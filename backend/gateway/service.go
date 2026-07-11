@@ -34,7 +34,7 @@ const (
 	healthPath       = "/v1/models"
 	responsesPath    = "/v1/responses"
 
-	proxyAttemptTimeout      = 25 * time.Second
+	proxyAttemptTimeout      = 60 * time.Second
 	healthProbeTimeout       = 8 * time.Second
 	healthProbeRetryJitterMax = 15 * time.Second
 	// streamFirstEventTimeout 是"等上游吐出第一个 SSE 事件"的最长等待。
@@ -44,6 +44,9 @@ const (
 	// "stream closed before response.completed"。放宽到 90s 覆盖绝大多数推理场景；
 	// 真卡死的连接由 preflight 的字节/事件上限和上游自身超时兜底。
 	streamFirstEventTimeout  = 90 * time.Second
+	// streamIdleTimeout 是正式转发阶段"两个事件之间"的最长间隔。给得比首事件更宽，
+	// 因为推理模型 token 之间可能有较长停顿；超过则判上游卡死，主动断开让客户端收到错误。
+	streamIdleTimeout        = 120 * time.Second
 	streamPreflightMaxEvents = 16
 	streamPreflightMaxBytes  = 64 << 10
 	// proxyFailureCooldown 是"请求失败后该候选临时不可调度"的固定时长。
@@ -55,6 +58,7 @@ type Service struct {
 	gateway    *storage.GatewayKeys
 	affinities *storage.GatewayAffinities
 	groupKeys  *storage.UpstreamGroupKeys
+	usageLogs  *storage.UsageLogs
 	cipher     *appcrypto.Cipher
 	channelSvc *channel.Service
 	log        *slog.Logger
@@ -150,6 +154,7 @@ type UpdateGroupKeyInput struct {
 	RequestMode      *string `json:"request_mode"`
 	Priority         *int    `json:"priority"`
 	ClientFormat     *string `json:"client_format"`
+	Charity          *bool   `json:"charity"`
 }
 
 type normalizedRequest struct {
@@ -191,6 +196,10 @@ type sseStreamReader struct {
 	event   string
 	data    strings.Builder
 	closed  bool
+	// closer/idleTimeout 可选：设置后，正式转发阶段每次读事件都带这个 idle 超时，
+	// 避免上游中途卡住导致 reader.Next() 无限阻塞、客户端超时断流。
+	closer      io.Closer
+	idleTimeout time.Duration
 }
 
 type GatewayError struct {
@@ -227,8 +236,60 @@ func NewService(
 	}
 }
 
-func (s *Service) UpdateUpstreamConfig(cfg config.UpstreamConfig) {
-	s.configMu.Lock()
+// SetUsageLogs 注入使用记录仓库（可选）。为空时不记录，功能降级但不影响主流程。
+func (s *Service) SetUsageLogs(logs *storage.UsageLogs) {
+	s.usageLogs = logs
+}
+
+// modelFromRequestBody 从请求体里取 model 字段，用于使用记录展示。
+func modelFromRequestBody(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return ""
+	}
+	if m, ok := raw["model"].(string); ok {
+		return strings.TrimSpace(m)
+	}
+	return ""
+}
+
+// ListUsageLogs 分页返回使用记录。
+func (s *Service) ListUsageLogs(limit, offset int) ([]storage.UsageLog, int64, error) {
+	if s.usageLogs == nil {
+		return []storage.UsageLog{}, 0, nil
+	}
+	return s.usageLogs.List(limit, offset)
+}
+
+// recordUsageLog 在请求成功后异步写一条使用记录。失败只记 warn，绝不影响主请求。
+func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *storage.UpstreamGroupKey, model string, usage usageTokens) {
+	if s.usageLogs == nil || candidate == nil {
+		return
+	}
+	entry := &storage.UsageLog{
+		ChannelID:        candidate.ChannelID,
+		ChannelName:      candidate.ChannelName,
+		GroupName:        candidate.GroupName,
+		Model:            model,
+		ClientFormat:     candidate.ClientFormat,
+		PromptTokens:     usage.Prompt,
+		CompletionTokens: usage.Completion,
+		TotalTokens:      usage.Total,
+		Ratio:            candidate.Ratio,
+	}
+	if gatewayKey != nil {
+		entry.GatewayKeyID = gatewayKey.ID
+		entry.GatewayKeyName = gatewayKey.Name
+	}
+	if err := s.usageLogs.Add(entry); err != nil && s.log != nil {
+		s.log.Warn("record usage log failed", "err", err)
+	}
+}
+
+func (s *Service) UpdateUpstreamConfig(cfg config.UpstreamConfig) {	s.configMu.Lock()
 	defer s.configMu.Unlock()
 	s.upstream = cfg.WithDefaults()
 }
@@ -425,7 +486,106 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 			return nil, err
 		}
 	}
+	if input.Charity != nil {
+		if err := s.groupKeys.UpdateCharity(id, *input.Charity); err != nil {
+			return nil, err
+		}
+	}
 	return s.groupKeys.FindByID(id)
+}
+
+// ManualGroupKeyInput 是"手动添加渠道分组"的入参：不登录上游，直接填分组名 + key。
+// 用于那些无法登录、只能拿到 key 的上游。
+type ManualGroupKeyInput struct {
+	ChannelID    uint    `json:"channel_id"`    // 绑定到已有渠道（可选，二选一）
+	SiteURL      string  `json:"site_url"`      // 或直接给上游地址，自动建一个 manual 渠道
+	ChannelName  string  `json:"channel_name"`  // manual 渠道名
+	GroupName    string  `json:"group_name"`    // 分组名（必填）
+	GroupDesc    string  `json:"group_description"`
+	Key          string  `json:"key"`           // 上游 key 明文（必填，存库前加密）
+	Ratio        float64 `json:"ratio"`         // 倍率
+	ClientFormat string  `json:"client_format"` // openai / claude
+	RequestMode  string  `json:"request_mode"`  // responses / chat
+	Charity      bool    `json:"charity"`
+	Priority     int     `json:"priority"`
+}
+
+// CreateManualGroupKey 手动创建一个上游分组密钥，不经过登录/自动同步。
+func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKeyInput) (*storage.UpstreamGroupKey, error) {
+	groupName := strings.TrimSpace(input.GroupName)
+	rawKey := strings.TrimSpace(input.Key)
+	if groupName == "" {
+		return nil, errors.New("分组名称不能为空")
+	}
+	if rawKey == "" {
+		return nil, errors.New("上游 key 不能为空")
+	}
+
+	// 解析/创建目标渠道。
+	var ch *storage.Channel
+	if input.ChannelID > 0 {
+		found, err := s.channels.FindByID(input.ChannelID)
+		if err != nil {
+			return nil, fmt.Errorf("渠道不存在: %w", err)
+		}
+		ch = found
+	} else {
+		siteURL := strings.TrimSpace(input.SiteURL)
+		if siteURL == "" {
+			return nil, errors.New("请选择已有渠道或填写上游地址")
+		}
+		name := strings.TrimSpace(input.ChannelName)
+		if name == "" {
+			name = siteURL
+		}
+		// 建一个"手动"渠道：token 凭据模式 + 关闭监控（不登录、不自动扫描），仅承载手动分组。
+		newCh := &storage.Channel{
+			Name:           name,
+			Type:           storage.ChannelTypeSub2API,
+			SiteURL:        siteURL,
+			Username:       "manual",
+			CredentialMode: storage.CredentialModeToken,
+			MonitorEnabled: true,
+		}
+		if err := s.channels.Create(newCh); err != nil {
+			return nil, fmt.Errorf("创建渠道失败: %w", err)
+		}
+		ch = newCh
+	}
+
+	cipher, err := s.cipher.Encrypt(rawKey)
+	if err != nil {
+		return nil, fmt.Errorf("加密 key 失败: %w", err)
+	}
+
+	format := normalizeClientFormat(input.ClientFormat)
+	mode := normalizeUpstreamRequestMode(input.RequestMode)
+	ratio := input.Ratio
+	if ratio <= 0 {
+		ratio = 1
+	}
+	// groupRef 用分组名归一化，保证同渠道下唯一。
+	groupRef := "manual:" + strings.ToLower(groupName)
+	rec := &storage.UpstreamGroupKey{
+		ChannelID:    ch.ID,
+		ChannelName:  ch.Name,
+		ChannelType:  ch.Type,
+		ClientFormat: format,
+		RequestMode:  mode,
+		GroupRef:     groupRef,
+		GroupName:    groupName,
+		GroupDesc:    strings.TrimSpace(input.GroupDesc),
+		Ratio:        ratio,
+		Priority:     input.Priority,
+		Charity:      input.Charity,
+		Enabled:      true,
+		KeyCipher:    cipher,
+		Status:       "unknown",
+	}
+	if err := s.groupKeys.Upsert(rec); err != nil {
+		return nil, fmt.Errorf("保存分组失败: %w", err)
+	}
+	return s.groupKeys.FindByChannelGroup(ch.ID, groupRef)
 }
 
 // DeleteGroupKey 删除一个上游分组密钥记录。
@@ -553,15 +713,32 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 	return result, nil
 }
 
-func (s *Service) TestAllGroupKeys(ctx context.Context) (*HealthResult, error) {
+func (s *Service) TestAllGroupKeys(_ context.Context) (*HealthResult, error) {
 	list, err := s.groupKeys.List()
 	if err != nil {
 		return nil, err
 	}
-	result := &HealthResult{Items: []HealthResultItem{}}
+
+	// 关键：测活用独立的、够长的 context，绝不复用调用方（HTTP 请求）的 ctx。
+	// 之前直接用 c.Request.Context()，渠道一多、串行探测耗时超过浏览器/网关的请求超时，
+	// 整个 ctx 被取消，导致"正在测的 + 还没测的"全部 context canceled 被误判为死亡。
+	// 这里给一个基于总数的宽裕预算：每个渠道最坏 ~25s（首探 + 抖动 + 重探），再封顶 10 分钟。
+	budget := time.Duration(len(list))*25*time.Second + 30*time.Second
+	if budget > 10*time.Minute {
+		budget = 10 * time.Minute
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+
+	result := &HealthResult{Items: make([]HealthResultItem, len(list))}
+
+	// 并发探测，限制并发度，避免 2C1G 上一次性打太多请求。
+	const maxConcurrent = 6
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
 	for i := range list {
 		if !list[i].Enabled {
-			result.Items = append(result.Items, HealthResultItem{
+			result.Items[i] = HealthResultItem{
 				ID:          list[i].ID,
 				ChannelID:   list[i].ChannelID,
 				ChannelName: list[i].ChannelName,
@@ -569,18 +746,33 @@ func (s *Service) TestAllGroupKeys(ctx context.Context) (*HealthResult, error) {
 				GroupName:   list[i].GroupName,
 				Ratio:       list[i].Ratio,
 				Status:      "disabled",
-			})
+			}
 			continue
 		}
-		item := s.testGroupKey(ctx, &list[i])
-		result.Checked++
-		switch item.Status {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			result.Items[idx] = s.testGroupKey(probeCtx, &list[idx])
+		}(i)
+	}
+	wg.Wait()
+
+	// 汇总计数（并发写入各自的 slot，这里统一统计，避免竞态）。
+	for i := range result.Items {
+		switch result.Items[i].Status {
 		case "alive":
+			result.Checked++
 			result.Alive++
 		case "dead":
+			result.Checked++
 			result.Dead++
+		case "disabled":
+			// 不计入 checked
+		default:
+			result.Checked++
 		}
-		result.Items = append(result.Items, item)
 	}
 	return result, nil
 }
@@ -759,6 +951,7 @@ func (s *Service) attemptStream(
 		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 		_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 		s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
+		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
 		return candOutcome{kind: candSuccess}
 	}
 	errMsg := err.Error()
@@ -770,6 +963,7 @@ func (s *Service) attemptStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
+		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
 			return candOutcome{kind: candSuccess}
 		}
 		errMsg = reason + " retry failed: " + err.Error()
@@ -785,6 +979,7 @@ func (s *Service) attemptStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
+		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
 			return candOutcome{kind: candSuccess}
 		}
 		errMsg = reason + " retry failed: " + err.Error()
@@ -812,6 +1007,7 @@ func (s *Service) attemptNonStream(
 		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 		_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 		s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
+		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
 		writeProxyResponse(w, status, header, respBody, candidate, normalized.ResponseMode)
 		return candOutcome{kind: candSuccess}
 	}
@@ -825,6 +1021,7 @@ func (s *Service) attemptNonStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
+		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
 			writeProxyResponse(w, status, header, respBody, candidate, fallback.ResponseMode)
 			return candOutcome{kind: candSuccess}
 		}
@@ -842,6 +1039,7 @@ func (s *Service) attemptNonStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
+		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
 			writeProxyResponse(w, status, header, respBody, candidate, normalized.ResponseMode)
 			return candOutcome{kind: candSuccess}
 		}
@@ -902,6 +1100,10 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			return false, extractUsage(respBody), nil
 		}
 		reader := newSSEStreamReader(resp.Body)
+		// 正式转发阶段的 idle 读超时：上游连续 streamIdleTimeout 没有任何新事件就判定卡死，
+		// 主动关连接返回错误，避免 reader.Next() 无限阻塞导致客户端 stream closed。
+		reader.closer = resp.Body
+		reader.idleTimeout = streamIdleTimeout
 		buffered, err := preflightSSEStream(reader, resp.Body)
 		if err != nil {
 			return true, usageTokens{}, err
@@ -1071,6 +1273,11 @@ func (s *Service) testGroupKey(ctx context.Context, key *storage.UpstreamGroupKe
 }
 
 func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.UpstreamGroupKey) (int, []byte, int64, error) {
+	// Claude 类型渠道：走 Anthropic Messages 格式探测，绝不用 openai 的 /v1/models + /v1/responses，
+	// 否则 claude 上游不认这些端点，测活必然失败（这正是"claude 渠道一测就死"的原因）。
+	if normalizeClientFormat(key.ClientFormat) == "claude" {
+		return s.healthProbeClaude(ctx, key)
+	}
 	start := time.Now()
 	model, status, body, err := s.discoverHealthProbeModel(ctx, key)
 	if err != nil && !shouldFallbackHealthModelDiscovery(status) {
@@ -1093,6 +1300,67 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 		return status, body, latencyMS, fmt.Errorf("upstream returned non-generation payload: %s", truncateBody(body, 240))
 	}
 	return status, body, latencyMS, nil
+}
+
+// healthProbeClaude 用 Anthropic Messages 格式测活 claude 类型渠道。
+// 直接打 /v1/messages，不做 /v1/models 发现（claude 中转站常不提供或格式不同）。
+func (s *Service) healthProbeClaude(ctx context.Context, key *storage.UpstreamGroupKey) (int, []byte, int64, error) {
+	start := time.Now()
+	model := defaultHealthProbeModel(key.ClientFormat)
+	body, _ := json.Marshal(map[string]any{
+		"model":      model,
+		"max_tokens": 1,
+		"messages": []map[string]any{
+			{"role": "user", "content": "hi"},
+		},
+		"stream": false,
+	})
+	header := http.Header{}
+	header.Set("Content-Type", "application/json")
+	req := normalizedRequest{
+		Method:       http.MethodPost,
+		Path:         "/v1/messages",
+		Header:       header,
+		Body:         body,
+		ResponseMode: "raw",
+		Stream:       false,
+	}
+	status, _, respBody, err := s.requestCandidate(ctx, req, key, healthProbeTimeout)
+	latencyMS := time.Since(start).Milliseconds()
+	if err != nil {
+		return status, respBody, latencyMS, err
+	}
+	if status < 200 || status >= 300 {
+		return status, respBody, latencyMS, healthProbeError(status, respBody, nil)
+	}
+	if isUpstreamErrorBody(respBody) {
+		return status, respBody, latencyMS, fmt.Errorf("upstream returned error payload: %s", truncateBody(respBody, 240))
+	}
+	// claude 成功响应含 content / role / type=message 等字段。
+	if !looksLikeClaudeSuccess(respBody) {
+		return status, respBody, latencyMS, fmt.Errorf("upstream returned non-message payload: %s", truncateBody(respBody, 240))
+	}
+	return status, respBody, latencyMS, nil
+}
+
+// looksLikeClaudeSuccess 判断 Anthropic Messages 响应是否为正常生成结果。
+func looksLikeClaudeSuccess(body []byte) bool {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return false
+	}
+	if t, _ := raw["type"].(string); t == "message" {
+		return true
+	}
+	if _, ok := raw["content"]; ok {
+		return true
+	}
+	if _, ok := raw["id"]; ok {
+		if _, ok := raw["role"]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) discoverHealthProbeModel(ctx context.Context, key *storage.UpstreamGroupKey) (string, int, []byte, error) {
@@ -1913,6 +2181,11 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
 			return rankI < rankJ
 		}
+		// 公益优先：同为可用状态时，公益渠道永远排在付费渠道前面。
+		// 公益全部不可用（被降级到 dead/冷却）后，才会轮到付费渠道。
+		if out[i].Charity != out[j].Charity {
+			return out[i].Charity
+		}
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
 		}
@@ -2030,6 +2303,9 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 	sort.SliceStable(out, func(i, j int) bool {
 		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
 			return rankI < rankJ
+		}
+		if out[i].Charity != out[j].Charity {
+			return out[i].Charity
 		}
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
@@ -2549,9 +2825,9 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		}
 		return nil
 	})
-	if err != nil {
-		return best, err
-	}
+	// 即使上游中途断（err != nil），只要已经开始输出，也补齐 response.completed + [DONE]，
+	// 让 Responses 协议的客户端平滑收尾，不报 "stream closed before response.completed"。
+	streamErr := err
 	if err := emitCreated(); err != nil {
 		return best, err
 	}
@@ -2576,6 +2852,10 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	if err := writeSSEData(w, "[DONE]"); err != nil {
 		return best, err
 	}
+	// streamErr 已经用"补 completed"平滑收尾，且我们从没往调用方写头之外的坏数据，
+	// 这里吞掉它（若上游一个字都没发过，textBuf 为空，客户端至少拿到一个空的 completed，
+	// 也比断流强）。
+	_ = streamErr
 	return best, nil
 }
 
@@ -2855,7 +3135,15 @@ func readSSEEvents(buffered []sseEvent, reader *sseStreamReader, emit func(event
 		}
 	}
 	for {
-		ev, err := reader.Next()
+		var ev sseEvent
+		var err error
+		// 有 closer + idleTimeout 的 reader（真实上游转发）走带超时的读，
+		// 上游卡住超过 idle 就主动关连接返回错误，避免无限阻塞 → 客户端断流。
+		if reader != nil && reader.closer != nil && reader.idleTimeout > 0 {
+			ev, err = readNextSSEWithTimeout(reader, reader.closer, reader.idleTimeout)
+		} else {
+			ev, err = reader.Next()
+		}
 		if errors.Is(err, io.EOF) {
 			return nil
 		}
@@ -2963,13 +3251,101 @@ func sseEventType(ev sseEvent) string {
 
 func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader) (usageTokens, error) {
 	var best usageTokens
+	completedSeen := false
+	sawAnyData := false
+	model := ""
+	respID := ""
 	err := readSSEEvents(buffered, reader, func(event, data string) error {
 		if usage := usageFromSSEData(data); usage.Total > 0 {
 			best = usage
 		}
+		if strings.TrimSpace(data) != "" && data != "[DONE]" {
+			sawAnyData = true
+			if id, m := sseResponseIDAndModel(data); id != "" || m != "" {
+				if id != "" {
+					respID = id
+					best.ResponseID = id
+				}
+				if m != "" {
+					model = m
+				}
+			}
+		}
+		typ := sseEventType(sseEvent{Event: event, Data: data})
+		if typ == "response.completed" {
+			completedSeen = true
+		}
 		return writeSSEEvent(w, sseEvent{Event: event, Data: data})
 	})
+	// 关键容错：只要我们已经向客户端转发过内容（sawAnyData）且上游始终没发
+	// response.completed，就补一个合成的终止事件——无论上游是"正常 EOF"还是
+	// "中途断开/超时（err != nil）"。
+	//
+	// 走 Responses 协议的客户端（Codex 直连）必须收到 response.completed 才认为流结束，
+	// 否则报 "stream closed before response.completed"。上游中途把 TCP 断掉、或 idle 超时
+	// 触发我们主动 Close，都会让 readSSEEvents 返回 err；这些情况下客户端其实已经拿到了
+	// 大部分内容，补一个 completed 让它平滑收尾，远好过把断流错误透传出去。
+	// 这正是 ccswitch 走 chat 路径时靠 [DONE] 达到的效果。
+	if sawAnyData && !completedSeen {
+		if writeErr := writeSyntheticResponseCompleted(w, respID, model, best); writeErr != nil {
+			return best, writeErr
+		}
+		// 已经给了客户端完整的终止事件，这个"上游中途断"的错误就不再上抛，
+		// 否则上层会误判为候选失败并可能重复请求。
+		return best, nil
+	}
 	return best, err
+}
+
+// sseResponseIDAndModel 从一个 responses SSE data 里尽量提取 response id 和 model。
+func sseResponseIDAndModel(data string) (string, string) {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		return "", ""
+	}
+	id := ""
+	model := ""
+	if resp, ok := raw["response"].(map[string]any); ok {
+		if v, ok := resp["id"].(string); ok {
+			id = v
+		}
+		if v, ok := resp["model"].(string); ok {
+			model = v
+		}
+	}
+	if id == "" {
+		if v, ok := raw["response_id"].(string); ok {
+			id = v
+		}
+	}
+	if model == "" {
+		if v, ok := raw["model"].(string); ok {
+			model = v
+		}
+	}
+	return id, model
+}
+
+// writeSyntheticResponseCompleted 合成一个 response.completed 事件 + [DONE]，用于上游漏发终止事件时兜底。
+func writeSyntheticResponseCompleted(w http.ResponseWriter, id, model string, usage usageTokens) error {
+	if id == "" {
+		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	resp := map[string]any{
+		"id":     id,
+		"object": "response",
+		"status": "completed",
+		"model":  model,
+	}
+	if usage.Total > 0 {
+		resp["usage"] = map[string]int64{
+			"input_tokens":  usage.Prompt,
+			"output_tokens": usage.Completion,
+			"total_tokens":  usage.Total,
+		}
+	}
+	payload, _ := json.Marshal(map[string]any{"type": "response.completed", "response": resp})
+	return writeSSEEvent(w, sseEvent{Event: "response.completed", Data: string(payload)})
 }
 
 func writeSSEEvent(w http.ResponseWriter, ev sseEvent) error {

@@ -325,6 +325,11 @@ func (r *UpstreamGroupKeys) UpdateClientFormat(id uint, format string) error {
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("client_format", format).Error
 }
 
+// UpdateCharity 设置分组是否为公益渠道（调度时公益优先于付费）。
+func (r *UpstreamGroupKeys) UpdateCharity(id uint, charity bool) error {
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("charity", charity).Error
+}
+
 func (r *UpstreamGroupKeys) MarkFailure(id uint, errMsg string, disabledUntil time.Time) error {
 	now := time.Now()
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
@@ -353,4 +358,38 @@ func (r *UpstreamGroupKeys) MarkHealthFailure(id uint, errMsg string, disabledUn
 
 func (r *UpstreamGroupKeys) Delete(id uint) error {
 	return r.db.Delete(&UpstreamGroupKey{}, id).Error
+}
+
+// UsageLogs 存取网关请求使用记录。
+type UsageLogs struct{ db *gorm.DB }
+
+func NewUsageLogs(db *gorm.DB) *UsageLogs { return &UsageLogs{db: db} }
+
+func (r *UsageLogs) Add(entry *UsageLog) error {
+	return r.db.Create(entry).Error
+}
+
+// List 分页返回使用记录，按时间倒序。
+func (r *UsageLogs) List(limit, offset int) ([]UsageLog, int64, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total int64
+	if err := r.db.Model(&UsageLog{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var list []UsageLog
+	if err := r.db.Order("created_at DESC").Limit(limit).Offset(offset).Find(&list).Error; err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
+}
+
+// DeleteOlderThan 清理指定时间点之前的记录，返回删除条数。
+func (r *UsageLogs) DeleteOlderThan(cutoff time.Time) (int64, error) {
+	res := r.db.Where("created_at < ?", cutoff).Delete(&UsageLog{})
+	return res.RowsAffected, res.Error
 }

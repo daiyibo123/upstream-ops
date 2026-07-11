@@ -123,6 +123,8 @@ func main() {
 	monitorSvc := monitor.NewService(channels, announcements, rates, monLogs, channelSvc, dispatcher, log)
 	gatewaySvc := gateway.NewService(channels, gatewayKeys, gatewayAffinities, upstreamGroupKeys, cipher, channelSvc, log)
 	gatewaySvc.UpdateUpstreamConfig(cfg.Upstream)
+	usageLogs := storage.NewUsageLogs(db)
+	gatewaySvc.SetUsageLogs(usageLogs)
 
 	schedulerFactory := func(scfg config.SchedulerConfig, pcfg config.ProxyConfig) *scheduler.Scheduler {
 		return scheduler.New(scfg, monitorSvc, monLogs, rates, notifies, announcements, captchas, cipher, pcfg, gatewaySvc, log)

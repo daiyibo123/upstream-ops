@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { CheckCircle2, Copy, Eye, EyeOff, KeyRound, Loader2, Pencil, Plus, RefreshCw, Trash2, XCircle } from "lucide-react"
+import { CheckCircle2, ChevronLeft, ChevronRight, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Trash2, XCircle } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -71,6 +71,34 @@ function createDefaultDraft(): KeyDraft {
     dailyLimitM: "",
     totalLimitM: "",
     expiresInDays: "0",
+  }
+}
+
+interface ManualDraft {
+  channelName: string
+  siteUrl: string
+  groupName: string
+  groupDescription: string
+  key: string
+  ratio: string
+  clientFormat: "openai" | "claude"
+  requestMode: UpstreamRequestMode
+  charity: boolean
+  priority: string
+}
+
+function createDefaultManualDraft(): ManualDraft {
+  return {
+    channelName: "",
+    siteUrl: "",
+    groupName: "",
+    groupDescription: "",
+    key: "",
+    ratio: "1",
+    clientFormat: "openai",
+    requestMode: "responses",
+    charity: false,
+    priority: "0",
   }
 }
 
@@ -456,7 +484,9 @@ function KeyDraftFields({
   )
 }
 
-export function GatewayPanel() {
+export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "groups" } = {}) {
+  const showKeys = section === "all" || section === "keys"
+  const showGroups = section === "all" || section === "groups"
   const [keys, setKeys] = useState<GatewayKey[]>([])
   const [groups, setGroups] = useState<UpstreamGroupKey[]>([])
   const [loading, setLoading] = useState(true)
@@ -470,10 +500,27 @@ export function GatewayPanel() {
   const [concurrencyDrafts, setConcurrencyDrafts] = useState<Record<number, string>>({})
   const [priorityDrafts, setPriorityDrafts] = useState<Record<number, string>>({})
   const [healthResults, setHealthResults] = useState<Record<number, GatewayHealthResult["items"][number]>>({})
+  const [manualOpen, setManualOpen] = useState(false)
+  const [manualDraft, setManualDraft] = useState<ManualDraft>(() => createDefaultManualDraft())
+  const [pageSize, setPageSize] = useState(10)
+  const [page, setPage] = useState(1)
 
   const aliveCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "alive").length, [groups])
   const deadCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "dead").length, [groups])
   const enabledGroupCount = useMemo(() => groups.filter((group) => group.enabled !== false).length, [groups])
+
+  const totalPages = Math.max(1, Math.ceil(groups.length / pageSize))
+  const currentPage = Math.min(page, totalPages)
+  const pagedGroups = useMemo(
+    () => groups.slice((currentPage - 1) * pageSize, currentPage * pageSize),
+    [groups, currentPage, pageSize],
+  )
+  const rangeStart = groups.length === 0 ? 0 : (currentPage - 1) * pageSize + 1
+  const rangeEnd = Math.min(currentPage * pageSize, groups.length)
+
+  useEffect(() => {
+    if (page > totalPages) setPage(totalPages)
+  }, [page, totalPages])
 
   async function load() {
     setLoading(true)
@@ -645,7 +692,7 @@ export function GatewayPanel() {
 
   async function updateGroup(
     group: UpstreamGroupKey,
-    patch: { concurrency_limit?: number; enabled?: boolean; request_mode?: UpstreamRequestMode; priority?: number; client_format?: string },
+    patch: { concurrency_limit?: number; enabled?: boolean; request_mode?: UpstreamRequestMode; priority?: number; client_format?: string; charity?: boolean },
   ) {
     setBusy(`group-${group.id}`)
     try {
@@ -657,6 +704,7 @@ export function GatewayPanel() {
           ...(patch.request_mode == null ? {} : { request_mode: patch.request_mode }),
           ...(patch.priority == null ? {} : { priority: patch.priority }),
           ...(patch.client_format == null ? {} : { client_format: patch.client_format }),
+          ...(patch.charity == null ? {} : { charity: patch.charity }),
         }),
       })
       setGroups((prev) => sortGroupsForDisplay(prev.map((item) => (item.id === updated.id ? updated : item))))
@@ -742,36 +790,90 @@ export function GatewayPanel() {
     }
   }
 
+  async function toggleGroupCharity(group: UpstreamGroupKey, charity: boolean) {
+    const updated = await updateGroup(group, { charity })
+    if (updated) {
+      toast.success(charity ? "已标记为公益分组" : "已取消公益标记")
+    }
+  }
+
+  async function submitManualGroup() {
+    if (!manualDraft.groupName.trim()) {
+      toast.error("请填写分组名")
+      return
+    }
+    if (!manualDraft.key.trim()) {
+      toast.error("请填写 Key")
+      return
+    }
+    setBusy("manual-add")
+    try {
+      await apiFetch<UpstreamGroupKey>("/gateway/group-keys/manual", {
+        method: "POST",
+        body: JSON.stringify({
+          channel_name: manualDraft.channelName.trim() || undefined,
+          site_url: manualDraft.siteUrl.trim() || undefined,
+          group_name: manualDraft.groupName.trim(),
+          group_description: manualDraft.groupDescription.trim() || undefined,
+          key: manualDraft.key.trim(),
+          ratio: Number(manualDraft.ratio) || 0,
+          client_format: manualDraft.clientFormat,
+          request_mode: manualDraft.requestMode,
+          charity: manualDraft.charity,
+          priority: Math.max(0, Math.floor(Number(manualDraft.priority) || 0)),
+        }),
+      })
+      toast.success("手动添加分组成功")
+      setManualOpen(false)
+      setManualDraft(createDefaultManualDraft())
+      await load()
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "手动添加分组失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
   return (
     <Card className="border border-border shadow-none">
       <CardHeader className="flex flex-col gap-3 pb-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <CardTitle className="text-base font-semibold">调度网关</CardTitle>
+          <CardTitle className="text-base font-semibold">{showGroups && !showKeys ? "可用渠道" : "调度网关"}</CardTitle>
           <p className="mt-1 text-xs text-muted-foreground">
-            /v1 兼容入口 · 优先级优先 · Key 可绑定指定上游
+            {showGroups && !showKeys
+              ? "上游分组列表 · 状态 / 优先级 / 并发 / 公益 / 冷却"
+              : "/v1 兼容入口 · 优先级优先 · Key 可绑定指定上游"}
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant="outline" className="border-success/20 bg-success/10 text-success">
-            存活 {aliveCount}
-          </Badge>
-          <Badge variant="outline" className="border-danger/20 bg-danger/10 text-danger">
-            死亡 {deadCount}
-          </Badge>
-          <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
-            启用 {enabledGroupCount}/{groups.length}
-          </Badge>
-          <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
-            {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
-            一键创建分组 Key
-          </Button>
-          <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={testGroups}>
-            {busy === "test" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-            一键分组测活
-          </Button>
-        </div>
+        {showGroups ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="outline" className="border-success/20 bg-success/10 text-success">
+              存活 {aliveCount}
+            </Badge>
+            <Badge variant="outline" className="border-danger/20 bg-danger/10 text-danger">
+              死亡 {deadCount}
+            </Badge>
+            <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
+              启用 {enabledGroupCount}/{groups.length}
+            </Badge>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={() => setManualOpen(true)}>
+              <Plus className="size-3.5" />
+              手动添加
+            </Button>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
+              {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
+              一键创建分组 Key
+            </Button>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={testGroups}>
+              {busy === "test" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
+              一键分组测活
+            </Button>
+          </div>
+        ) : null}
       </CardHeader>
       <CardContent className="space-y-4">
+        {showKeys ? (
         <div className="grid gap-4 rounded-md border border-border bg-muted/10 p-3 xl:grid-cols-[0.95fr_1.35fr]">
           <div className="space-y-3">
             <div className="flex items-center justify-between gap-2">
@@ -905,13 +1007,16 @@ export function GatewayPanel() {
             )}
           </div>
         </div>
+        ) : null}
 
+        {showGroups ? (
         <div className="overflow-x-auto rounded-md border border-border">
-          <Table className="min-w-[1260px]">
+          <Table className="min-w-[1360px]">
             <TableHeader>
               <TableRow>
                 <TableHead>状态</TableHead>
                 <TableHead className="w-20">启用</TableHead>
+                <TableHead className="w-20">公益</TableHead>
                 <TableHead>渠道</TableHead>
                 <TableHead>分组</TableHead>
                 <TableHead className="w-24">格式</TableHead>
@@ -926,25 +1031,25 @@ export function GatewayPanel() {
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={11} className="h-24 text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={12} className="h-24 text-center text-xs text-muted-foreground">
                     <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
                     加载中...
                   </TableCell>
                 </TableRow>
               ) : groups.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={11} className="h-24 text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={12} className="h-24 text-center text-xs text-muted-foreground">
                     还没有分组 Key，先点“一键创建分组 Key”
                   </TableCell>
                 </TableRow>
               ) : (
-                groups.map((group) => {
+                pagedGroups.map((group) => {
                   const status = effectiveStatus(group)
                   const Icon = status === "alive" ? CheckCircle2 : status === "dead" ? XCircle : RefreshCw
                   const latestHealth = healthResults[group.id]
                   const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
                   return (
-                    <TableRow key={group.id}>
+                    <TableRow key={group.id} className={cn(group.charity && "bg-success/5")}>
                       <TableCell>
                         <Badge variant="outline" className={cn("gap-1.5", statusTone(status))}>
                           <Icon className="size-3" />
@@ -958,6 +1063,22 @@ export function GatewayPanel() {
                           title={group.enabled === false ? "启用这个上游分组" : "禁用后不会参与调度和测活"}
                           onCheckedChange={(checked) => void toggleGroupEnabled(group, checked)}
                         />
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-col items-start gap-1">
+                          <Switch
+                            checked={group.charity === true}
+                            disabled={!!busy}
+                            title={group.charity ? "取消公益标记" : "标记为公益分组"}
+                            onCheckedChange={(checked) => void toggleGroupCharity(group, checked)}
+                          />
+                          {group.charity ? (
+                            <Badge variant="outline" className="gap-1 border-success/20 bg-success/10 px-1.5 text-[10px] text-success">
+                              <HeartHandshake className="size-3" />
+                              公益
+                            </Badge>
+                          ) : null}
+                        </div>
                       </TableCell>
                       <TableCell>
                         <div className="text-sm font-medium">{group.channel_name || `#${group.channel_id}`}</div>
@@ -1099,7 +1220,174 @@ export function GatewayPanel() {
             </TableBody>
           </Table>
         </div>
+        ) : null}
+
+        {showGroups && groups.length > 0 ? (
+          <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/10 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-xs text-muted-foreground">
+              显示 {rangeStart}-{rangeEnd} / {groups.length} 个分组
+            </div>
+            <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                <span>每页</span>
+                <Select
+                  value={String(pageSize)}
+                  onValueChange={(value) => {
+                    setPageSize(Number(value))
+                    setPage(1)
+                  }}
+                >
+                  <SelectTrigger className="h-8 w-20 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="10">10 条</SelectItem>
+                    <SelectItem value="20">20 条</SelectItem>
+                    <SelectItem value="50">50 条</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1 px-2 text-xs"
+                disabled={currentPage <= 1}
+                onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+              >
+                <ChevronLeft className="size-3.5" />
+                上一页
+              </Button>
+              <span className="min-w-16 text-center text-xs text-muted-foreground">
+                {currentPage} / {totalPages}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1 px-2 text-xs"
+                disabled={currentPage >= totalPages}
+                onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+              >
+                下一页
+                <ChevronRight className="size-3.5" />
+              </Button>
+            </div>
+          </div>
+        ) : null}
       </CardContent>
+
+      <Dialog
+        open={manualOpen}
+        onOpenChange={(open) => {
+          setManualOpen(open)
+          if (!open) setManualDraft(createDefaultManualDraft())
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>手动添加渠道</DialogTitle>
+            <DialogDescription>
+              给无法登录、只能拿到 Key 的上游手动创建分组。分组名和 Key 为必填。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="manual-channel-name">渠道名</Label>
+              <Input
+                id="manual-channel-name"
+                value={manualDraft.channelName}
+                onChange={(event) => setManualDraft((prev) => ({ ...prev, channelName: event.target.value }))}
+                placeholder="例如：某公益中转"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="manual-site-url">上游地址</Label>
+              <Input
+                id="manual-site-url"
+                value={manualDraft.siteUrl}
+                onChange={(event) => setManualDraft((prev) => ({ ...prev, siteUrl: event.target.value }))}
+                placeholder="https://..."
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="manual-group-name">分组名 *</Label>
+              <Input
+                id="manual-group-name"
+                value={manualDraft.groupName}
+                onChange={(event) => setManualDraft((prev) => ({ ...prev, groupName: event.target.value }))}
+                placeholder="例如：default"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="manual-ratio">倍率</Label>
+              <Input
+                id="manual-ratio"
+                value={manualDraft.ratio}
+                inputMode="decimal"
+                onChange={(event) => setManualDraft((prev) => ({ ...prev, ratio: sanitizeMInput(event.target.value) }))}
+                placeholder="1"
+              />
+            </div>
+            <div className="space-y-1.5 sm:col-span-2">
+              <Label htmlFor="manual-key">Key *</Label>
+              <Input
+                id="manual-key"
+                value={manualDraft.key}
+                onChange={(event) => setManualDraft((prev) => ({ ...prev, key: event.target.value }))}
+                placeholder="上游 API Key"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>类型</Label>
+              <Select
+                value={manualDraft.clientFormat}
+                onValueChange={(value) => setManualDraft((prev) => ({ ...prev, clientFormat: value === "claude" ? "claude" : "openai" }))}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="openai">OpenAI</SelectItem>
+                  <SelectItem value="claude">Claude</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <Label>请求方式</Label>
+              <Select
+                value={manualDraft.requestMode}
+                onValueChange={(value) => setManualDraft((prev) => ({ ...prev, requestMode: normalizeRequestMode(value) }))}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="responses">Responses</SelectItem>
+                  <SelectItem value="chat">Chat</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/20 px-3 py-2 sm:col-span-2">
+              <div>
+                <p className="text-sm font-medium text-foreground">是否公益</p>
+                <p className="text-xs text-muted-foreground">标记为公益分组后会有醒目标记</p>
+              </div>
+              <Switch
+                checked={manualDraft.charity}
+                onCheckedChange={(checked) => setManualDraft((prev) => ({ ...prev, charity: checked }))}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setManualOpen(false)} disabled={!!busy}>
+              取消
+            </Button>
+            <Button onClick={() => void submitManualGroup()} disabled={!!busy}>
+              {busy === "manual-add" ? <Loader2 className="mr-1.5 size-3.5 animate-spin" /> : null}
+              添加
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={editOpen}

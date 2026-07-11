@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	gatewaySvc "github.com/bejix/upstream-ops/backend/gateway"
 	"github.com/gin-gonic/gin"
@@ -128,12 +129,26 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": item})
 	})
-	gp.POST("/group-keys/bootstrap", func(c *gin.Context) {		result, err := d.Gateway.BootstrapGroupKeys(c.Request.Context())
+	gp.POST("/group-keys/bootstrap", func(c *gin.Context) {
+		result, err := d.Gateway.BootstrapGroupKeys(c.Request.Context())
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"data": result})
+	})
+	gp.POST("/group-keys/manual", func(c *gin.Context) {
+		var in gatewaySvc.ManualGroupKeyInput
+		if err := c.ShouldBindJSON(&in); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		item, err := d.Gateway.CreateManualGroupKey(c.Request.Context(), in)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": item})
 	})
 	gp.POST("/group-keys/test", func(c *gin.Context) {
 		result, err := d.Gateway.TestAllGroupKeys(c.Request.Context())
@@ -143,6 +158,27 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": result})
 	})
+	gp.GET("/usage-logs", func(c *gin.Context) {
+		limit := atoiDefault(c.Query("limit"), 50)
+		offset := atoiDefault(c.Query("offset"), 0)
+		items, total, err := d.Gateway.ListUsageLogs(limit, offset)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": items, "total": total}})
+	})
+}
+
+func atoiDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func registerGatewayProxy(r *gin.Engine, d *Deps) {

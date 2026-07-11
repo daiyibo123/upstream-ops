@@ -76,7 +76,14 @@ func (r *Channels) ListPage(page, pageSize int) ([]Channel, int64, error) {
 		return nil, 0, err
 	}
 	var list []Channel
-	q := r.db.Order("sort_order DESC").Order("id ASC")
+	// 按"该渠道下最低倍率的分组"从低到高排序：越便宜的渠道越靠前。
+	// 没有可用分组（min 为 NULL）的渠道排最后；同价再按 sort_order / id。
+	minRatioSub := "(SELECT MIN(ratio) FROM upstream_group_keys g WHERE g.channel_id = channels.id AND g.key_cipher <> '')"
+	q := r.db.
+		Order("CASE WHEN " + minRatioSub + " IS NULL THEN 1 ELSE 0 END ASC").
+		Order(minRatioSub + " ASC").
+		Order("sort_order DESC").
+		Order("id ASC")
 	if pageSize != -1 {
 		q = q.Offset((page - 1) * pageSize).Limit(pageSize)
 	}

@@ -288,6 +288,26 @@ type MonitorLog struct {
 
 func (MonitorLog) TableName() string { return "monitor_logs" }
 
+// UsageLog 记录每次通过网关的请求，用于"使用记录"页展示（渠道/分组/模型/token/时间）。
+// 只在请求成功后写入，保持精简；保留天数由清理任务控制。
+type UsageLog struct {
+	ID               uint      `gorm:"primaryKey" json:"id"`
+	GatewayKeyID     uint      `gorm:"index" json:"gateway_key_id"`
+	GatewayKeyName   string    `gorm:"size:128" json:"gateway_key_name,omitempty"`
+	ChannelID        uint      `gorm:"index" json:"channel_id"`
+	ChannelName      string    `gorm:"size:128" json:"channel_name,omitempty"`
+	GroupName        string    `gorm:"size:128" json:"group_name,omitempty"`
+	Model            string    `gorm:"size:128;index" json:"model,omitempty"`
+	ClientFormat     string    `gorm:"size:16" json:"client_format,omitempty"`
+	PromptTokens     int64     `json:"prompt_tokens"`
+	CompletionTokens int64     `json:"completion_tokens"`
+	TotalTokens      int64     `json:"total_tokens"`
+	Ratio            float64   `json:"ratio"`
+	CreatedAt        time.Time `gorm:"index" json:"created_at"`
+}
+
+func (UsageLog) TableName() string { return "usage_logs" }
+
 // GatewayKey is the local API key a client uses against this deployment's
 // OpenAI-compatible /v1/* gateway. The full key is encrypted for reveal/copy;
 // authentication uses KeyHash so request handling does not need to decrypt.
@@ -343,6 +363,9 @@ type UpstreamGroupKey struct {
 	GroupDesc        string      `gorm:"size:512" json:"group_description,omitempty"`
 	Ratio            float64     `gorm:"not null;default:1" json:"ratio"`
 	Priority         int         `gorm:"not null;default:0;index" json:"priority"`
+	// Charity 标记这个分组是"公益/免费"渠道。调度时公益永远优先于付费，
+	// 公益内部再按倍率高低（这里沿用 ratio 低者优先）排序，公益全挂了才轮到付费。
+	Charity          bool        `gorm:"not null;default:false;index" json:"charity"`
 	UpstreamKeyID    int64       `gorm:"not null;default:0" json:"upstream_key_id"`
 	KeyCipher        string      `gorm:"type:text;not null" json:"-"`
 	Enabled          bool        `gorm:"not null;default:true;index" json:"enabled"`

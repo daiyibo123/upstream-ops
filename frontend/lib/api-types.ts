@@ -521,6 +521,7 @@ export interface UpstreamGroupKey {
   group_description?: string
   ratio: number
   priority: number
+  charity?: boolean
   enabled: boolean
   upstream_key_id: number
   status: "unknown" | "alive" | "dead" | "disabled" | string
@@ -537,6 +538,27 @@ export interface UpstreamGroupKey {
   last_error?: string
   created_at: string
   updated_at: string
+}
+
+export interface UsageLog {
+  id: number
+  gateway_key_id?: number
+  gateway_key_name?: string
+  channel_id?: number
+  channel_name?: string
+  group_name?: string
+  model?: string
+  client_format?: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  ratio?: number
+  created_at: string
+}
+
+export interface UsageLogsResponse {
+  items: UsageLog[]
+  total: number
 }
 
 export interface GatewayBootstrapResult {

@@ -19,6 +19,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { apiFetch } from "@/lib/api"
 import { formatRatio, relativeTime } from "@/lib/format"
+import { useAppVersion } from "@/lib/queries"
 import type { DashboardGatewayGroup } from "@/lib/api-types"
 
 interface PublicKeyStat {
@@ -82,6 +83,12 @@ export default function HomePage() {
   const [publicKeyOpen, setPublicKeyOpen] = useState(false)
   const [publicKeyPassword, setPublicKeyPassword] = useState("")
   const [copyingPublicKey, setCopyingPublicKey] = useState(false)
+  const appVersion = useAppVersion()
+  const appTitle = appVersion.data?.title?.trim() || "UpstreamOps"
+
+  useEffect(() => {
+    document.title = appTitle
+  }, [appTitle])
 
   useEffect(() => {
     apiFetch<PublicSummary>("/public/summary", { skipAuthErrorHandler: true })
@@ -141,7 +148,7 @@ export default function HomePage() {
               <Route className="size-5" />
             </span>
             <div>
-              <p className="text-sm font-semibold">UpstreamOps</p>
+              <p className="text-sm font-semibold">{appTitle}</p>
               <p className="text-xs text-slate-400">AI 调度网关</p>
             </div>
           </div>
@@ -160,7 +167,7 @@ export default function HomePage() {
               实时调度状态公开页
             </Badge>
             <h1 className="text-4xl font-semibold leading-tight text-white sm:text-6xl">
-              UpstreamOps
+              {appTitle}
             </h1>
             <p className="mt-5 max-w-2xl text-base leading-7 text-slate-300 sm:text-lg">
               按存活状态、人工优先级和低倍率调度，上游恢复后自动回到更合适的线路。公开页只展示概览，不暴露敏感配置。

@@ -15,6 +15,8 @@ import HomePage from '@/app/home-page'
 import DashboardPage from '@/app/page'
 import ChannelsPage from '@/app/channels-page'
 import KeysPage from '@/app/keys-page'
+import GatewayPage from '@/app/gateway-page'
+import UsagePage from '@/app/usage-page'
 import NotificationsPage from '@/app/notifications-page'
 import SettingsPage from '@/app/settings-page'
 import '@/app/globals.css'
@@ -33,6 +35,8 @@ createRoot(document.getElementById('root')!).render(
                   <Route path="dashboard" element={<DashboardPage />} />
                   <Route path="channels" element={<ChannelsPage />} />
                   <Route path="keys" element={<KeysPage />} />
+                  <Route path="gateway" element={<GatewayPage />} />
+                  <Route path="usage" element={<UsagePage />} />
                   <Route path="notifications" element={<NotificationsPage />} />
                   <Route path="settings" element={<SettingsPage />} />
                 </Route>

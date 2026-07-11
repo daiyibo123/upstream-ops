@@ -596,6 +596,20 @@ func TestOrderCandidatesRespectsManualPriorityBeforeRatio(t *testing.T) {
 	}
 }
 
+func TestOrderCandidatesPrefersCharityBeforePaid(t *testing.T) {
+	// 公益渠道即便倍率更高，也应排在付费渠道前面。
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Status: "alive", Ratio: 0.01, Charity: false},        // 便宜的付费
+		{ID: 2, Status: "alive", Ratio: 0.5, Charity: true},          // 贵一点的公益
+		{ID: 3, Status: "alive", Ratio: 0.2, Charity: true},          // 更便宜的公益
+	}
+	ordered := orderCandidates(candidates)
+	// 公益先行：ID3(0.2公益) → ID2(0.5公益) → ID1(付费)
+	if ordered[0].ID != 3 || ordered[1].ID != 2 || ordered[2].ID != 1 {
+		t.Fatalf("charity should be scheduled before paid: %#v", ordered)
+	}
+}
+
 func TestHealthProbeRequiresGenerationSuccess(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -863,6 +877,60 @@ func TestProxyRetriesSameCandidateWithImageFallback(t *testing.T) {
 }
 
 // TestProxyFallsBackToChatWhenUpstreamLacksResponses 覆盖"不开路由直连"的关键场景：
+func TestProxySynthesizesCompletedWhenUpstreamDropsStreamMidway(t *testing.T) {
+	// 上游发了 delta 后直接把连接断掉（不发 response.completed），模拟真实的中途断流。
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			_, _ = w.Write([]byte("event: response.output_text.delta\n" +
+				"data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\",\"response_id\":\"resp_mid\",\"model\":\"gpt-test\"}\n\n"))
+			f.Flush()
+		}
+		// 用 hijack 直接断开，制造 EOF 之外的中途断流。
+		hj, ok := w.(http.Hijacker)
+		if ok {
+			conn, _, err := hj.Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("m", 32))
+	channel := &storage.Channel{Name: "mid-drop", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "mid-drop", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "pong") {
+		t.Fatalf("missing streamed delta: %s", out)
+	}
+	if !strings.Contains(out, "response.completed") {
+		t.Fatalf("gateway must synthesize response.completed even when upstream drops mid-stream: %s", out)
+	}
+}
+
+// TestProxyFallsBackToChatWhenUpstreamLacksResponses 覆盖"不开路由直连"的关键场景：
 // Codex 直连网关发原生 /v1/responses，但上游只支持 /v1/chat/completions（返回 404）。
 // 网关应在同一候选上自动降级到 chat 再打一次并成功，而不是把断流错误抛给客户端。
 func TestProxyFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
@@ -971,6 +1039,48 @@ func TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
 	}
 	if !strings.Contains(out, "response.completed") || !strings.Contains(out, "pong") || !strings.Contains(out, "[DONE]") {
 		t.Fatalf("stream fallback output malformed: %s", out)
+	}
+}
+
+func TestSynthesizesResponseCompletedWhenUpstreamOmitsIt(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		// 上游发了 delta，但故意不发 response.completed 就结束流（模拟不规范上游）。
+		_, _ = w.Write([]byte("event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\",\"response_id\":\"resp_x\",\"model\":\"gpt-test\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("y", 32))
+	channel := &storage.Channel{Name: "no-completed", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "no-completed", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "pong") {
+		t.Fatalf("missing delta content: %s", out)
+	}
+	if !strings.Contains(out, "response.completed") {
+		t.Fatalf("gateway should synthesize response.completed when upstream omits it: %s", out)
 	}
 }
 

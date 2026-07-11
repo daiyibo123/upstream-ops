@@ -134,6 +134,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&GatewayKey{},
 		&GatewayAffinity{},
 		&UpstreamGroupKey{},
+		&UsageLog{},
 	)
 }
 
