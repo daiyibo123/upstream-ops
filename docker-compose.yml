@@ -52,7 +52,9 @@ services:
   # 需要自动更新时用 `docker compose --profile autoupdate up -d` 显式开启，
   # 不想要自动更新的用户零负担。
   watchtower:
-    image: containrrr/watchtower:latest
+    # containrrr/watchtower 已停更，用的 Docker API 1.25 在新版 Docker（>=25）上会被拒。
+    # 换用社区活跃维护的 fork nickfedor/watchtower，配置与环境变量完全兼容。
+    image: nickfedor/watchtower:latest
     restart: unless-stopped
     profiles: ["autoupdate"]
     environment:
