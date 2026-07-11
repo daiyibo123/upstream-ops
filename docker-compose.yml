@@ -1,0 +1,71 @@
+name: upstream-ops
+
+services:
+  app:
+    image: ghcr.io/daiyibo123/upstream-ops:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["-config", "/app/data/config.yaml"]
+    labels:
+      # 只有带这个 label 的容器才会被 watchtower 纳管，避免它去动别的容器。
+      com.centurylinklabs.watchtower.enable: "true"
+    environment:
+      TZ: Asia/Shanghai
+      SERVER_PORT: 8418
+      DATABASE_DRIVER: sqlite
+      DATABASE_PATH: /app/data/upstream-ops.db
+      SERVER_MODE: ${SERVER_MODE:-release}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      APP_SECRET: ${APP_SECRET:?APP_SECRET is required, set it in .env}
+      # 自用模式建议默认开启鉴权；账号密码通过 .env / docker 环境变量初始化。
+      # AUTH_ENABLED=true 时必须显式设置 ADMIN_PASSWORD，否则 docker-compose 直接报错，
+      # 避免 auth 初始化失败导致容器无休止 crash-loop。
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required (set it in .env, or export AUTH_ENABLED=false for internal-only deployments)}
+      AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:-}
+    ports:
+      - "${HTTP_PORT:-8080}:8418"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8418/healthz >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── 自动更新侧车 ──────────────────────────────────────────────────────────
+  # watchtower 定时检查 app 镜像有没有新版：一旦 GitHub Actions 推了新的
+  # ghcr.io/daiyibo123/upstream-ops:latest，它会 docker pull 新镜像并用新版重建 app 容器。
+  #
+  # 关键取舍（都是为了 2C1G 上的稳定 + 可回退）：
+  #   * WATCHTOWER_LABEL_ENABLE=true —— 只动带 watchtower.enable=true 的 app，
+  #     绝不误伤别的容器，也不会更新 watchtower 自己。
+  #   * 不设 --cleanup —— 故意保留旧镜像。更新翻车时旧镜像还在本地，
+  #     `IMAGE_TAG=<旧 tag> docker compose up -d app` 一行即可秒回退。
+  #   * WATCHTOWER_POLL_INTERVAL 默认 6 小时，避免频繁拉取给小机器添压力；
+  #     想更快可在 .env 里调小，或直接在面板点「立即重启」让当前镜像先重启。
+  #   * WATCHTOWER_INCLUDE_RESTARTING/ROLLING_RESTART 关闭 —— 单容器无需滚动，
+  #     直接停旧起新，healthcheck 没过 compose 会自己重试拉起。
+  #
+  # profile=autoupdate：默认 `docker compose up -d` 不会带起 watchtower，
+  # 需要自动更新时用 `docker compose --profile autoupdate up -d` 显式开启，
+  # 不想要自动更新的用户零负担。
+  watchtower:
+    image: containrrr/watchtower:latest
+    restart: unless-stopped
+    profiles: ["autoupdate"]
+    environment:
+      TZ: Asia/Shanghai
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "false"
+      WATCHTOWER_POLL_INTERVAL: ${WATCHTOWER_POLL_INTERVAL:-21600}
+      WATCHTOWER_INCLUDE_RESTARTING: "false"
+      WATCHTOWER_ROLLING_RESTART: "false"
+      # 只监控本 compose 项目内的容器，进一步缩小影响面。
+      WATCHTOWER_SCOPE: ""
+    volumes:
+      # 只读挂 docker.sock：watchtower 需要它来 pull + 重建容器。
+      # 这是自动更新的固有代价，已通过 label-enable + 只读把权限收到最小。
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
