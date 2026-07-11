@@ -34,6 +34,24 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": key})
 	})
+	gp.PATCH("/keys/:id", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		var in gatewaySvc.UpdateGatewayKeyInput
+		if err := c.ShouldBindJSON(&in); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		key, err := d.Gateway.UpdateGatewayKey(id, in)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": key})
+	})
 	gp.POST("/keys/:id/reveal", func(c *gin.Context) {
 		id, err := uintParam(c, "id")
 		if err != nil {
@@ -85,8 +103,32 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": item})
 	})
-	gp.POST("/group-keys/bootstrap", func(c *gin.Context) {
-		result, err := d.Gateway.BootstrapGroupKeys(c.Request.Context())
+	gp.DELETE("/group-keys/:id", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		if err := d.Gateway.DeleteGroupKey(id); err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"deleted": true}})
+	})
+	gp.POST("/group-keys/:id/clear-cooldown", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		item, err := d.Gateway.ClearGroupKeyCooldown(id)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": item})
+	})
+	gp.POST("/group-keys/bootstrap", func(c *gin.Context) {		result, err := d.Gateway.BootstrapGroupKeys(c.Request.Context())
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return

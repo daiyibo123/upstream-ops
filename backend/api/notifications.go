@@ -128,6 +128,10 @@ func createNotifyChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusBadRequest, errors.New("config is required"))
 		return
 	}
+	if !allowedNotifyType(in.Type) {
+		fail(c, http.StatusBadRequest, errors.New("notification type is disabled"))
+		return
+	}
 	subs, err := normalizeSubscriptions(in.Subscriptions)
 	if err != nil {
 		fail(c, http.StatusBadRequest, err)
@@ -169,6 +173,10 @@ func updateNotifyChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusBadRequest, err)
 		return
 	}
+	if !allowedNotifyType(in.Type) {
+		fail(c, http.StatusBadRequest, errors.New("notification type is disabled"))
+		return
+	}
 	subs, err := normalizeSubscriptions(in.Subscriptions)
 	if err != nil {
 		fail(c, http.StatusBadRequest, err)
@@ -192,6 +200,15 @@ func updateNotifyChannel(c *gin.Context, d *Deps) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": ch})
+}
+
+func allowedNotifyType(t storage.NotificationChannelType) bool {
+	switch t {
+	case storage.NotifyEmail, storage.NotifyWecom, storage.NotifyFeishu:
+		return true
+	default:
+		return false
+	}
 }
 
 func testNotify(c *gin.Context, d *Deps) {

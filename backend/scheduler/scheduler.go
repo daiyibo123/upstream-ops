@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/bejix/upstream-ops/backend/captcha"
 	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/bejix/upstream-ops/backend/crypto"
 	"github.com/bejix/upstream-ops/backend/gateway"
@@ -101,11 +100,6 @@ func (s *Scheduler) runBalance() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	s.monitor.ScanAllBalances(ctx)
-	if s.captchas != nil && s.cipher != nil {
-		if _, err := captcha.RefreshAllBalancesWithProxy(ctx, s.captchas, s.cipher, s.log, s.proxy); err != nil {
-			s.log.Warn("refresh captcha balances failed", "err", err)
-		}
-	}
 }
 
 func (s *Scheduler) runRates() {

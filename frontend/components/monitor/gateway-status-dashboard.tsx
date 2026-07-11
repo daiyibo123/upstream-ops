@@ -143,6 +143,18 @@ export function GatewayStatusDashboard() {
   const dailyUsed = gateway?.today_tokens ?? 0
   const dailyPct = dailyLimit > 0 ? pct(dailyUsed, dailyLimit) : Math.min(100, dailyUsed > 0 ? 100 : 0)
   const cheapest = gateway?.cheapest ?? null
+  const dispatchOrder = groups
+    .filter((group) => group.enabled !== false)
+    .slice()
+    .sort((a, b) => {
+      const statusRank = (status: string) => (status === "alive" ? 0 : status === "unknown" ? 1 : 2)
+      return (
+        statusRank(a.status) - statusRank(b.status) ||
+        (b.priority || 0) - (a.priority || 0) ||
+        a.ratio - b.ratio ||
+        a.failure_count - b.failure_count
+      )
+    })
   const serverOk = server?.status === "ok" && server?.database === "ok"
 
   const statusData = [
@@ -381,7 +393,7 @@ export function GatewayStatusDashboard() {
             <div className="mb-3 flex items-center justify-between gap-2">
               <div>
                 <p className="text-sm font-semibold text-foreground">上游分组用量</p>
-                <p className="text-xs text-muted-foreground">调度器会优先选择存活且倍率最低的分组</p>
+                <p className="text-xs text-muted-foreground">调度器会优先选择存活、优先级更高且同级倍率更低的分组</p>
               </div>
               <Activity className="size-4 text-warning" />
             </div>
@@ -420,15 +432,13 @@ export function GatewayStatusDashboard() {
           <div className="rounded-md border border-border bg-background p-4">
             <div className="mb-3 flex items-center justify-between gap-2">
               <div>
-                <p className="text-sm font-semibold text-foreground">最近调度</p>
-                <p className="text-xs text-muted-foreground">按最近使用时间展示</p>
+                <p className="text-sm font-semibold text-foreground">省钱调度顺序</p>
+                <p className="text-xs text-muted-foreground">按存活状态、优先级和低倍率展示</p>
               </div>
               <Cpu className="size-4 text-muted-foreground" />
             </div>
             <div className="space-y-2">
-              {groups
-                .slice()
-                .sort((a, b) => new Date(b.last_used_at ?? 0).getTime() - new Date(a.last_used_at ?? 0).getTime())
+              {dispatchOrder
                 .slice(0, 5)
                 .map((group) => (
                   <div key={group.id} className="flex items-center justify-between gap-2 rounded-md border border-border px-3 py-2">
@@ -437,7 +447,7 @@ export function GatewayStatusDashboard() {
                         {group.channel_name} / {group.group_name}
                       </p>
                       <p className="truncate text-[11px] text-muted-foreground">
-                        倍率 {formatRatio(group.ratio)} · {relativeTime(group.last_used_at)}
+                        优先级 {group.priority || 0} · 倍率 {formatRatio(group.ratio)} · {relativeTime(group.last_used_at)}
                       </p>
                     </div>
                     <span

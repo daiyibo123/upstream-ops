@@ -7,7 +7,6 @@ import {
   LayoutDashboard,
   Plus,
   Settings,
-  ShieldCheck,
   type LucideIcon,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -158,12 +157,6 @@ export function DockBar() {
       label: "添加渠道",
       onAction: openAdd,
       gradient: "from-emerald-400 via-emerald-500 to-teal-600",
-    },
-    {
-      icon: ShieldCheck,
-      label: "打码平台",
-      path: "/captcha",
-      gradient: "from-fuchsia-400 via-purple-500 to-purple-700",
     },
     {
       icon: Bell,

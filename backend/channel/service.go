@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bejix/upstream-ops/backend/captcha"
 	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/bejix/upstream-ops/backend/connector"
 	"github.com/bejix/upstream-ops/backend/crypto"
@@ -191,7 +190,7 @@ func (s *Service) Create(in CreateInput) (*storage.Channel, error) {
 		PasswordCipher:         enc,
 		CredentialMode:         mode,
 		LoginExtraParams:       loginExtraParams,
-		TurnstileEnabled:       in.TurnstileEnabled && mode == storage.CredentialModePassword, // token 模式不需要打码
+		TurnstileEnabled:       in.TurnstileEnabled && mode == storage.CredentialModePassword, // token 模式不需要自动验证码
 		IgnoreAnnouncements:    in.IgnoreAnnouncements,
 		SubscriptionEnabled:    in.SubscriptionEnabled,
 		ProxyEnabled:           in.ProxyEnabled,
@@ -202,7 +201,7 @@ func (s *Service) Create(in CreateInput) (*storage.Channel, error) {
 		MonitorEnabled:         in.MonitorEnabled,
 	}
 	if mode == storage.CredentialModeToken {
-		// token 模式不依赖打码 provider
+		// token 模式不依赖自动验证码 provider
 		c.CaptchaConfigID = nil
 	}
 	if err := s.Channels.Create(c); err != nil {
@@ -326,7 +325,7 @@ func (s *Service) Update(id uint, in UpdateInput) (*storage.Channel, error) {
 			c.CaptchaConfigID = nil
 		}
 	} else if finalMode == storage.CredentialModeToken {
-		// token 模式强制清空打码绑定
+		// token 模式强制清空自动验证码绑定
 		c.CaptchaConfigID = nil
 	}
 	if in.BalanceThreshold != nil {
@@ -482,8 +481,7 @@ func (s *Service) ClearLoginInfo(id uint) (*storage.Channel, error) {
 
 // Resolve 把存储层的加密渠道解密成 connector 可用的 Channel。
 //
-// 注意：这一步**不**求解 Turnstile —— 打码只在真正要登录时做（见 prepareTurnstile），
-// 复用现有 session 的路径无需任何打码消耗。
+// 注意：这一步不处理 Turnstile；复用现有 session 的路径不应产生额外消耗。
 //
 // token 模式下 connector.Channel.Password 留空——connector 永远不会读到它。
 func (s *Service) Resolve(ctx context.Context, c *storage.Channel) (*connector.Channel, error) {
@@ -561,62 +559,23 @@ func (s *Service) buildSessionFromToken(c *storage.Channel) (*connector.AuthSess
 	}
 }
 
-// prepareTurnstile 在调用 conn.Login 之前求解 Turnstile token。
-// 没启用 turnstile 或者上游 site 公开接口说"未开启 Turnstile"时是空操作。
+// prepareTurnstile 保留旧配置兼容，但不再调用自动验证码平台。
+// 遇到机器人/Turnstile 拦截时请切到 token 模式，直接填写上游 Key 或 token。
 func (s *Service) prepareTurnstile(
 	ctx context.Context,
 	c *storage.Channel,
 	resolved *connector.Channel,
 	conn connector.Connector,
 ) error {
-	if !c.TurnstileEnabled || c.CaptchaConfigID == nil {
+	if !c.TurnstileEnabled {
 		return nil
 	}
-	progress.Start(ctx, progress.StageCaptcha, "求解 Turnstile…")
-	siteKey, err := conn.GetTurnstileSiteKey(ctx, resolved)
-	if err != nil {
-		progress.Fail(ctx, progress.StageCaptcha, err.Error())
-		return fmt.Errorf("fetch turnstile site key: %w", err)
-	}
-	if siteKey == "" {
-		progress.OK(ctx, progress.StageCaptcha, "上游未开启 Turnstile，跳过")
-		return nil
-	}
-	token, err := s.solveCaptcha(ctx, *c.CaptchaConfigID, siteKey, c.SiteURL)
-	if err != nil {
-		progress.Fail(ctx, progress.StageCaptcha, err.Error())
-		return fmt.Errorf("solve captcha: %w", err)
-	}
-	resolved.TurnstileToken = token
-	progress.OK(ctx, progress.StageCaptcha, "打码完成")
-	return nil
-}
-
-func (s *Service) solveCaptcha(ctx context.Context, captchaID uint, siteKey, pageURL string) (string, error) {
-	cfg, err := s.Captchas.FindByID(captchaID)
-	if err != nil {
-		return "", err
-	}
-	if !cfg.Enabled {
-		return "", errors.New("captcha config disabled")
-	}
-	apiKey, err := s.Cipher.Decrypt(cfg.APIKeyCipher)
-	if err != nil {
-		return "", err
-	}
-	proxyURL := ""
-	if cfg.ProxyEnabled {
-		var proxyErr error
-		proxyURL, proxyErr = s.proxyURL()
-		if proxyErr != nil {
-			return "", proxyErr
-		}
-	}
-	provider, err := captcha.BuildWithProxy(cfg, apiKey, proxyURL)
-	if err != nil {
-		return "", err
-	}
-	return provider.SolveTurnstile(ctx, siteKey, pageURL)
+	_ = resolved
+	_ = conn
+	progress.Start(ctx, progress.StageCaptcha, "跳过自动验证码")
+	err := errors.New("自动验证码平台已移除，请改用 token/key 模式添加此渠道")
+	progress.Fail(ctx, progress.StageCaptcha, err.Error())
+	return err
 }
 
 // EnsureSession 优先复用未过期的 session，否则重新登录并加密回写。
@@ -882,7 +841,7 @@ func (s *Service) decryptSession(saved *storage.AuthSession) (*connector.AuthSes
 }
 
 // TestLogin 手动测试登录：
-//   - password 模式：复用 login() 的完整流程（打码 → 登录 → 持久化）
+//   - password 模式：复用 login() 的完整流程（登录 → 持久化）
 //   - token 模式：直接走 EnsureSession，等同于检查 CheckAuth 是否通过
 func (s *Service) TestLogin(ctx context.Context, channelID uint) error {
 	c, err := s.Channels.FindByID(channelID)

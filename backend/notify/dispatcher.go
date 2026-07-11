@@ -349,7 +349,7 @@ func (d *Dispatcher) withNotificationPrefix(msg Message) Message {
 //   - 退避 = 2^(attempt-1) * 1s，上限 30s（即 1s / 2s / 4s / 8s / 16s / 30s ...）
 //   - ctx 被取消时立即返回，不再等待
 //
-// 注意：所有错误都会重试，包括 "Telegram 401 unauthorized" 这类永久错误。
+// 注意：所有错误都会重试，包括鉴权失败这类永久错误。
 // 单用户场景下，简单胜过复杂；如果反复重试相同 401，反正最多 SendMaxAttempts 次就停了。
 func (d *Dispatcher) sendWithRetry(ctx context.Context, channelName string, n Notifier, msg Message) error {
 	maxAttempts := d.Policy().SendMaxAttempts

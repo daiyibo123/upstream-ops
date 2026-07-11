@@ -20,10 +20,12 @@ import (
 const (
 	githubRepoURL              = "https://github.com/daiyibo123/upstream-ops"
 	defaultGitHubLatestRelease = "https://api.github.com/repos/daiyibo123/upstream-ops/releases/latest"
+	defaultGitHubTagsURL       = "https://api.github.com/repos/daiyibo123/upstream-ops/tags?per_page=1"
 )
 
 var (
 	githubLatestReleaseURL = defaultGitHubLatestRelease
+	githubTagsURL          = defaultGitHubTagsURL
 	githubReleaseClient    = &http.Client{Timeout: 2 * time.Second}
 )
 
@@ -41,6 +43,10 @@ type versionResponse struct {
 type githubReleaseResponse struct {
 	TagName string `json:"tag_name"`
 	HTMLURL string `json:"html_url"`
+}
+
+type githubTagResponse struct {
+	Name string `json:"name"`
 }
 
 func registerVersion(api *gin.RouterGroup, d *Deps) {
@@ -85,7 +91,7 @@ func handleUpgradeCommand(c *gin.Context) {
 		"command":       "docker compose pull && docker compose up -d",
 		"auto_update":   "docker compose --profile autoupdate up -d",
 		"rollback":      "IMAGE_TAG=<上一个可用版本> docker compose up -d app",
-		"description":   "拉取最新镜像并热替换。执行完后可点『立即重启』让容器切到新版本。若想让服务器发现新版自动更新，改用 auto_update 命令带起 watchtower 侧车（更新失败时旧镜像仍在本地，用 rollback 命令一行回退）。",
+		"description":   "只更新应用镜像，不覆盖 ./data 里的 config.yaml 和数据库。执行完后可点『立即重启』让容器切到新版本。若想自动更新，改用 auto_update 命令带起 watchtower 侧车（旧镜像仍保留，可用 rollback 一行回退）。",
 		"restart_after": true,
 		"repo_url":      githubRepoURL,
 	})
@@ -157,6 +163,9 @@ func fetchLatestGitHubRelease(ctx context.Context, client *http.Client) (string,
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusNotFound {
+			return fetchLatestGitHubTag(ctx, client)
+		}
 		return "", "", fmt.Errorf("github latest release status %d", resp.StatusCode)
 	}
 
@@ -171,6 +180,33 @@ func fetchLatestGitHubRelease(ctx context.Context, client *http.Client) (string,
 		release.HTMLURL = githubRepoURL
 	}
 	return release.TagName, release.HTMLURL, nil
+}
+
+func fetchLatestGitHubTag(ctx context.Context, client *http.Client) (string, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, githubTagsURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "upstream-ops")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("github tags status %d", resp.StatusCode)
+	}
+	var tags []githubTagResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tags); err != nil {
+		return "", "", err
+	}
+	if len(tags) == 0 || strings.TrimSpace(tags[0].Name) == "" {
+		return "", "", errors.New("github tags missing latest tag")
+	}
+	tag := strings.TrimSpace(tags[0].Name)
+	return tag, githubRepoURL + "/releases/tag/" + tag, nil
 }
 
 func isVersionNewer(latest, current string) bool {

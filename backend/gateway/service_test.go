@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -583,6 +584,60 @@ func TestOrderCandidatesUsesRuntimeLatencyWithinSamePrice(t *testing.T) {
 	}
 }
 
+func TestOrderCandidatesRespectsManualPriorityBeforeRatio(t *testing.T) {
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Status: "alive", Ratio: 0.01, Priority: 0},
+		{ID: 2, Status: "alive", Ratio: 1, Priority: 20},
+		{ID: 3, Status: "alive", Ratio: 0.05, Priority: 10},
+	}
+	ordered := orderCandidates(candidates)
+	if ordered[0].ID != 2 || ordered[1].ID != 3 || ordered[2].ID != 1 {
+		t.Fatalf("manual priority should win before ratio: %#v", ordered)
+	}
+}
+
+func TestHealthProbeRequiresGenerationSuccess(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test"}]}`))
+		case "/v1/responses":
+			_, _ = w.Write([]byte(`{"error":{"message":"generation blocked"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("l", 32))
+	channel := &storage.Channel{Name: "blocked-generation", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "blocked-generation", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "default")
+	if err != nil {
+		t.Fatalf("load group: %v", err)
+	}
+	status, _, _, err := env.svc.healthProbeCandidate(context.Background(), group)
+	if err == nil {
+		t.Fatalf("expected health probe to fail when generation endpoint returns error")
+	}
+	if status != http.StatusOK || !strings.Contains(err.Error(), "generation blocked") {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+}
+
 func TestProxySkipsCandidateAtConcurrencyLimit(t *testing.T) {
 	var limitedHits int64
 	limitedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -804,6 +859,118 @@ func TestProxyRetriesSameCandidateWithImageFallback(t *testing.T) {
 	}
 	if hits != 2 {
 		t.Fatalf("same candidate was not retried once: hits=%d", hits)
+	}
+}
+
+// TestProxyFallsBackToChatWhenUpstreamLacksResponses 覆盖"不开路由直连"的关键场景：
+// Codex 直连网关发原生 /v1/responses，但上游只支持 /v1/chat/completions（返回 404）。
+// 网关应在同一候选上自动降级到 chat 再打一次并成功，而不是把断流错误抛给客户端。
+func TestProxyFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
+	var responsesHits, chatHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/responses") {
+			responsesHits++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("404 page not found"))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/chat/completions") {
+			chatHits++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"chatcmpl_ok","model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("c", 32))
+	channel := &storage.Channel{Name: "chat-only", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "chat-only", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "pong") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if responsesHits != 1 || chatHits != 1 {
+		t.Fatalf("expected responses->chat fallback on same candidate: responses=%d chat=%d", responsesHits, chatHits)
+	}
+}
+
+// TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses 覆盖 Codex 直连的真实场景：
+// 流式 /v1/responses 打到只支持 chat 的上游，网关降级到 chat 流并把 chat chunk 转回
+// responses SSE 事件，客户端最终能收到 response.completed。
+func TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
+	var responsesHits, chatHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/responses") {
+			responsesHits++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte("404 page not found"))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/chat/completions") {
+			chatHits++
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_s\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl_s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl_s\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+				"data: [DONE]\n\n"))
+			return
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("s", 32))
+	channel := &storage.Channel{Name: "chat-only-stream", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "chat-only-stream", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	out := rec.Body.String()
+	if responsesHits != 1 || chatHits != 1 {
+		t.Fatalf("expected responses->chat stream fallback: responses=%d chat=%d", responsesHits, chatHits)
+	}
+	if !strings.Contains(out, "response.completed") || !strings.Contains(out, "pong") || !strings.Contains(out, "[DONE]") {
+		t.Fatalf("stream fallback output malformed: %s", out)
 	}
 }
 

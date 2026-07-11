@@ -1,11 +1,15 @@
 package api
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"runtime"
+	"sort"
 	"strconv"
 	"time"
 
+	"github.com/bejix/upstream-ops/backend/config"
+	gatewaySvc "github.com/bejix/upstream-ops/backend/gateway"
 	"github.com/gin-gonic/gin"
 )
 
@@ -17,6 +21,188 @@ func registerDashboard(g *gin.RouterGroup, d *Deps) {
 	g.GET("/dashboard/balance-trend", func(c *gin.Context) { dashboardBalanceTrend(c, d) })
 	g.GET("/dashboard/cost-trend", func(c *gin.Context) { dashboardCostTrend(c, d) })
 }
+
+func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
+	g.GET("/summary", func(c *gin.Context) {
+		channels, _ := d.Channels.List()
+		gateway := dashboardGateway(d)
+		publicKey := publicKeySummary(d)
+		publicGroups := make([]dashboardGatewayGroup, 0, 8)
+		for _, group := range gateway.Groups {
+			if !group.Enabled || group.Status == "dead" || group.Status == "disabled" {
+				continue
+			}
+			publicGroups = append(publicGroups, group)
+			if len(publicGroups) >= 8 {
+				break
+			}
+		}
+		openaiCount := 0
+		claudeCount := 0
+		for _, group := range gateway.Groups {
+			if !group.Enabled {
+				continue
+			}
+			switch group.ClientFormat {
+			case "claude":
+				claudeCount++
+			default:
+				openaiCount++
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{
+			"title":              "UpstreamOps",
+			"total_channels":     len(channels),
+			"active_channels":    gateway.AliveGroups,
+			"upstream_groups":    gateway.TotalGroups,
+			"available_groups":   gateway.AliveGroups + gateway.UnknownGroups,
+			"openai_groups":      openaiCount,
+			"claude_groups":      claudeCount,
+			"today_tokens":       gateway.TodayTokens,
+			"total_tokens":       gateway.TotalTokens,
+			"cheapest":           gateway.Cheapest,
+			"dispatch_preview":   publicGroups,
+			"supported_formats":  []string{"OpenAI /v1/chat/completions", "OpenAI /v1/responses", "Claude Messages 自动转 Responses"},
+			"gateway_status":     "online",
+			"public_key":         publicKey,
+			"public_key_enabled": publicKey.Enabled,
+		}})
+	})
+	g.POST("/key/reveal", func(c *gin.Context) {
+		var in struct {
+			Password string `json:"password"`
+		}
+		if err := c.ShouldBindJSON(&in); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		cfg, gatewayKey, ok := loadPublicKeyConfig(d)
+		if !ok || !cfg.Enabled || cfg.Key == "" || gatewayKey == nil {
+			fail(c, http.StatusNotFound, errPublicKeyUnavailable())
+			return
+		}
+		if publicKeyExpired(cfg.ExpiresAt) {
+			fail(c, http.StatusGone, errPublicKeyExpired())
+			return
+		}
+		if cfg.Password != "" && subtle.ConstantTimeCompare([]byte(in.Password), []byte(cfg.Password)) != 1 {
+			fail(c, http.StatusUnauthorized, errPublicKeyPassword())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{
+			"key":        cfg.Key,
+			"name":       publicKeyName(cfg),
+			"expires_at": cfg.ExpiresAt,
+		}})
+	})
+}
+
+type publicKeyStat struct {
+	Enabled          bool       `json:"enabled"`
+	Name             string     `json:"name"`
+	PasswordRequired bool       `json:"password_required"`
+	PasswordHint     string     `json:"password_hint,omitempty"`
+	ExpiresAt        string     `json:"expires_at,omitempty"`
+	Status           string     `json:"status"`
+	TodayTokens      int64      `json:"today_tokens"`
+	TotalTokens      int64      `json:"total_tokens"`
+	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
+}
+
+func publicKeySummary(d *Deps) publicKeyStat {
+	cfg, gatewayKey, ok := loadPublicKeyConfig(d)
+	if !ok {
+		return publicKeyStat{Status: "disabled"}
+	}
+	stat := publicKeyStat{
+		Enabled:          cfg.Enabled && cfg.Key != "",
+		Name:             publicKeyName(cfg),
+		PasswordRequired: cfg.Password != "",
+		PasswordHint:     cfg.PasswordHint,
+		ExpiresAt:        cfg.ExpiresAt,
+		Status:           "disabled",
+	}
+	if !stat.Enabled {
+		return stat
+	}
+	if publicKeyExpired(cfg.ExpiresAt) {
+		stat.Status = "expired"
+		return stat
+	}
+	if gatewayKey == nil {
+		stat.Status = "unavailable"
+		return stat
+	}
+	stat.Status = "available"
+	todayTokens := gatewayKey.TodayTokens
+	if gatewayKey.UsageDate != "" && gatewayKey.UsageDate != time.Now().Format("2006-01-02") {
+		todayTokens = 0
+	}
+	stat.TodayTokens = todayTokens
+	stat.TotalTokens = gatewayKey.TotalTokens
+	stat.LastUsedAt = gatewayKey.LastUsedAt
+	return stat
+}
+
+func loadPublicKeyConfig(d *Deps) (config.PublicKeyConfig, *gatewaySvc.GatewayKeyOutput, bool) {
+	if d == nil || d.Runtime == nil {
+		return config.PublicKeyConfig{}, nil, false
+	}
+	cfg, err := config.LoadFile(d.Runtime.ConfigPath())
+	if err != nil {
+		return config.PublicKeyConfig{}, nil, false
+	}
+	publicKey := cfg.App.PublicKey
+	if d.Gateway == nil || publicKey.Key == "" {
+		return publicKey, nil, true
+	}
+	key, err := d.Gateway.FindGatewayKeyByRaw(publicKey.Key)
+	if err != nil {
+		return publicKey, nil, true
+	}
+	return publicKey, key, true
+}
+
+func publicKeyName(cfg config.PublicKeyConfig) string {
+	if cfg.Name != "" {
+		return cfg.Name
+	}
+	return "公益 Key"
+}
+
+func publicKeyExpired(raw string) bool {
+	expiresAt, ok := parsePublicKeyExpiry(raw)
+	return ok && time.Now().After(expiresAt)
+}
+
+func parsePublicKeyExpiry(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339, raw); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse("2006-01-02", raw); err == nil {
+		return t.Add(24*time.Hour - time.Nanosecond), true
+	}
+	return time.Time{}, false
+}
+
+func errPublicKeyUnavailable() error {
+	return publicKeyError("public key is not available")
+}
+
+func errPublicKeyExpired() error {
+	return publicKeyError("public key expired")
+}
+
+func errPublicKeyPassword() error {
+	return publicKeyError("public key password mismatch")
+}
+
+type publicKeyError string
+
+func (e publicKeyError) Error() string { return string(e) }
 
 type dashboardLowest struct {
 	ChannelID uint     `json:"channel_id"`
@@ -55,8 +241,11 @@ type dashboardGatewayGroup struct {
 	ID            uint       `json:"id"`
 	ChannelID     uint       `json:"channel_id"`
 	ChannelName   string     `json:"channel_name"`
+	ClientFormat  string     `json:"client_format"`
 	GroupName     string     `json:"group_name"`
 	Ratio         float64    `json:"ratio"`
+	Priority      int        `json:"priority"`
+	Enabled       bool       `json:"enabled"`
 	Status        string     `json:"status"`
 	FailureCount  int        `json:"failure_count"`
 	TotalTokens   int64      `json:"total_tokens"`
@@ -194,7 +383,12 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 	}
 	stat.TotalGroups = len(groups)
 	for _, group := range groups {
-		switch group.Status {
+		status := group.Status
+		if !group.Enabled {
+			status = "disabled"
+		}
+		switch status {
+		case "disabled":
 		case "alive":
 			stat.AliveGroups++
 		case "dead":
@@ -208,9 +402,12 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			ID:            group.ID,
 			ChannelID:     group.ChannelID,
 			ChannelName:   group.ChannelName,
+			ClientFormat:  group.ClientFormat,
 			GroupName:     group.GroupName,
 			Ratio:         group.Ratio,
-			Status:        group.Status,
+			Priority:      group.Priority,
+			Enabled:       group.Enabled,
+			Status:        status,
 			FailureCount:  group.FailureCount,
 			TotalTokens:   group.TotalTokens,
 			LastCheckedAt: group.LastCheckedAt,
@@ -218,14 +415,46 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			LastError:     group.LastError,
 		}
 		stat.Groups = append(stat.Groups, g)
-		if group.Status == "alive" || group.Status == "unknown" {
+		if group.Enabled && (group.Status == "alive" || group.Status == "unknown") {
 			if stat.Cheapest == nil || group.Ratio < stat.Cheapest.Ratio {
 				copy := g
 				stat.Cheapest = &copy
 			}
 		}
 	}
+	sort.SliceStable(stat.Groups, func(i, j int) bool {
+		return dashboardGroupLess(stat.Groups[i], stat.Groups[j])
+	})
 	return stat
+}
+
+func dashboardGroupLess(a, b dashboardGatewayGroup) bool {
+	if rankA, rankB := dashboardStatusRank(a.Status), dashboardStatusRank(b.Status); rankA != rankB {
+		return rankA < rankB
+	}
+	if a.Priority != b.Priority {
+		return a.Priority > b.Priority
+	}
+	if a.Ratio != b.Ratio {
+		return a.Ratio < b.Ratio
+	}
+	if a.FailureCount != b.FailureCount {
+		return a.FailureCount < b.FailureCount
+	}
+	return a.ID < b.ID
+}
+
+func dashboardStatusRank(status string) int {
+	switch status {
+	case "alive":
+		return 0
+	case "unknown":
+		return 1
+	case "dead":
+		return 2
+	default:
+		return 3
+	}
 }
 
 func dashboardServer(d *Deps) dashboardServerStat {

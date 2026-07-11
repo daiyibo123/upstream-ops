@@ -1,4 +1,4 @@
-package monitor
+﻿package monitor
 
 import (
 	"context"
@@ -59,23 +59,14 @@ func TestRefreshRatesSyncAnnouncementsAndNotify(t *testing.T) {
 	var webhookHits atomic.Int32
 	webhookSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		webhookHits.Add(1)
-		var body struct {
-			Event string `json:"event"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("decode webhook: %v", err)
-		}
-		if body.Event != string(storage.EventAnnouncement) {
-			t.Fatalf("webhook event = %q, want announcement", body.Event)
-		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer webhookSrv.Close()
 
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
-		Name:         "webhook",
-		Type:         storage.NotifyWebhook,
-		ConfigCipher: mustEncrypt(t, cipher, `{"url":"`+webhookSrv.URL+`"}`),
+		Name:         "wecom",
+		Type:         storage.NotifyWecom,
+		ConfigCipher: mustEncrypt(t, cipher, `{"webhook_url":"`+webhookSrv.URL+`"}`),
 	}); err != nil {
 		t.Fatalf("create notify channel: %v", err)
 	}
@@ -177,9 +168,9 @@ func TestRefreshRatesSkipsAnnouncementsWhenIgnored(t *testing.T) {
 	defer webhookSrv.Close()
 
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
-		Name:         "webhook",
-		Type:         storage.NotifyWebhook,
-		ConfigCipher: mustEncrypt(t, cipher, `{"url":"`+webhookSrv.URL+`"}`),
+		Name:         "wecom",
+		Type:         storage.NotifyWecom,
+		ConfigCipher: mustEncrypt(t, cipher, `{"webhook_url":"`+webhookSrv.URL+`"}`),
 	}); err != nil {
 		t.Fatalf("create notify channel: %v", err)
 	}
@@ -264,9 +255,9 @@ func TestRefreshRatesEmitsRateAddedAndRemoved(t *testing.T) {
 	defer webhookSrv.Close()
 
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
-		Name:         "webhook",
-		Type:         storage.NotifyWebhook,
-		ConfigCipher: mustEncrypt(t, cipher, `{"url":"`+webhookSrv.URL+`"}`),
+		Name:         "wecom",
+		Type:         storage.NotifyWecom,
+		ConfigCipher: mustEncrypt(t, cipher, `{"webhook_url":"`+webhookSrv.URL+`"}`),
 	}); err != nil {
 		t.Fatalf("create notify channel: %v", err)
 	}
@@ -397,9 +388,9 @@ func TestRefreshRatesAfterChannelReuseDoesNotEmitOldStructureChange(t *testing.T
 	defer webhookSrv.Close()
 
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
-		Name:         "webhook",
-		Type:         storage.NotifyWebhook,
-		ConfigCipher: mustEncrypt(t, cipher, `{"url":"`+webhookSrv.URL+`"}`),
+		Name:         "wecom",
+		Type:         storage.NotifyWecom,
+		ConfigCipher: mustEncrypt(t, cipher, `{"webhook_url":"`+webhookSrv.URL+`"}`),
 	}); err != nil {
 		t.Fatalf("create notify channel: %v", err)
 	}
@@ -507,9 +498,9 @@ func TestRateEventSubscriptionFiltersGroups(t *testing.T) {
 	defer webhookSrv.Close()
 
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
-		Name:          "webhook",
-		Type:          storage.NotifyWebhook,
-		ConfigCipher:  mustEncrypt(t, cipher, `{"url":"`+webhookSrv.URL+`"}`),
+		Name:          "wecom",
+		Type:          storage.NotifyWecom,
+		ConfigCipher:  mustEncrypt(t, cipher, `{"webhook_url":"`+webhookSrv.URL+`"}`),
 		Subscriptions: `[{"channel_id":1,"mode":"groups","groups":["beta"]}]`,
 	}); err != nil {
 		t.Fatalf("create notify channel: %v", err)
@@ -625,25 +616,14 @@ func TestSubscriptionUsageAlertsAndCooldown(t *testing.T) {
 	var webhookHits atomic.Int32
 	webhookSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		webhookHits.Add(1)
-		var body struct {
-			Event string `json:"event"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("decode webhook: %v", err)
-		}
-		if body.Event != string(storage.EventSubscriptionDailyLow) &&
-			body.Event != string(storage.EventSubscriptionMonthlyLow) &&
-			body.Event != string(storage.EventSubscriptionExpiring) {
-			t.Fatalf("unexpected event = %q", body.Event)
-		}
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	defer webhookSrv.Close()
 
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
-		Name:         "webhook",
-		Type:         storage.NotifyWebhook,
-		ConfigCipher: mustEncrypt(t, cipher, `{"url":"`+webhookSrv.URL+`"}`),
+		Name:         "wecom",
+		Type:         storage.NotifyWecom,
+		ConfigCipher: mustEncrypt(t, cipher, `{"webhook_url":"`+webhookSrv.URL+`"}`),
 	}); err != nil {
 		t.Fatalf("create notify channel: %v", err)
 	}

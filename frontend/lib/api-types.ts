@@ -10,19 +10,9 @@ export type CredentialMode = "password" | "token"
 export type RechargeMultiplierMode = "divide" | "multiply"
 
 export type NotificationChannelType =
-  | "telegram"
-  | "webhook"
   | "email"
   | "wecom"
-  | "dingtalk"
   | "feishu"
-  | "serverchan3"
-
-export type CaptchaProviderType =
-  | "capsolver"
-  | "2captcha"
-  | "anticaptcha"
-  | "yescaptcha"
 
 export type MonitorJob = "login" | "balance" | "rates"
 
@@ -34,7 +24,6 @@ export type NotificationEvent =
   | "rate_removed"
   | "announcement"
   | "login_failed"
-  | "captcha_failed"
   | "monitor_failed"
   | "subscription_daily_remaining_low"
   | "subscription_weekly_remaining_low"
@@ -75,22 +64,6 @@ export interface ChannelPage {
   page: number
   page_size: number
   pages: number
-}
-
-export interface CaptchaConfig {
-  id: number
-  name: string
-  type: CaptchaProviderType
-  endpoint?: string
-  extra?: string
-  enabled: boolean
-  proxy_enabled: boolean
-  last_balance?: number | null
-  balance_unit?: string
-  balance_at?: string | null
-  balance_error?: string
-  created_at: string
-  updated_at: string
 }
 
 export interface RateSnapshot {
@@ -207,8 +180,11 @@ export interface DashboardGatewayGroup {
   id: number
   channel_id: number
   channel_name: string
+  client_format?: "openai" | "claude" | "any" | string
   group_name: string
   ratio: number
+  priority: number
+  enabled: boolean
   status: string
   failure_count: number
   total_tokens: number
@@ -291,9 +267,19 @@ export interface SystemAuthConfig {
   sessionTTLHours: number
 }
 
+export interface SystemPublicKeyConfig {
+  enabled: boolean
+  name: string
+  key: string
+  password: string
+  passwordHint: string
+  expiresAt: string
+}
+
 export interface AppConfig {
   title: string
   notificationPrefix: string
+  publicKey: SystemPublicKeyConfig
 }
 
 export interface SystemSchedulerRetentionConfig {
@@ -402,72 +388,6 @@ export interface ChannelRedeemResult {
   validity_days?: number
 }
 
-export type RechargePaymentMethod = "alipay" | "wxpay"
-export type SubscriptionPaymentMethod =
-  | "balance"
-  | "alipay"
-  | "wxpay"
-  | "stripe"
-  | "creem"
-  | "waffo_pancake"
-  | string
-
-export interface ChannelRechargeMethod {
-  type: RechargePaymentMethod
-  name: string
-  min_amount: number
-  max_amount: number
-}
-
-export interface ChannelRechargeInfo {
-  amount_label: string
-  amount_step: number
-  min_amount: number
-  max_amount: number
-  preset_amounts: number[]
-  help_text?: string
-  help_image_url?: string
-  alipay_force_qrcode: boolean
-  methods: ChannelRechargeMethod[]
-}
-
-export interface ChannelRechargeLaunch {
-  mode: "qrcode" | "redirect" | "form" | "success"
-  qr_code?: string
-  pay_url?: string
-  form_action?: string
-  form_fields?: Record<string, string>
-  expires_at?: string
-}
-
-export interface ChannelSubscriptionMethod {
-  type: SubscriptionPaymentMethod
-  name: string
-}
-
-export interface ChannelSubscriptionPlan {
-  id: string
-  name: string
-  description?: string
-  price: number
-  currency?: string
-  validity?: string
-  group_name?: string
-  quota?: number
-  daily_limit_usd?: number | null
-  weekly_limit_usd?: number | null
-  monthly_limit_usd?: number | null
-  features?: string[]
-  payment_methods?: string[]
-}
-
-export interface ChannelSubscriptionInfo {
-  plans: ChannelSubscriptionPlan[]
-  methods: ChannelSubscriptionMethod[]
-}
-
-export type ChannelSubscriptionLaunch = ChannelRechargeLaunch
-
 export interface ChannelSubscriptionUsageWindow {
   limit_usd: number
   used_usd: number
@@ -571,6 +491,8 @@ export interface GatewayKey {
   key_prefix: string
   key?: string
   enabled: boolean
+  client_format: "openai" | "claude" | "any" | string
+  allowed_group_ids?: number[]
   daily_limit: number
   total_limit: number
   today_tokens: number
@@ -592,10 +514,14 @@ export interface UpstreamGroupKey {
   channel_id: number
   channel_name?: string
   channel_type: ChannelType
+  client_format?: "openai" | "claude" | "any" | string
+  request_mode?: "responses" | "chat" | string
   group_ref: string
   group_name: string
   group_description?: string
   ratio: number
+  priority: number
+  enabled: boolean
   upstream_key_id: number
   status: "unknown" | "alive" | "dead" | "disabled" | string
   concurrency_limit: number
@@ -604,6 +530,7 @@ export interface UpstreamGroupKey {
   completion_tokens: number
   total_tokens: number
   last_checked_at?: string | null
+  last_latency_ms?: number
   last_success_at?: string | null
   last_used_at?: string | null
   disabled_until?: string | null

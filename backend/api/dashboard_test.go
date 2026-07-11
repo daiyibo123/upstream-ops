@@ -1,4 +1,4 @@
-package api
+﻿package api
 
 import (
 	"context"
@@ -145,7 +145,7 @@ func TestNotificationsLogsPage(t *testing.T) {
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
 		ID:            1,
 		Name:          "alpha",
-		Type:          storage.NotifyTelegram,
+		Type:          storage.NotifyFeishu,
 		ConfigCipher:  "x",
 		Subscriptions: "[]",
 		Enabled:       true,
@@ -155,7 +155,7 @@ func TestNotificationsLogsPage(t *testing.T) {
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
 		ID:            2,
 		Name:          "beta",
-		Type:          storage.NotifyWebhook,
+		Type:          storage.NotifyWecom,
 		ConfigCipher:  "y",
 		Subscriptions: "[]",
 		Enabled:       true,
@@ -676,9 +676,9 @@ func syncSubscriptionAlertTest(t *testing.T, path string) {
 	defer webhookSrv.Close()
 
 	if err := notifies.CreateChannel(&storage.NotificationChannel{
-		Name:         "webhook",
-		Type:         storage.NotifyWebhook,
-		ConfigCipher: mustEncryptAPI(t, cipher, `{"url":"`+webhookSrv.URL+`"}`),
+		Name:         "wecom",
+		Type:         storage.NotifyWecom,
+		ConfigCipher: mustEncryptAPI(t, cipher, `{"webhook_url":"`+webhookSrv.URL+`"}`),
 		Enabled:      true,
 	}); err != nil {
 		t.Fatalf("create notification channel: %v", err)

@@ -27,6 +27,16 @@ type Config struct {
 type AppConfig struct {
 	Title              string `mapstructure:"title" yaml:"title" json:"title"`
 	NotificationPrefix string `mapstructure:"notificationPrefix" yaml:"notificationPrefix" json:"notificationPrefix"`
+	PublicKey          PublicKeyConfig `mapstructure:"publicKey" yaml:"publicKey" json:"publicKey"`
+}
+
+type PublicKeyConfig struct {
+	Enabled      bool   `mapstructure:"enabled" yaml:"enabled" json:"enabled"`
+	Name         string `mapstructure:"name" yaml:"name" json:"name"`
+	Key          string `mapstructure:"key" yaml:"key" json:"key"`
+	Password     string `mapstructure:"password" yaml:"password" json:"password"`
+	PasswordHint string `mapstructure:"passwordHint" yaml:"passwordHint" json:"passwordHint"`
+	ExpiresAt    string `mapstructure:"expiresAt" yaml:"expiresAt" json:"expiresAt"`
 }
 
 type ServerConfig struct {
@@ -299,6 +309,8 @@ func configSearchPaths() []string {
 func setDefaults(v *viper.Viper) {
 	v.SetDefault("app.title", "UpstreamOps")
 	v.SetDefault("app.notificationPrefix", "[AI 聚合监控] ")
+	v.SetDefault("app.publicKey.enabled", false)
+	v.SetDefault("app.publicKey.name", "公益 Key")
 
 	v.SetDefault("server.port", 8418)
 	v.SetDefault("server.mode", "debug")

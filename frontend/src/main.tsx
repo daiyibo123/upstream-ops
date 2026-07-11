@@ -11,8 +11,10 @@ import { AuthGate } from '@/components/auth/auth-gate'
 import { AppShell } from '@/components/app-shell'
 import { Toaster } from '@/components/ui/sonner'
 import { LoginPage } from '@/components/auth/login-page'
+import HomePage from '@/app/home-page'
 import DashboardPage from '@/app/page'
-import CaptchaPage from '@/app/captcha-page'
+import ChannelsPage from '@/app/channels-page'
+import KeysPage from '@/app/keys-page'
 import NotificationsPage from '@/app/notifications-page'
 import SettingsPage from '@/app/settings-page'
 import '@/app/globals.css'
@@ -21,24 +23,24 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <ThemeProvider attribute="class" defaultTheme="light" enableSystem disableTransitionOnChange>
       <AuthProvider>
-        <AuthGate>
-          <RefreshProvider>
-            <BrowserRouter>
-              <AddChannelProvider>
-                <Routes>
-                  <Route element={<AppShell />}>
-                    <Route index element={<DashboardPage />} />
-                    <Route path="captcha" element={<CaptchaPage />} />
-                    <Route path="notifications" element={<NotificationsPage />} />
-                    <Route path="settings" element={<SettingsPage />} />
-                    <Route path="login" element={<LoginPage />} />
-                  </Route>
-                </Routes>
-              </AddChannelProvider>
-            </BrowserRouter>
-          </RefreshProvider>
+        <RefreshProvider>
+          <BrowserRouter>
+            <AddChannelProvider>
+              <Routes>
+                <Route index element={<HomePage />} />
+                <Route path="login" element={<LoginPage />} />
+                <Route element={<AuthGate><AppShell /></AuthGate>}>
+                  <Route path="dashboard" element={<DashboardPage />} />
+                  <Route path="channels" element={<ChannelsPage />} />
+                  <Route path="keys" element={<KeysPage />} />
+                  <Route path="notifications" element={<NotificationsPage />} />
+                  <Route path="settings" element={<SettingsPage />} />
+                </Route>
+              </Routes>
+            </AddChannelProvider>
+          </BrowserRouter>
+        </RefreshProvider>
           <Toaster richColors closeButton position="top-right" />
-        </AuthGate>
       </AuthProvider>
     </ThemeProvider>
   </StrictMode>,

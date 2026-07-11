@@ -6,7 +6,6 @@ import { useRefreshTick } from "@/lib/refresh-context"
 import type {
   AppVersion,
   BalanceTrendPoint,
-  CaptchaConfig,
   Channel,
   ChannelPage,
   CostTrendPoint,
@@ -227,10 +226,6 @@ export function useAnnouncements(page = 1, pageSize = 20) {
   return useApi<UpstreamAnnouncementPage>(
     `/announcements?page=${page}&page_size=${pageSize}`,
   )
-}
-
-export function useCaptchaConfigs(enabled = true) {
-  return useApi<CaptchaConfig[]>(enabled ? "/captcha-configs" : null)
 }
 
 export function useSystemConfig() {

@@ -30,7 +30,6 @@ import {
 import type { Channel, ChannelType, CredentialMode, RechargeMultiplierMode } from "@/lib/api-types"
 import { apiFetch } from "@/lib/api"
 import { useTriggerRefresh } from "@/lib/refresh-context"
-import { useCaptchaConfigs } from "@/lib/queries"
 import { cn } from "@/lib/utils"
 
 interface ChannelFormDialogProps {
@@ -136,7 +135,6 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const refresh = useTriggerRefresh()
-  const captchas = useCaptchaConfigs(open)
 
   // 打开 / 切换目标渠道时重置表单。
   useEffect(() => {
@@ -232,13 +230,7 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
         }
       }
 
-      // 打码 provider 只在 password 模式 + 启用 Turnstile 时生效
-      const useCaptcha = !isTokenMode && form.turnstile_enabled
-      const captchaConfigID =
-        useCaptcha && form.captcha_config_id ? Number(form.captcha_config_id) : null
-      if (useCaptcha && captchaConfigID == null) {
-        throw new Error("启用 Turnstile 时必须选择一个打码 provider")
-      }
+      const captchaConfigID = null
 
       // password 模式下的密码校验
       if (!isTokenMode) {
@@ -258,7 +250,7 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
           recharge_multiplier: rechargeMultiplier,
           recharge_multiplier_mode: form.recharge_multiplier_mode,
           monitor_enabled: form.monitor_enabled,
-          turnstile_enabled: !isTokenMode && form.turnstile_enabled,
+          turnstile_enabled: false,
           ignore_announcements: form.ignore_announcements,
           subscription_enabled: supportsSubscription && form.subscription_enabled,
           proxy_enabled: form.proxy_enabled,
@@ -287,7 +279,7 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
             recharge_multiplier: rechargeMultiplier,
             recharge_multiplier_mode: form.recharge_multiplier_mode,
             monitor_enabled: form.monitor_enabled,
-            turnstile_enabled: !isTokenMode && form.turnstile_enabled,
+            turnstile_enabled: false,
             ignore_announcements: form.ignore_announcements,
             subscription_enabled: supportsSubscription && form.subscription_enabled,
             proxy_enabled: form.proxy_enabled,
@@ -405,8 +397,8 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
             </div>
             <p className="text-[11px] text-muted-foreground">
               {isTokenMode
-                ? "粘贴浏览器里已登录后的 Token / Cookie。失效时需要手动重新粘贴。"
-                : "提供账号密码，系统自动登录并续期。可能需要配打码 provider。"}
+                ? "粘贴上游已生成的 Token / Cookie / Key，跳过登录和机器人校验。失效时需要手动重新粘贴。"
+                : "提供账号密码，系统自动登录并续期；如果上游机器人拦截，请切换到 Token 模式直接填 Key。"}
             </p>
           </div>
 
@@ -635,39 +627,6 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
             />
           </div>
 
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="space-y-1.5">
-              <Label htmlFor="recharge-multiplier">充值倍率（留空 = 跟随上游）</Label>
-              <Input
-                id="recharge-multiplier"
-                type="number"
-                step="0.0001"
-                min="0"
-                value={form.recharge_multiplier}
-                onChange={(e) => setForm({ ...form, recharge_multiplier: e.target.value })}
-                disabled={submitting}
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="recharge-multiplier-mode">换算方式</Label>
-              <Select
-                value={form.recharge_multiplier_mode}
-                onValueChange={(v) =>
-                  setForm({ ...form, recharge_multiplier_mode: v as RechargeMultiplierMode })
-                }
-                disabled={submitting}
-              >
-                <SelectTrigger id="recharge-multiplier-mode" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="divide">余额 / 倍率</SelectItem>
-                  <SelectItem value="multiply">余额 × 倍率</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
           <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
             <div>
               <p className="text-sm font-medium">启用监控</p>
@@ -696,7 +655,7 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
             <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
               <div>
                 <p className="text-sm font-medium">启用订阅购买</p>
-                <p className="text-xs text-muted-foreground">开启后充值弹窗显示订阅购买</p>
+                <p className="text-xs text-muted-foreground">开启后展示订阅用量并参与订阅提醒</p>
               </div>
               <Switch
                 checked={form.subscription_enabled}
@@ -717,56 +676,6 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
               disabled={submitting}
             />
           </div>
-
-          {/* Turnstile / 打码：token 模式下整段不展示 */}
-          {!isTokenMode ? (
-            <>
-              <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
-                <div>
-                  <p className="text-sm font-medium">Turnstile 人机校验</p>
-                  <p className="text-xs text-muted-foreground">站点开启 Cloudflare Turnstile 时打开</p>
-                </div>
-                <Switch
-                  checked={form.turnstile_enabled}
-                  onCheckedChange={(v) => setForm({ ...form, turnstile_enabled: v })}
-                  disabled={submitting}
-                />
-              </div>
-
-              {form.turnstile_enabled ? (
-                <div className="space-y-1.5">
-                  <Label htmlFor="captcha-config">打码 provider</Label>
-                  <Select
-                    value={form.captcha_config_id}
-                    onValueChange={(v) => setForm({ ...form, captcha_config_id: v })}
-                    disabled={submitting}
-                  >
-                    <SelectTrigger id="captcha-config" className="w-full">
-                      <SelectValue
-                        placeholder={
-                          captchas.data && captchas.data.length > 0
-                            ? "选择 provider"
-                            : "先到底部 [验证码服务] 卡片新增"
-                        }
-                      />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {(captchas.data ?? [])
-                        .filter((c) => c.enabled)
-                        .map((c) => (
-                          <SelectItem key={c.id} value={String(c.id)}>
-                            {c.name}
-                          </SelectItem>
-                        ))}
-                    </SelectContent>
-                  </Select>
-                  <p className="text-[11px] text-muted-foreground">
-                    {"siteKey 会自动从上游公开接口拉取，无需在此填写。"}
-                  </p>
-                </div>
-              ) : null}
-            </>
-          ) : null}
 
           {error ? (
             <p className="text-sm text-destructive" role="alert">

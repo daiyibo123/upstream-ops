@@ -32,8 +32,6 @@ func registerChannels(g *gin.RouterGroup, d *Deps) {
 	gp.POST("/:id/refresh-balance", func(c *gin.Context) { refreshBalance(c, d) })
 	gp.POST("/:id/refresh-rates", func(c *gin.Context) { refreshRates(c, d) })
 	gp.POST("/:id/redeem", func(c *gin.Context) { redeemChannel(c, d) })
-	gp.GET("/:id/recharge-info", func(c *gin.Context) { channelRechargeInfo(c, d) })
-	gp.POST("/:id/recharge", func(c *gin.Context) { createChannelRecharge(c, d) })
 	gp.GET("/:id/subscription-info", func(c *gin.Context) { channelSubscriptionInfo(c, d) })
 	gp.POST("/:id/subscription", func(c *gin.Context) { createChannelSubscription(c, d) })
 	gp.GET("/:id/subscription-usage", func(c *gin.Context) { channelSubscriptionUsage(c, d) })
@@ -96,12 +94,6 @@ type channelOutput struct {
 
 type channelRedeemInput struct {
 	Code string `json:"code"`
-}
-
-type channelRechargeInput struct {
-	Amount        float64 `json:"amount"`
-	PaymentMethod string  `json:"payment_method"`
-	IsMobile      bool    `json:"is_mobile"`
 }
 
 type channelSubscriptionInput struct {
@@ -401,51 +393,6 @@ func redeemChannel(c *gin.Context, d *Deps) {
 		return
 	}
 	res, err := d.ChannelSvc.RedeemCode(c.Request.Context(), id, in.Code)
-	if err != nil {
-		fail(c, http.StatusBadRequest, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"data": res})
-}
-
-func channelRechargeInfo(c *gin.Context, d *Deps) {
-	id, err := uintParam(c, "id")
-	if err != nil {
-		fail(c, http.StatusBadRequest, err)
-		return
-	}
-	info, err := d.ChannelSvc.GetRechargeInfo(c.Request.Context(), id)
-	if err != nil {
-		fail(c, http.StatusBadRequest, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"data": info})
-}
-
-func createChannelRecharge(c *gin.Context, d *Deps) {
-	id, err := uintParam(c, "id")
-	if err != nil {
-		fail(c, http.StatusBadRequest, err)
-		return
-	}
-	var in channelRechargeInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		fail(c, http.StatusBadRequest, err)
-		return
-	}
-	if in.Amount <= 0 {
-		fail(c, http.StatusBadRequest, fmt.Errorf("充值金额必须大于 0"))
-		return
-	}
-	if in.PaymentMethod != "alipay" && in.PaymentMethod != "wxpay" {
-		fail(c, http.StatusBadRequest, fmt.Errorf("仅支持 alipay 或 wxpay"))
-		return
-	}
-	res, err := d.ChannelSvc.CreateRecharge(c.Request.Context(), id, connector.RechargeRequest{
-		Amount:        in.Amount,
-		PaymentMethod: in.PaymentMethod,
-		IsMobile:      in.IsMobile,
-	})
 	if err != nil {
 		fail(c, http.StatusBadRequest, err)
 		return

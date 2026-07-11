@@ -71,3 +71,4 @@ docs/md
 
 # Local runtime data (sqlite db, generated config)
 /data/
+.tmp-home/

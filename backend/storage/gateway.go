@@ -2,9 +2,11 @@ package storage
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type GatewayKeys struct{ db *gorm.DB }
@@ -100,24 +102,22 @@ func (r *GatewayAffinities) Find(hash string, now time.Time) (*GatewayAffinity, 
 }
 
 func (r *GatewayAffinities) Upsert(hash string, groupKeyID uint, expiresAt time.Time, now time.Time) error {
-	var item GatewayAffinity
-	err := r.db.Where("affinity_hash = ?", hash).First(&item).Error
-	switch {
-	case err == nil:
-		item.GroupKeyID = groupKeyID
-		item.ExpiresAt = expiresAt
-		item.LastUsedAt = now
-		return r.db.Save(&item).Error
-	case errors.Is(err, gorm.ErrRecordNotFound):
-		return r.db.Create(&GatewayAffinity{
-			AffinityHash: hash,
-			GroupKeyID:   groupKeyID,
-			ExpiresAt:    expiresAt,
-			LastUsedAt:   now,
-		}).Error
-	default:
-		return err
-	}
+	// 原子 upsert：affinity_hash 上有唯一索引，并发请求可能同时命中"查不到→插入"，
+	// 读后写会撞 UNIQUE 约束。用 ON CONFLICT DO UPDATE 一条语句完成，避免竞态。
+	return r.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "affinity_hash"}},
+		DoUpdates: clause.Assignments(map[string]any{
+			"group_key_id": groupKeyID,
+			"expires_at":   expiresAt,
+			"last_used_at": now,
+			"updated_at":   now,
+		}),
+	}).Create(&GatewayAffinity{
+		AffinityHash: hash,
+		GroupKeyID:   groupKeyID,
+		ExpiresAt:    expiresAt,
+		LastUsedAt:   now,
+	}).Error
 }
 
 func (r *GatewayAffinities) Delete(hash string) error {
@@ -137,9 +137,17 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 	case err == nil:
 		existing.ChannelName = key.ChannelName
 		existing.ChannelType = key.ChannelType
+		existing.ClientFormat = key.ClientFormat
+		existing.RequestMode = key.RequestMode
 		existing.GroupName = key.GroupName
 		existing.GroupDesc = key.GroupDesc
 		existing.Ratio = key.Ratio
+		if existing.ClientFormat == "" {
+			existing.ClientFormat = "openai"
+		}
+		if existing.RequestMode == "" {
+			existing.RequestMode = "responses"
+		}
 		if key.UpstreamKeyID > 0 {
 			existing.UpstreamKeyID = key.UpstreamKeyID
 		}
@@ -151,6 +159,15 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 		}
 		return r.db.Save(&existing).Error
 	case errors.Is(err, gorm.ErrRecordNotFound):
+		if !key.Enabled {
+			key.Enabled = true
+		}
+		if key.ClientFormat == "" {
+			key.ClientFormat = "openai"
+		}
+		if key.RequestMode == "" {
+			key.RequestMode = "responses"
+		}
 		if key.Status == "" {
 			key.Status = "unknown"
 		}
@@ -162,7 +179,16 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 
 func (r *UpstreamGroupKeys) List() ([]UpstreamGroupKey, error) {
 	var list []UpstreamGroupKey
-	if err := r.db.Order("ratio ASC").Order("channel_id ASC").Order("group_name ASC").Find(&list).Error; err != nil {
+	if err := r.db.Order("priority DESC").Order("ratio ASC").Order("channel_id ASC").Order("group_name ASC").Find(&list).Error; err != nil {
+		return nil, err
+	}
+	return list, nil
+}
+
+// ListByChannel 返回某个渠道下的全部分组密钥，用于同步时对比"上游还剩哪些分组"。
+func (r *UpstreamGroupKeys) ListByChannel(channelID uint) ([]UpstreamGroupKey, error) {
+	var list []UpstreamGroupKey
+	if err := r.db.Where("channel_id = ?", channelID).Find(&list).Error; err != nil {
 		return nil, err
 	}
 	return list, nil
@@ -173,9 +199,11 @@ func (r *UpstreamGroupKeys) ListCandidates(now time.Time) ([]UpstreamGroupKey, e
 	q := r.db.
 		Joins("JOIN channels ON channels.id = upstream_group_keys.channel_id").
 		Where("upstream_group_keys.key_cipher <> ''").
+		Where("upstream_group_keys.enabled = ?", true).
 		Where("channels.monitor_enabled = ?", true).
 		Where("(disabled_until IS NULL OR disabled_until <= ?)", now).
 		Where("upstream_group_keys.status <> ?", "disabled").
+		Order("upstream_group_keys.priority DESC").
 		Order("upstream_group_keys.ratio ASC").
 		Order("upstream_group_keys.failure_count ASC").
 		Order("upstream_group_keys.channel_id ASC").
@@ -218,6 +246,30 @@ func (r *UpstreamGroupKeys) MarkSuccess(id uint) error {
 	}).Error
 }
 
+// ClearCooldown 手动解除冷却：清掉 disabled_until 和 failure_count，让候选立即回到调度池。
+// 不改 status（下一轮测活会刷新真实状态），只是撤销"临时不可调度"这个限制。
+func (r *UpstreamGroupKeys) ClearCooldown(id uint) error {
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+		"failure_count":  0,
+		"disabled_until": nil,
+	}).Error
+}
+
+func (r *UpstreamGroupKeys) MarkHealthSuccess(id uint, latencyMS int64) error {
+	now := time.Now()
+	if latencyMS < 0 {		latencyMS = 0
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+		"status":           "alive",
+		"failure_count":    0,
+		"last_checked_at":  &now,
+		"last_success_at":  &now,
+		"last_latency_ms":  latencyMS,
+		"disabled_until":   nil,
+		"last_error":       "",
+	}).Error
+}
+
 func (r *UpstreamGroupKeys) MarkSuccessWithUsage(id uint, promptTokens, completionTokens, totalTokens int64) error {
 	now := time.Now()
 	if totalTokens <= 0 {
@@ -244,12 +296,56 @@ func (r *UpstreamGroupKeys) UpdateConcurrencyLimit(id uint, limit int) error {
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("concurrency_limit", limit).Error
 }
 
+func (r *UpstreamGroupKeys) UpdateEnabled(id uint, enabled bool) error {
+	updates := map[string]any{"enabled": enabled, "disabled_until": nil}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(updates).Error
+}
+
+func (r *UpstreamGroupKeys) UpdateRequestMode(id uint, mode string) error {
+	if strings.TrimSpace(mode) == "" {
+		mode = "responses"
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("request_mode", mode).Error
+}
+
+func (r *UpstreamGroupKeys) UpdatePriority(id uint, priority int) error {
+	if priority < 0 {
+		priority = 0
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("priority", priority).Error
+}
+
+// UpdateClientFormat 手动纠正某个分组的请求格式（openai / claude）。
+// 自动推断可能出错（比如分组名没带 claude 字样但其实是 claude 模型），允许手动覆盖，
+// 避免用 openai 格式打到 claude 模型导致报错。
+func (r *UpstreamGroupKeys) UpdateClientFormat(id uint, format string) error {
+	if format == "" {
+		format = "openai"
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("client_format", format).Error
+}
+
 func (r *UpstreamGroupKeys) MarkFailure(id uint, errMsg string, disabledUntil time.Time) error {
 	now := time.Now()
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
 		"status":          "dead",
 		"failure_count":   gorm.Expr("failure_count + ?", 1),
 		"last_checked_at": &now,
+		"disabled_until":  &disabledUntil,
+		"last_error":      errMsg,
+	}).Error
+}
+
+func (r *UpstreamGroupKeys) MarkHealthFailure(id uint, errMsg string, disabledUntil time.Time, latencyMS int64) error {
+	now := time.Now()
+	if latencyMS < 0 {
+		latencyMS = 0
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+		"status":          "dead",
+		"failure_count":   gorm.Expr("failure_count + ?", 1),
+		"last_checked_at": &now,
+		"last_latency_ms": latencyMS,
 		"disabled_until":  &disabledUntil,
 		"last_error":      errMsg,
 	}).Error

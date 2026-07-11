@@ -46,13 +46,6 @@ interface NotificationFormDialogProps {
 }
 
 interface ConfigState {
-  // telegram
-  bot_token: string
-  chat_id: string
-  // webhook
-  url: string
-  method: string
-  headers: string // 原始 JSON 字符串，留空 = 不传
   // email
   host: string
   port: string
@@ -61,12 +54,9 @@ interface ConfigState {
   from: string
   to: string // 逗号分隔
   use_tls: boolean
-  // wecom / dingtalk / feishu
+  // wecom / feishu
   webhook_url: string
   secret: string
-  // Server酱³
-  serverchan3_uid: string
-  serverchan3_sendkey: string
 }
 
 interface SubRow {
@@ -88,11 +78,6 @@ interface FormState {
 
 function emptyConfig(): ConfigState {
   return {
-    bot_token: "",
-    chat_id: "",
-    url: "",
-    method: "POST",
-    headers: "",
     host: "",
     port: "",
     username: "",
@@ -102,8 +87,6 @@ function emptyConfig(): ConfigState {
     use_tls: false,
     webhook_url: "",
     secret: "",
-    serverchan3_uid: "",
-    serverchan3_sendkey: "",
   }
 }
 
@@ -117,7 +100,6 @@ const notificationEventOptions: Array<{ id: string; label: string; events: Notif
   },
   { id: "announcement", label: "上游公告", events: ["announcement"] },
   { id: "login_failed", label: "登录失败", events: ["login_failed"] },
-  { id: "captcha_failed", label: "验证码失败", events: ["captcha_failed"] },
   { id: "monitor_failed", label: "采集失败", events: ["monitor_failed"] },
   {
     id: "subscription_notice",
@@ -172,7 +154,7 @@ function initialState(c?: NotificationChannel | null): FormState {
   }
   return {
     name: c?.name ?? "",
-    type: c?.type ?? "telegram",
+    type: c?.type && ["email", "wecom", "feishu"].includes(c.type) ? c.type : "wecom",
     enabled: c?.enabled ?? true,
     proxy_enabled: c?.proxy_enabled ?? false,
     cfg: emptyConfig(),
@@ -184,25 +166,6 @@ function initialState(c?: NotificationChannel | null): FormState {
 // 留空字段会被剔除（除非该字段是必填）。
 function buildConfigByType(type: NotificationChannelType, cfg: ConfigState): string {
   switch (type) {
-    case "telegram":
-      return JSON.stringify({
-        bot_token: cfg.bot_token,
-        chat_id: cfg.chat_id,
-      })
-    case "webhook": {
-      const body: Record<string, unknown> = { url: cfg.url }
-      if (cfg.method && cfg.method !== "POST") body.method = cfg.method
-      if (cfg.headers.trim()) {
-        // 验证是合法 JSON object；不是就抛错让用户改
-        const parsed = JSON.parse(cfg.headers)
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-          body.headers = parsed
-        } else {
-          throw new Error("headers 必须是 JSON 对象，例如 {\"Authorization\":\"Bearer ...\"}")
-        }
-      }
-      return JSON.stringify(body)
-    }
     case "email": {
       const port = Number(cfg.port)
       if (!Number.isFinite(port) || port <= 0) throw new Error("端口必须是正整数")
@@ -220,17 +183,13 @@ function buildConfigByType(type: NotificationChannelType, cfg: ConfigState): str
     }
     case "wecom":
       return JSON.stringify({ webhook_url: cfg.webhook_url })
-    case "dingtalk":
     case "feishu": {
       const body: Record<string, unknown> = { webhook_url: cfg.webhook_url }
       if (cfg.secret) body.secret = cfg.secret
       return JSON.stringify(body)
     }
-    case "serverchan3":
-      return JSON.stringify({
-        uid: cfg.serverchan3_uid,
-        sendkey: cfg.serverchan3_sendkey,
-      })
+    default:
+      throw new Error("通知渠道仅支持邮箱、企业微信和飞书")
   }
 }
 
@@ -297,14 +256,8 @@ export function NotificationFormDialog({
       // 判断 cfg 是否填了关键字段
       const hasConfigInput = (() => {
         switch (form.type) {
-          case "telegram":
-            return !!(form.cfg.bot_token || form.cfg.chat_id)
-          case "webhook":
-            return !!form.cfg.url
           case "email":
             return !!(form.cfg.host || form.cfg.from || form.cfg.to)
-          case "serverchan3":
-            return !!(form.cfg.serverchan3_uid || form.cfg.serverchan3_sendkey)
           default:
             return !!form.cfg.webhook_url
         }
@@ -372,7 +325,7 @@ export function NotificationFormDialog({
             <Label htmlFor="notify-name">渠道名</Label>
             <Input
               id="notify-name"
-              placeholder="例如：TG-运维群"
+              placeholder="例如：运维告警"
               value={form.name}
               onChange={(e) => setForm({ ...form, name: e.target.value })}
               required
@@ -393,13 +346,9 @@ export function NotificationFormDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="telegram">Telegram</SelectItem>
-                <SelectItem value="webhook">Webhook</SelectItem>
-                <SelectItem value="email">Email</SelectItem>
+                <SelectItem value="email">邮箱</SelectItem>
                 <SelectItem value="wecom">企业微信</SelectItem>
-                <SelectItem value="dingtalk">钉钉</SelectItem>
                 <SelectItem value="feishu">飞书</SelectItem>
-                <SelectItem value="serverchan3">Server酱³</SelectItem>
               </SelectContent>
             </Select>
             {isEdit ? (
@@ -519,87 +468,6 @@ function ConfigFields({ type, cfg, updateCfg, disabled, isEdit }: ConfigFieldsPr
     <p className="text-[11px] text-muted-foreground">编辑模式下留空保留原值</p>
   ) : null
 
-  if (type === "telegram") {
-    return (
-      <div className="space-y-2 rounded-lg border border-border p-3">
-        <p className="text-xs font-medium text-muted-foreground">Telegram</p>
-        <div className="space-y-1.5">
-          <Label htmlFor="tg-token">Bot Token</Label>
-          <Input
-            id="tg-token"
-            type="password"
-            placeholder="123456:ABC-..."
-            value={cfg.bot_token}
-            onChange={(e) => updateCfg({ bot_token: e.target.value })}
-            required={!isEdit}
-            disabled={disabled}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="tg-chat">Chat ID</Label>
-          <Input
-            id="tg-chat"
-            placeholder="-1001234567890 或 @channelname"
-            value={cfg.chat_id}
-            onChange={(e) => updateCfg({ chat_id: e.target.value })}
-            required={!isEdit}
-            disabled={disabled}
-          />
-        </div>
-        {hint}
-      </div>
-    )
-  }
-
-  if (type === "webhook") {
-    return (
-      <div className="space-y-2 rounded-lg border border-border p-3">
-        <p className="text-xs font-medium text-muted-foreground">Webhook</p>
-        <div className="space-y-1.5">
-          <Label htmlFor="wh-url">URL</Label>
-          <Input
-            id="wh-url"
-            placeholder="https://example.com/hook"
-            value={cfg.url}
-            onChange={(e) => updateCfg({ url: e.target.value })}
-            required={!isEdit}
-            disabled={disabled}
-          />
-        </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-          <div className="space-y-1.5">
-            <Label htmlFor="wh-method">Method</Label>
-            <Select
-              value={cfg.method || "POST"}
-              onValueChange={(v) => updateCfg({ method: v })}
-              disabled={disabled}
-            >
-              <SelectTrigger id="wh-method">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="POST">POST</SelectItem>
-                <SelectItem value="PUT">PUT</SelectItem>
-                <SelectItem value="GET">GET</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          <div className="space-y-1.5 sm:col-span-2">
-            <Label htmlFor="wh-headers">Headers (JSON, 可选)</Label>
-            <Input
-              id="wh-headers"
-              placeholder='{"Authorization":"Bearer xxx"}'
-              value={cfg.headers}
-              onChange={(e) => updateCfg({ headers: e.target.value })}
-              disabled={disabled}
-            />
-          </div>
-        </div>
-        {hint}
-      </div>
-    )
-  }
-
   if (type === "email") {
     return (
       <div className="space-y-2 rounded-lg border border-border p-3">
@@ -688,43 +556,12 @@ function ConfigFields({ type, cfg, updateCfg, disabled, isEdit }: ConfigFieldsPr
     )
   }
 
-  if (type === "serverchan3") {
-    return (
-      <div className="space-y-2 rounded-lg border border-border p-3">
-        <p className="text-xs font-medium text-muted-foreground">Server酱³</p>
-        <div className="space-y-1.5">
-          <Label htmlFor="sc3-uid">UID</Label>
-          <Input
-            id="sc3-uid"
-            placeholder="例如：SC3xxxx"
-            value={cfg.serverchan3_uid}
-            onChange={(e) => updateCfg({ serverchan3_uid: e.target.value })}
-            required={!isEdit}
-            disabled={disabled}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="sc3-sendkey">SendKey</Label>
-          <Input
-            id="sc3-sendkey"
-            type="password"
-            value={cfg.serverchan3_sendkey}
-            onChange={(e) => updateCfg({ serverchan3_sendkey: e.target.value })}
-            required={!isEdit}
-            disabled={disabled}
-          />
-        </div>
-        {hint}
-      </div>
-    )
-  }
-
-  // wecom / dingtalk / feishu
-  const supportsSecret = type === "dingtalk" || type === "feishu"
+  // wecom / feishu
+  const supportsSecret = type === "feishu"
   return (
     <div className="space-y-2 rounded-lg border border-border p-3">
       <p className="text-xs font-medium text-muted-foreground">
-        {type === "wecom" ? "企业微信" : type === "dingtalk" ? "钉钉" : "飞书"}
+        {type === "wecom" ? "企业微信" : "飞书"}
       </p>
       <div className="space-y-1.5">
         <Label htmlFor="wb-url">Webhook URL</Label>

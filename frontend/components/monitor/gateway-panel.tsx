@@ -1,12 +1,22 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { CheckCircle2, Copy, Eye, EyeOff, KeyRound, Loader2, Plus, RefreshCw, Trash2, XCircle } from "lucide-react"
+import { CheckCircle2, Copy, Eye, EyeOff, KeyRound, Loader2, Pencil, Plus, RefreshCw, Trash2, XCircle } from "lucide-react"
 import { toast } from "sonner"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Checkbox } from "@/components/ui/checkbox"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import {
   Select,
   SelectContent,
@@ -14,6 +24,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
+import { Switch } from "@/components/ui/switch"
 import {
   Table,
   TableBody,
@@ -33,6 +44,36 @@ import type {
   UpstreamGroupKey,
 } from "@/lib/api-types"
 
+const TOKEN_M = 1_000_000
+
+type ClientFormat = "openai" | "claude" | "any"
+type GroupScope = "all" | "selected"
+type UpstreamRequestMode = "responses" | "chat"
+
+interface KeyDraft {
+  name: string
+  enabled: boolean
+  clientFormat: ClientFormat
+  scope: GroupScope
+  selectedGroupIds: number[]
+  dailyLimitM: string
+  totalLimitM: string
+  expiresInDays: string
+}
+
+function createDefaultDraft(): KeyDraft {
+  return {
+    name: "default",
+    enabled: true,
+    clientFormat: "openai",
+    scope: "all",
+    selectedGroupIds: [],
+    dailyLimitM: "",
+    totalLimitM: "",
+    expiresInDays: "0",
+  }
+}
+
 function statusTone(status: string) {
   switch (status) {
     case "alive":
@@ -44,6 +85,10 @@ function statusTone(status: string) {
     default:
       return "bg-muted text-muted-foreground border-border"
   }
+}
+
+function effectiveStatus(group: UpstreamGroupKey) {
+  return group.enabled === false ? "disabled" : group.status
 }
 
 function statusText(status: string) {
@@ -59,16 +104,98 @@ function statusText(status: string) {
   }
 }
 
-async function copyText(text: string) {
-  await navigator.clipboard.writeText(text)
-  toast.success("已复制")
+function normalizeClientFormat(value?: string | null): ClientFormat {
+  switch ((value ?? "").toLowerCase()) {
+    case "claude":
+      return "claude"
+    case "any":
+      return "any"
+    default:
+      return "openai"
+  }
 }
 
-function formatTokens(value: number) {
-  if (!Number.isFinite(value) || value <= 0) return "0"
-  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(2)}M`
-  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
-  return String(value)
+function clientFormatLabel(value?: string | null) {
+  switch (normalizeClientFormat(value)) {
+    case "claude":
+      return "Claude"
+    case "any":
+      return "不限"
+    default:
+      return "OpenAI"
+  }
+}
+
+function normalizeRequestMode(value?: string | null): UpstreamRequestMode {
+  switch ((value ?? "").toLowerCase()) {
+    case "chat":
+    case "chat_completions":
+    case "chat-completions":
+      return "chat"
+    default:
+      return "responses"
+  }
+}
+
+function requestModeLabel(value?: string | null) {
+  return normalizeRequestMode(value) === "chat" ? "Chat" : "Responses"
+}
+
+function groupClientFormat(group: UpstreamGroupKey): ClientFormat {
+  return normalizeClientFormat(group.client_format)
+}
+
+function groupMatchesFormat(group: UpstreamGroupKey, format: ClientFormat) {
+  const groupFormat = groupClientFormat(group)
+  return format === "any" || groupFormat === "any" || groupFormat === format
+}
+
+function groupStatusRank(status: string) {
+  return status === "alive" ? 0 : status === "unknown" ? 1 : status === "dead" ? 2 : 3
+}
+
+function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
+  return groups.slice().sort((a, b) => {
+    return (
+      groupStatusRank(effectiveStatus(a)) - groupStatusRank(effectiveStatus(b)) ||
+      (b.priority || 0) - (a.priority || 0) ||
+      a.ratio - b.ratio ||
+      a.failure_count - b.failure_count ||
+      a.id - b.id
+    )
+  })
+}
+
+function cleanGroupIDs(ids: number[], groups: UpstreamGroupKey[], format: ClientFormat) {
+  const allowed = new Set(groups.filter((group) => groupMatchesFormat(group, format)).map((group) => group.id))
+  return Array.from(new Set(ids.filter((id) => allowed.has(id)))).sort((a, b) => a - b)
+}
+
+function formatTokens(value?: number | null) {
+  const n = Number(value ?? 0)
+  if (!Number.isFinite(n) || n <= 0) return "0"
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+function tokensToMInput(value?: number | null) {
+  const n = Number(value ?? 0)
+  if (!Number.isFinite(n) || n <= 0) return ""
+  const m = n / TOKEN_M
+  return Number.isInteger(m) ? String(m) : String(Number(m.toFixed(3)))
+}
+
+function mInputToTokens(raw: string) {
+  const text = raw.trim()
+  if (!text) return 0
+  const n = Number(text)
+  if (!Number.isFinite(n) || n <= 0) return 0
+  return Math.round(n * TOKEN_M)
+}
+
+function sanitizeMInput(value: string) {
+  return value.replace(/[^\d.]/g, "").replace(/(\..*)\./g, "$1")
 }
 
 function formatExpiry(value?: string | null) {
@@ -79,21 +206,274 @@ function formatExpiry(value?: string | null) {
   return date.toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" })
 }
 
+async function copyText(text: string) {
+  await navigator.clipboard.writeText(text)
+  toast.success("已复制")
+}
+
+function draftFromKey(key: GatewayKey): KeyDraft {
+  const ids = key.allowed_group_ids ?? []
+  return {
+    name: key.name || "default",
+    enabled: key.enabled !== false,
+    clientFormat: normalizeClientFormat(key.client_format),
+    scope: ids.length > 0 ? "selected" : "all",
+    selectedGroupIds: ids,
+    dailyLimitM: tokensToMInput(key.daily_limit),
+    totalLimitM: tokensToMInput(key.total_limit),
+    expiresInDays: "keep",
+  }
+}
+
+function buildGatewayKeyPayload(draft: KeyDraft, includeEnabled: boolean, includeExpiry: boolean) {
+  const payload: Record<string, unknown> = {
+    name: draft.name.trim() || "default",
+    client_format: draft.clientFormat,
+    allowed_group_ids: draft.scope === "selected" ? draft.selectedGroupIds : [],
+    daily_limit: mInputToTokens(draft.dailyLimitM),
+    total_limit: mInputToTokens(draft.totalLimitM),
+  }
+  if (includeEnabled) {
+    payload.enabled = draft.enabled
+  }
+  if (includeExpiry) {
+    payload.expires_in_days = Math.max(0, Math.floor(Number(draft.expiresInDays) || 0))
+  }
+  return payload
+}
+
+function selectedGroupSummary(key: GatewayKey, groups: UpstreamGroupKey[]) {
+  const ids = key.allowed_group_ids ?? []
+  if (ids.length === 0) return "全部分组，按优先级和低倍率顺序调度"
+  const names = ids
+    .slice(0, 3)
+    .map((id) => groups.find((group) => group.id === id))
+    .filter(Boolean)
+    .map((group) => `${group?.channel_name || `#${group?.channel_id}`} / ${group?.group_name}`)
+  return `指定 ${ids.length} 个${names.length ? `：${names.join("、")}` : ""}`
+}
+
+function KeyDraftFields({
+  draft,
+  groups,
+  onChange,
+  showEnabled = false,
+  showKeepExpiry = false,
+}: {
+  draft: KeyDraft
+  groups: UpstreamGroupKey[]
+  onChange: (draft: KeyDraft) => void
+  showEnabled?: boolean
+  showKeepExpiry?: boolean
+}) {
+  const eligibleGroups = groups.filter((group) => groupMatchesFormat(group, draft.clientFormat))
+  const selected = new Set(draft.selectedGroupIds)
+
+  function updateFormat(format: ClientFormat) {
+    onChange({
+      ...draft,
+      clientFormat: format,
+      selectedGroupIds: cleanGroupIDs(draft.selectedGroupIds, groups, format),
+    })
+  }
+
+  function toggleGroup(id: number, checked: boolean) {
+    const next = checked
+      ? [...draft.selectedGroupIds, id]
+      : draft.selectedGroupIds.filter((item) => item !== id)
+    onChange({ ...draft, selectedGroupIds: cleanGroupIDs(next, groups, draft.clientFormat) })
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 sm:grid-cols-[1fr_0.75fr]">
+        <div className="space-y-1.5">
+          <Label htmlFor="gateway-key-name">Key 名称</Label>
+          <Input
+            id="gateway-key-name"
+            value={draft.name}
+            onChange={(event) => onChange({ ...draft, name: event.target.value })}
+            placeholder="例如：公益 OpenAI Key"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label>请求格式</Label>
+          <Select value={draft.clientFormat} onValueChange={(value) => updateFormat(normalizeClientFormat(value))}>
+            <SelectTrigger>
+              <SelectValue placeholder="选择格式" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="openai">OpenAI</SelectItem>
+              <SelectItem value="claude">Claude</SelectItem>
+              <SelectItem value="any">不限</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      {showEnabled ? (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/20 px-3 py-2">
+          <div>
+            <p className="text-sm font-medium text-foreground">Key 状态</p>
+            <p className="text-xs text-muted-foreground">停用后客户端会收到无效 Key 提示</p>
+          </div>
+          <Switch checked={draft.enabled} onCheckedChange={(checked) => onChange({ ...draft, enabled: checked })} />
+        </div>
+      ) : null}
+
+      <div className="grid gap-3 sm:grid-cols-3">
+        <div className="space-y-1.5">
+          <Label htmlFor="gateway-key-daily">每日额度（M）</Label>
+          <Input
+            id="gateway-key-daily"
+            value={draft.dailyLimitM}
+            inputMode="decimal"
+            onChange={(event) => onChange({ ...draft, dailyLimitM: sanitizeMInput(event.target.value) })}
+            placeholder="留空不限"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="gateway-key-total">总额度（M）</Label>
+          <Input
+            id="gateway-key-total"
+            value={draft.totalLimitM}
+            inputMode="decimal"
+            onChange={(event) => onChange({ ...draft, totalLimitM: sanitizeMInput(event.target.value) })}
+            placeholder="留空不限"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label>过期时间</Label>
+          <Select value={draft.expiresInDays} onValueChange={(value) => onChange({ ...draft, expiresInDays: value })}>
+            <SelectTrigger>
+              <SelectValue placeholder="过期时间" />
+            </SelectTrigger>
+            <SelectContent>
+              {showKeepExpiry ? <SelectItem value="keep">保留当前</SelectItem> : null}
+              <SelectItem value="1">1 天</SelectItem>
+              <SelectItem value="2">2 天</SelectItem>
+              <SelectItem value="7">7 天</SelectItem>
+              <SelectItem value="30">30 天</SelectItem>
+              <SelectItem value="0">永不过期</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <Label>绑定上游分组</Label>
+          <Select value={draft.scope} onValueChange={(value) => onChange({ ...draft, scope: value as GroupScope })}>
+            <SelectTrigger className="h-8 w-32 text-xs">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">全部</SelectItem>
+              <SelectItem value="selected">指定</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="rounded-md border border-border bg-background">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2 text-xs">
+            <span className="text-muted-foreground">
+              {draft.scope === "all"
+                ? `将按优先级和低倍率顺序使用 ${eligibleGroups.length} 个匹配分组`
+                : `已选择 ${draft.selectedGroupIds.length}/${eligibleGroups.length} 个匹配分组`}
+            </span>
+            {draft.scope === "selected" ? (
+              <div className="flex items-center gap-1">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => onChange({ ...draft, selectedGroupIds: eligibleGroups.map((group) => group.id) })}
+                >
+                  全选
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => onChange({ ...draft, selectedGroupIds: [] })}
+                >
+                  清空
+                </Button>
+              </div>
+            ) : null}
+          </div>
+          <div className="max-h-56 overflow-y-auto p-2">
+            {eligibleGroups.length === 0 ? (
+              <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+                没有匹配 {clientFormatLabel(draft.clientFormat)} 的分组，先同步或切换格式
+              </div>
+            ) : (
+              <div className="space-y-1">
+                {eligibleGroups.map((group) => {
+                  const status = effectiveStatus(group)
+                  return (
+                    <label
+                      key={group.id}
+                      className={cn(
+                        "flex cursor-pointer items-start gap-2 rounded-md px-2 py-2 text-xs hover:bg-muted/60",
+                        draft.scope === "all" && "cursor-default opacity-80",
+                      )}
+                    >
+                      {draft.scope === "selected" ? (
+                        <Checkbox
+                          checked={selected.has(group.id)}
+                          onCheckedChange={(checked) => toggleGroup(group.id, checked === true)}
+                        />
+                      ) : (
+                        <span className="mt-0.5 size-4 rounded-[4px] border border-border bg-muted" />
+                      )}
+                      <span className="min-w-0 flex-1">
+                        <span className="flex flex-wrap items-center gap-1.5">
+                          <span className="font-medium text-foreground">{group.channel_name || `#${group.channel_id}`}</span>
+                          <span className="text-muted-foreground">/</span>
+                          <span className="truncate text-foreground">{group.group_name}</span>
+                          <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                            {clientFormatLabel(group.client_format)}
+                          </Badge>
+                          <Badge variant="outline" className={cn("h-5 px-1.5 text-[10px]", statusTone(status))}>
+                            {statusText(status)}
+                          </Badge>
+                        </span>
+                        <span className="mt-1 block text-muted-foreground">
+                          优先级 {group.priority || 0} · 倍率 {formatRatio(group.ratio)} · {channelTypeLabel(group.channel_type)}
+                        </span>
+                      </span>
+                    </label>
+                  )
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function GatewayPanel() {
   const [keys, setKeys] = useState<GatewayKey[]>([])
   const [groups, setGroups] = useState<UpstreamGroupKey[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
-  const [newKeyName, setNewKeyName] = useState("default")
-  const [dailyLimit, setDailyLimit] = useState("")
-  const [totalLimit, setTotalLimit] = useState("")
-  const [expiresInDays, setExpiresInDays] = useState("0")
+  const [createDraft, setCreateDraft] = useState<KeyDraft>(() => createDefaultDraft())
+  const [editingKey, setEditingKey] = useState<GatewayKey | null>(null)
+  const [editDraft, setEditDraft] = useState<KeyDraft>(() => createDefaultDraft())
+  const [editOpen, setEditOpen] = useState(false)
   const [revealed, setRevealed] = useState<Record<number, string>>({})
   const [visible, setVisible] = useState<Record<number, boolean>>({})
   const [concurrencyDrafts, setConcurrencyDrafts] = useState<Record<number, string>>({})
+  const [priorityDrafts, setPriorityDrafts] = useState<Record<number, string>>({})
+  const [healthResults, setHealthResults] = useState<Record<number, GatewayHealthResult["items"][number]>>({})
 
-  const aliveCount = useMemo(() => groups.filter((g) => g.status === "alive").length, [groups])
-  const deadCount = useMemo(() => groups.filter((g) => g.status === "dead").length, [groups])
+  const aliveCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "alive").length, [groups])
+  const deadCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "dead").length, [groups])
+  const enabledGroupCount = useMemo(() => groups.filter((group) => group.enabled !== false).length, [groups])
 
   async function load() {
     setLoading(true)
@@ -103,10 +483,13 @@ export function GatewayPanel() {
         apiFetch<UpstreamGroupKey[]>("/gateway/group-keys"),
       ])
       setKeys(Array.isArray(keyList) ? keyList : [])
-      const nextGroups = Array.isArray(groupList) ? groupList : []
+      const nextGroups = sortGroupsForDisplay(Array.isArray(groupList) ? groupList : [])
       setGroups(nextGroups)
       setConcurrencyDrafts(
         Object.fromEntries(nextGroups.map((group) => [group.id, String(group.concurrency_limit || 0)])),
+      )
+      setPriorityDrafts(
+        Object.fromEntries(nextGroups.map((group) => [group.id, String(group.priority || 0)])),
       )
     } catch (e) {
       const err = e as Error
@@ -120,17 +503,25 @@ export function GatewayPanel() {
     void load()
   }, [])
 
+  function validateDraft(draft: KeyDraft) {
+    if (draft.scope === "selected" && draft.selectedGroupIds.length === 0) {
+      toast.error("指定分组模式下至少选择一个上游分组")
+      return false
+    }
+    if (mInputToTokens(draft.dailyLimitM) < 0 || mInputToTokens(draft.totalLimitM) < 0) {
+      toast.error("额度必须是大于等于 0 的数字")
+      return false
+    }
+    return true
+  }
+
   async function createGatewayKey() {
+    if (!validateDraft(createDraft)) return
     setBusy("create-key")
     try {
       const created = await apiFetch<GatewayKey>("/gateway/keys", {
         method: "POST",
-        body: JSON.stringify({
-          name: newKeyName.trim() || "default",
-          daily_limit: Number(dailyLimit) || 0,
-          total_limit: Number(totalLimit) || 0,
-          expires_in_days: Number(expiresInDays) || 0,
-        }),
+        body: JSON.stringify(buildGatewayKeyPayload(createDraft, false, true)),
       })
       if (created.key) {
         setRevealed((prev) => ({ ...prev, [created.id]: created.key ?? "" }))
@@ -138,10 +529,38 @@ export function GatewayPanel() {
         await copyText(created.key)
       }
       toast.success("网关 Key 已创建")
+      setCreateDraft(createDefaultDraft())
       await load()
     } catch (e) {
       const err = e as Error
       toast.error(err.message || "创建网关 Key 失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  function openEditKey(key: GatewayKey) {
+    setEditingKey(key)
+    setEditDraft(draftFromKey(key))
+    setEditOpen(true)
+  }
+
+  async function updateGatewayKey() {
+    if (!editingKey || !validateDraft(editDraft)) return
+    setBusy(`edit-${editingKey.id}`)
+    try {
+      const updated = await apiFetch<GatewayKey>(`/gateway/keys/${editingKey.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(buildGatewayKeyPayload(editDraft, true, editDraft.expiresInDays !== "keep")),
+      })
+      setKeys((prev) => prev.map((key) => (key.id === updated.id ? updated : key)))
+      toast.success("网关 Key 已保存")
+      setEditOpen(false)
+      setEditingKey(null)
+      await load()
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "保存网关 Key 失败")
     } finally {
       setBusy(null)
     }
@@ -213,6 +632,7 @@ export function GatewayPanel() {
     setBusy("test")
     try {
       const res = await apiFetch<GatewayHealthResult>("/gateway/group-keys/test", { method: "POST" })
+      setHealthResults(Object.fromEntries((res.items ?? []).map((item) => [item.id, item])))
       toast.success(`测活完成：存活 ${res.alive}，死亡 ${res.dead}`)
       await load()
     } catch (e) {
@@ -223,23 +643,102 @@ export function GatewayPanel() {
     }
   }
 
-  async function saveConcurrencyLimit(group: UpstreamGroupKey) {
-    const raw = concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)
-    const limit = Math.max(0, Math.floor(Number(raw) || 0))
-    setBusy(`group-limit-${group.id}`)
+  async function updateGroup(
+    group: UpstreamGroupKey,
+    patch: { concurrency_limit?: number; enabled?: boolean; request_mode?: UpstreamRequestMode; priority?: number; client_format?: string },
+  ) {
+    setBusy(`group-${group.id}`)
     try {
       const updated = await apiFetch<UpstreamGroupKey>(`/gateway/group-keys/${group.id}`, {
         method: "PATCH",
-        body: JSON.stringify({ concurrency_limit: limit }),
+        body: JSON.stringify({
+          concurrency_limit: patch.concurrency_limit ?? group.concurrency_limit ?? 0,
+          ...(patch.enabled == null ? {} : { enabled: patch.enabled }),
+          ...(patch.request_mode == null ? {} : { request_mode: patch.request_mode }),
+          ...(patch.priority == null ? {} : { priority: patch.priority }),
+          ...(patch.client_format == null ? {} : { client_format: patch.client_format }),
+        }),
       })
-      setGroups((prev) => prev.map((item) => (item.id === updated.id ? updated : item)))
+      setGroups((prev) => sortGroupsForDisplay(prev.map((item) => (item.id === updated.id ? updated : item))))
       setConcurrencyDrafts((prev) => ({ ...prev, [group.id]: String(updated.concurrency_limit || 0) }))
-      toast.success("并发上限已保存")
+      setPriorityDrafts((prev) => ({ ...prev, [group.id]: String(updated.priority || 0) }))
+      return updated
     } catch (e) {
       const err = e as Error
-      toast.error(err.message || "保存并发上限失败")
+      toast.error(err.message || "保存上游分组失败")
+      return null
     } finally {
       setBusy(null)
+    }
+  }
+
+  async function deleteGroup(group: UpstreamGroupKey) {
+    if (!window.confirm(`确认删除分组「${group.group_name}」？\n\n用于清理上游已删除、本地却残留的分组。仅删除本地记录，不影响上游。`)) {
+      return
+    }
+    setBusy(`group-${group.id}`)
+    try {
+      await apiFetch(`/gateway/group-keys/${group.id}`, { method: "DELETE" })
+      setGroups((prev) => prev.filter((item) => item.id !== group.id))
+      toast.success("分组已删除")
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "删除分组失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function clearCooldown(group: UpstreamGroupKey) {
+    setBusy(`group-${group.id}`)
+    try {
+      const updated = await apiFetch<UpstreamGroupKey>(`/gateway/group-keys/${group.id}/clear-cooldown`, { method: "POST" })
+      setGroups((prev) => sortGroupsForDisplay(prev.map((item) => (item.id === updated.id ? updated : item))))
+      toast.success("已解除冷却，恢复调度")
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "解除冷却失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function saveConcurrencyLimit(group: UpstreamGroupKey) {
+    const raw = concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)
+    const limit = Math.max(0, Math.floor(Number(raw) || 0))
+    const updated = await updateGroup(group, { concurrency_limit: limit })
+    if (updated) {
+      toast.success("并发上限已保存")
+    }
+  }
+
+  async function savePriority(group: UpstreamGroupKey) {
+    const raw = priorityDrafts[group.id] ?? String(group.priority || 0)
+    const priority = Math.max(0, Math.floor(Number(raw) || 0))
+    const updated = await updateGroup(group, { priority })
+    if (updated) {
+      toast.success("调度优先级已保存")
+    }
+  }
+
+  async function toggleGroupEnabled(group: UpstreamGroupKey, enabled: boolean) {
+    const updated = await updateGroup(group, { enabled })
+    if (updated) {
+      toast.success(enabled ? "上游分组已启用" : "上游分组已禁用，调度和测活会跳过它")
+    }
+  }
+
+  async function changeGroupRequestMode(group: UpstreamGroupKey, requestMode: UpstreamRequestMode) {
+    const updated = await updateGroup(group, { request_mode: requestMode })
+    if (updated) {
+      toast.success(`上游接口已切换为 ${requestModeLabel(requestMode)}`)
+    }
+  }
+
+  async function changeGroupClientFormat(group: UpstreamGroupKey, format: string) {
+    const updated = await updateGroup(group, { client_format: format })
+    if (updated) {
+      toast.success(`已标记为 ${clientFormatLabel(format)} 渠道`)
     }
   }
 
@@ -249,7 +748,7 @@ export function GatewayPanel() {
         <div>
           <CardTitle className="text-base font-semibold">调度网关</CardTitle>
           <p className="mt-1 text-xs text-muted-foreground">
-            /v1 兼容入口 · 低倍率优先 · 失败自动切换
+            /v1 兼容入口 · 优先级优先 · Key 可绑定指定上游
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -258,6 +757,9 @@ export function GatewayPanel() {
           </Badge>
           <Badge variant="outline" className="border-danger/20 bg-danger/10 text-danger">
             死亡 {deadCount}
+          </Badge>
+          <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
+            启用 {enabledGroupCount}/{groups.length}
           </Badge>
           <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
             {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
@@ -270,64 +772,44 @@ export function GatewayPanel() {
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid gap-3 rounded-md border border-border bg-muted/10 p-3 lg:grid-cols-[0.95fr_2.05fr]">
-          <div className="space-y-2">
-            <p className="text-xs font-medium text-foreground">新建调用 Key</p>
-            <div className="grid gap-2 sm:grid-cols-[1fr_0.75fr_0.75fr_0.75fr_auto]">
-              <Input value={newKeyName} onChange={(e) => setNewKeyName(e.target.value)} placeholder="名称" className="h-8 text-xs" />
-              <Input
-                value={dailyLimit}
-                onChange={(e) => setDailyLimit(e.target.value)}
-                inputMode="numeric"
-                placeholder="每日 token"
-                className="h-8 text-xs"
-              />
-              <Input
-                value={totalLimit}
-                onChange={(e) => setTotalLimit(e.target.value)}
-                inputMode="numeric"
-                placeholder="总 token"
-                className="h-8 text-xs"
-              />
-              <Select value={expiresInDays} onValueChange={setExpiresInDays}>
-                <SelectTrigger className="h-8 text-xs">
-                  <SelectValue placeholder="过期时间" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="1">1 天</SelectItem>
-                  <SelectItem value="2">2 天</SelectItem>
-                  <SelectItem value="7">7 天</SelectItem>
-                  <SelectItem value="30">30 天</SelectItem>
-                  <SelectItem value="0">永不过期</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button size="sm" className="h-8 shrink-0 gap-1.5 text-xs" disabled={!!busy} onClick={createGatewayKey}>
-                {busy === "create-key" ? <Loader2 className="size-3 animate-spin" /> : <KeyRound className="size-3" />}
-                创建
-              </Button>
+        <div className="grid gap-4 rounded-md border border-border bg-muted/10 p-3 xl:grid-cols-[0.95fr_1.35fr]">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <p className="text-xs font-medium text-foreground">创建调用 Key</p>
+                <p className="mt-1 text-[11px] text-muted-foreground">额度按 M token 设置，留空就是不限量</p>
+              </div>
+              <KeyRound className="size-4 text-brand" />
             </div>
+            <KeyDraftFields draft={createDraft} groups={groups} onChange={setCreateDraft} />
+            <Button size="sm" className="h-8 w-full gap-1.5 text-xs" disabled={!!busy} onClick={createGatewayKey}>
+              {busy === "create-key" ? <Loader2 className="size-3 animate-spin" /> : <KeyRound className="size-3" />}
+              创建并复制 Key
+            </Button>
           </div>
+
           <div className="min-w-0">
             <div className="mb-2 flex items-center justify-between gap-2">
               <p className="text-xs font-medium text-foreground">已有调用 Key</p>
               <span className="text-[11px] text-muted-foreground">Bearer Key · {keys.length} 个</span>
             </div>
             {keys.length === 0 ? (
-              <div className="rounded-md border border-dashed border-border bg-background px-3 py-6 text-center text-xs text-muted-foreground">
+              <div className="rounded-md border border-dashed border-border bg-background px-3 py-8 text-center text-xs text-muted-foreground">
                 还没有网关 Key
               </div>
             ) : (
               <div className="overflow-x-auto rounded-md border border-border bg-background">
-                <Table className="min-w-[760px]">
+                <Table className="min-w-[880px]">
                   <TableHeader>
                     <TableRow>
-                      <TableHead className="w-40">名称</TableHead>
+                      <TableHead className="w-44">名称</TableHead>
                       <TableHead>密钥</TableHead>
+                      <TableHead className="hidden lg:table-cell">绑定分组</TableHead>
                       <TableHead className="hidden text-right md:table-cell">今日</TableHead>
                       <TableHead className="hidden text-right xl:table-cell">总量</TableHead>
                       <TableHead className="hidden lg:table-cell">到期</TableHead>
                       <TableHead className="hidden md:table-cell">最近使用</TableHead>
-                      <TableHead className="w-28 text-right">操作</TableHead>
+                      <TableHead className="w-36 text-right">操作</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -337,7 +819,7 @@ export function GatewayPanel() {
                           <div className="min-w-0">
                             <p className="truncate text-xs font-medium text-foreground">{key.name}</p>
                             <p className={cn("text-[11px]", key.enabled ? "text-success" : "text-muted-foreground")}>
-                              {key.enabled ? "启用中" : "已停用"}
+                              {key.enabled ? "启用中" : "已停用"} · {clientFormatLabel(key.client_format)}
                             </p>
                           </div>
                         </TableCell>
@@ -347,6 +829,9 @@ export function GatewayPanel() {
                               ? revealed[key.id]
                               : `${key.key_prefix}***${revealed[key.id] ? revealed[key.id].slice(-6) : ""}`}
                           </code>
+                        </TableCell>
+                        <TableCell className="hidden max-w-60 truncate text-xs text-muted-foreground lg:table-cell">
+                          {selectedGroupSummary(key, groups)}
                         </TableCell>
                         <TableCell className="hidden text-right text-xs md:table-cell">
                           <span className="font-medium text-foreground">{formatTokens(key.today_tokens)}</span>
@@ -393,6 +878,16 @@ export function GatewayPanel() {
                             <Button
                               variant="ghost"
                               size="icon-sm"
+                              className="size-7"
+                              disabled={!!busy}
+                              title="编辑"
+                              onClick={() => openEditKey(key)}
+                            >
+                              <Pencil className="size-3.5" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
                               className="size-7 text-destructive hover:text-destructive"
                               disabled={!!busy}
                               title="删除"
@@ -412,13 +907,17 @@ export function GatewayPanel() {
         </div>
 
         <div className="overflow-x-auto rounded-md border border-border">
-          <Table className="min-w-[980px]">
+          <Table className="min-w-[1260px]">
             <TableHeader>
               <TableRow>
                 <TableHead>状态</TableHead>
+                <TableHead className="w-20">启用</TableHead>
                 <TableHead>渠道</TableHead>
                 <TableHead>分组</TableHead>
+                <TableHead className="w-24">格式</TableHead>
+                <TableHead className="w-32">上游接口</TableHead>
                 <TableHead className="text-right">倍率</TableHead>
+                <TableHead className="w-28">优先级</TableHead>
                 <TableHead className="w-32">并发上限</TableHead>
                 <TableHead>测活</TableHead>
                 <TableHead>错误</TableHead>
@@ -427,27 +926,38 @@ export function GatewayPanel() {
             <TableBody>
               {loading ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="h-24 text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={11} className="h-24 text-center text-xs text-muted-foreground">
                     <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
                     加载中...
                   </TableCell>
                 </TableRow>
               ) : groups.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="h-24 text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={11} className="h-24 text-center text-xs text-muted-foreground">
                     还没有分组 Key，先点“一键创建分组 Key”
                   </TableCell>
                 </TableRow>
               ) : (
                 groups.map((group) => {
-                  const Icon = group.status === "alive" ? CheckCircle2 : group.status === "dead" ? XCircle : RefreshCw
+                  const status = effectiveStatus(group)
+                  const Icon = status === "alive" ? CheckCircle2 : status === "dead" ? XCircle : RefreshCw
+                  const latestHealth = healthResults[group.id]
+                  const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
                   return (
                     <TableRow key={group.id}>
                       <TableCell>
-                        <Badge variant="outline" className={cn("gap-1.5", statusTone(group.status))}>
+                        <Badge variant="outline" className={cn("gap-1.5", statusTone(status))}>
                           <Icon className="size-3" />
-                          {statusText(group.status)}
+                          {statusText(status)}
                         </Badge>
+                      </TableCell>
+                      <TableCell>
+                        <Switch
+                          checked={group.enabled !== false}
+                          disabled={!!busy}
+                          title={group.enabled === false ? "启用这个上游分组" : "禁用后不会参与调度和测活"}
+                          onCheckedChange={(checked) => void toggleGroupEnabled(group, checked)}
+                        />
                       </TableCell>
                       <TableCell>
                         <div className="text-sm font-medium">{group.channel_name || `#${group.channel_id}`}</div>
@@ -457,9 +967,69 @@ export function GatewayPanel() {
                         <div className="text-sm font-medium">{group.group_name}</div>
                         <div className="max-w-96 truncate text-[11px] text-muted-foreground">{group.group_description || group.group_ref}</div>
                       </TableCell>
+                      <TableCell>
+                        <Select
+                          value={normalizeClientFormat(group.client_format)}
+                          disabled={!!busy}
+                          onValueChange={(value) => void changeGroupClientFormat(group, value)}
+                        >
+                          <SelectTrigger className="h-8 w-24 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="openai">ChatGPT</SelectItem>
+                            <SelectItem value="claude">Claude</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </TableCell>
+                      <TableCell>
+                        <Select
+                          value={normalizeRequestMode(group.request_mode)}
+                          disabled={!!busy}
+                          onValueChange={(value) => void changeGroupRequestMode(group, normalizeRequestMode(value))}
+                        >
+                          <SelectTrigger className="h-8 w-28 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="responses">Responses</SelectItem>
+                            <SelectItem value="chat">Chat</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </TableCell>
                       <TableCell className="text-right">
                         <div className="font-mono text-xs">{formatRatio(group.ratio)}</div>
                         <div className="text-[11px] text-muted-foreground">{formatTokens(group.total_tokens)} tok</div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-1">
+                          <Input
+                            value={priorityDrafts[group.id] ?? String(group.priority || 0)}
+                            inputMode="numeric"
+                            className="h-7 w-16 px-2 text-xs"
+                            disabled={!!busy}
+                            title="数值越大越优先；同优先级再按低倍率调度"
+                            onChange={(event) =>
+                              setPriorityDrafts((prev) => ({
+                                ...prev,
+                                [group.id]: event.target.value.replace(/[^\d]/g, ""),
+                              }))
+                            }
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") {
+                                event.currentTarget.blur()
+                              }
+                            }}
+                            onBlur={() => {
+                              const draft = priorityDrafts[group.id] ?? String(group.priority || 0)
+                              if (Number(draft) !== (group.priority || 0)) {
+                                void savePriority(group)
+                              }
+                            }}
+                          />
+                          {busy === `group-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+                        </div>
+                        <div className="mt-1 text-[11px] text-muted-foreground">越大越优先</div>
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1">
@@ -487,15 +1057,40 @@ export function GatewayPanel() {
                               }
                             }}
                           />
-                          {busy === `group-limit-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+                          {busy === `group-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
                         </div>
                         <div className="mt-1 text-[11px] text-muted-foreground">{(group.concurrency_limit || 0) > 0 ? `${group.concurrency_limit} 路` : "不限"}</div>
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
-                        {group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}
+                        <div>{latestHealth?.checked_at ? relativeTime(latestHealth.checked_at) : group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}</div>
+                        <div className="text-[11px]">{latencyMS > 0 ? `${latencyMS}ms` : "延迟 —"}</div>
                       </TableCell>
-                      <TableCell className="max-w-72 truncate text-xs text-danger" title={group.last_error || ""}>
-                        {group.last_error || ""}
+                      <TableCell className="max-w-72 text-xs text-danger">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate" title={group.last_error || ""}>{group.last_error || ""}</span>
+                          {group.disabled_until && new Date(group.disabled_until).getTime() > Date.now() ? (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-7 shrink-0 px-2 text-[11px]"
+                              disabled={!!busy}
+                              title="立即解除冷却，恢复调度"
+                              onClick={() => void clearCooldown(group)}
+                            >
+                              解除冷却
+                            </Button>
+                          ) : null}
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-7 shrink-0 text-muted-foreground hover:text-danger"
+                            disabled={!!busy}
+                            title="删除该分组（清理上游已删除的残留，仅删本地）"
+                            onClick={() => void deleteGroup(group)}
+                          >
+                            <Trash2 className="size-3.5" />
+                          </Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   )
@@ -505,6 +1100,39 @@ export function GatewayPanel() {
           </Table>
         </div>
       </CardContent>
+
+      <Dialog
+        open={editOpen}
+        onOpenChange={(open) => {
+          setEditOpen(open)
+          if (!open) setEditingKey(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>编辑调用 Key</DialogTitle>
+            <DialogDescription>
+              修改 Key 名称、额度、请求格式和可使用的上游分组，原始密钥不会重新生成。
+            </DialogDescription>
+          </DialogHeader>
+          <KeyDraftFields
+            draft={editDraft}
+            groups={groups}
+            onChange={setEditDraft}
+            showEnabled
+            showKeepExpiry
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditOpen(false)} disabled={!!busy}>
+              取消
+            </Button>
+            <Button onClick={() => void updateGatewayKey()} disabled={!!busy}>
+              {busy === `edit-${editingKey?.id}` ? <Loader2 className="mr-1.5 size-3.5 animate-spin" /> : null}
+              保存
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   )
 }

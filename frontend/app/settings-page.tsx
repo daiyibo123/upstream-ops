@@ -32,23 +32,20 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useConfirm } from "@/components/ui/confirm-dialog";
-import { CaptchaFormDialog } from "@/components/monitor/captcha-form-dialog";
 import { NotificationFormDialog } from "@/components/monitor/notification-form-dialog";
 import { apiFetch } from "@/lib/api";
 import { useTriggerRefresh } from "@/lib/refresh-context";
 import type {
   AppVersion,
   ApplyConfigResult,
-  CaptchaConfig,
   NotificationChannel,
   NotificationChannelType,
   SystemConfig,
   SystemRestartResponse,
   UpgradeCommand,
 } from "@/lib/api-types";
-import { decimal, money, relativeTime } from "@/lib/format";
+import { relativeTime } from "@/lib/format";
 import {
-  useCaptchaConfigs,
   useDashboardSummary,
   useNotificationLogs,
   useNotificationChannels,
@@ -59,6 +56,29 @@ import { cn } from "@/lib/utils";
 
 function num(v: string) {
   return Number(v || 0);
+}
+
+function withConfigDefaults(cfg: SystemConfig): SystemConfig {
+  const app = cfg.app as SystemConfig["app"] & {
+    publicKey?: SystemConfig["app"]["publicKey"];
+  };
+  const publicKey = (app.publicKey ?? {}) as Partial<
+    SystemConfig["app"]["publicKey"]
+  >;
+  return {
+    ...cfg,
+    app: {
+      ...app,
+      publicKey: {
+        enabled: publicKey.enabled ?? false,
+        name: publicKey.name ?? "公益 Key",
+        key: publicKey.key ?? "",
+        password: publicKey.password ?? "",
+        passwordHint: publicKey.passwordHint ?? "",
+        expiresAt: publicKey.expiresAt ?? "",
+      },
+    },
+  };
 }
 
 interface ProxyTestResult {
@@ -72,7 +92,6 @@ interface ProxyTestResult {
 export default function SettingsPage() {
   const query = useSystemConfig();
   const notifications = useNotificationChannels();
-  const captchas = useCaptchaConfigs();
   const summary = useDashboardSummary();
   const notificationLogs = useNotificationLogs(1, 10);
   const appVersion = useAppVersion();
@@ -89,20 +108,15 @@ export default function SettingsPage() {
   const [editingNotification, setEditingNotification] =
     useState<NotificationChannel | null>(null);
   const [notificationOpen, setNotificationOpen] = useState(false);
-  const [editingCaptcha, setEditingCaptcha] = useState<CaptchaConfig | null>(
-    null,
-  );
-  const [captchaOpen, setCaptchaOpen] = useState(false);
   const [busyNotificationID, setBusyNotificationID] = useState<number | null>(
     null,
   );
-  const [busyCaptchaID, setBusyCaptchaID] = useState<number | null>(null);
   const [activeTab, setActiveTab] = useState("system");
   const [versionInfo, setVersionInfo] = useState<AppVersion | null>(null);
 
   useEffect(() => {
     if (query.data?.config) {
-      setForm(query.data.config);
+      setForm(withConfigDefaults(query.data.config));
     }
   }, [query.data]);
 
@@ -172,45 +186,6 @@ export default function SettingsPage() {
       toast.error(err instanceof Error ? err.message : "测试失败");
     } finally {
       setBusyNotificationID(null);
-    }
-  }
-
-  async function handleDeleteCaptcha(item: CaptchaConfig) {
-    const ok = await confirm({
-      title: `删除验证码服务 ${item.name}？`,
-      description: "删除后引用此服务的渠道需要重新指定验证码服务。",
-      confirmLabel: "删除",
-      destructive: true,
-    });
-    if (!ok) return;
-    setBusyCaptchaID(item.id);
-    try {
-      await apiFetch(`/captcha-configs/${item.id}`, { method: "DELETE" });
-      toast.success(`已删除 ${item.name}`);
-      refresh();
-      captchas.refetch();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "删除失败");
-    } finally {
-      setBusyCaptchaID(null);
-    }
-  }
-
-  async function handleRefreshCaptchaBalance(item: CaptchaConfig) {
-    setBusyCaptchaID(item.id);
-    try {
-      await apiFetch(`/captcha-configs/${item.id}/refresh-balance`, {
-        method: "POST",
-      });
-      toast.success(`已更新 ${item.name} 剩余额度`);
-      refresh();
-      captchas.refetch();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "更新失败");
-      refresh();
-      captchas.refetch();
-    } finally {
-      setBusyCaptchaID(null);
     }
   }
 
@@ -350,11 +325,6 @@ export default function SettingsPage() {
             upstream: {
               ...prev.upstream,
               requestRectifier: {
-                enabled: true,
-                thinkingSignature: true,
-                thinkingBudget: true,
-                unsupportedImageFallback: true,
-                heuristicTextOnlyModels: false,
                 ...prev.upstream.requestRectifier,
                 [key]: checked,
               },
@@ -377,7 +347,7 @@ export default function SettingsPage() {
           </Badge>
         </div>
         <p className="max-w-3xl text-sm leading-6 text-muted-foreground">
-          这里集中管理鉴权、调度、通知策略、通知渠道和验证码服务。保存只写入配置文件，应用会让鉴权、调度和通知策略立即生效；通知渠道和验证码服务本身是实时写库生效。
+          这里集中管理鉴权、调度、通知策略和通知渠道。保存只写入配置文件，应用会让鉴权、调度和通知策略立即生效；通知渠道本身是实时写库生效。
         </p>
         <p className="text-xs text-muted-foreground">
           配置文件路径：{query.data?.config_path ?? "—"}
@@ -391,9 +361,6 @@ export default function SettingsPage() {
           </TabsTrigger>
           <TabsTrigger value="notifications" className="px-4 py-2">
             通知渠道
-          </TabsTrigger>
-          <TabsTrigger value="captcha" className="px-4 py-2">
-            验证码服务
           </TabsTrigger>
         </TabsList>
 
@@ -495,6 +462,153 @@ export default function SettingsPage() {
                                 app: {
                                   ...prev.app,
                                   notificationPrefix: e.target.value,
+                                },
+                              }
+                            : prev,
+                        )
+                      }
+                    />
+                  </Field>
+                </div>
+              </SectionCard>
+
+              <SectionCard
+                icon={<KeyRound className="size-4 text-cyan-600" />}
+                title="首页公益 Key"
+                description="在公开首页展示一个可复制的公益 Key，可设置复制密码、提示词和到期时间。"
+              >
+                <div className="grid gap-4 md:grid-cols-2">
+                  <InlineSwitch
+                    id="public-key-enabled"
+                    label="启用首页公益 Key"
+                    description="开启后公开首页会显示公益 Key 入口，但不会直接暴露明文。"
+                    checked={form.app.publicKey.enabled}
+                    onCheckedChange={(checked) =>
+                      setForm((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              app: {
+                                ...prev.app,
+                                publicKey: {
+                                  ...prev.app.publicKey,
+                                  enabled: checked,
+                                },
+                              },
+                            }
+                          : prev,
+                      )
+                    }
+                  />
+                  <NoteBox title="推荐做法">
+                    先在“创建 Key”页面创建一个只绑定低价分组的 Key，再把完整 Key 填到这里。
+                  </NoteBox>
+                </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-2">
+                  <Field label="展示名称" description="公开首页按钮和卡片展示的名称。">
+                    <Input
+                      value={form.app.publicKey.name}
+                      placeholder="公益 OpenAI Key"
+                      onChange={(e) =>
+                        setForm((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                app: {
+                                  ...prev.app,
+                                  publicKey: {
+                                    ...prev.app.publicKey,
+                                    name: e.target.value,
+                                  },
+                                },
+                              }
+                            : prev,
+                        )
+                      }
+                    />
+                  </Field>
+                  <Field label="到期时间" description="留空表示不过期；可填 2026-08-01 或 RFC3339。">
+                    <Input
+                      value={form.app.publicKey.expiresAt}
+                      placeholder="2026-08-01"
+                      onChange={(e) =>
+                        setForm((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                app: {
+                                  ...prev.app,
+                                  publicKey: {
+                                    ...prev.app.publicKey,
+                                    expiresAt: e.target.value,
+                                  },
+                                },
+                              }
+                            : prev,
+                        )
+                      }
+                    />
+                  </Field>
+                  <Field label="公益 Key" description="填写完整网关 Key；公开摘要不会返回明文。">
+                    <Input
+                      type="password"
+                      value={form.app.publicKey.key}
+                      placeholder="sk-..."
+                      onChange={(e) =>
+                        setForm((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                app: {
+                                  ...prev.app,
+                                  publicKey: {
+                                    ...prev.app.publicKey,
+                                    key: e.target.value,
+                                  },
+                                },
+                              }
+                            : prev,
+                        )
+                      }
+                    />
+                  </Field>
+                  <Field label="复制密码" description="留空表示公开页无需密码即可复制。">
+                    <Input
+                      type="password"
+                      value={form.app.publicKey.password}
+                      onChange={(e) =>
+                        setForm((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                app: {
+                                  ...prev.app,
+                                  publicKey: {
+                                    ...prev.app.publicKey,
+                                    password: e.target.value,
+                                  },
+                                },
+                              }
+                            : prev,
+                        )
+                      }
+                    />
+                  </Field>
+                  <Field label="密码提示词" description="公开页密码输入框上方展示。">
+                    <Input
+                      value={form.app.publicKey.passwordHint}
+                      placeholder="例如：关注公告获取复制密码"
+                      onChange={(e) =>
+                        setForm((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                app: {
+                                  ...prev.app,
+                                  publicKey: {
+                                    ...prev.app.publicKey,
+                                    passwordHint: e.target.value,
+                                  },
                                 },
                               }
                             : prev,
@@ -1304,7 +1418,7 @@ export default function SettingsPage() {
           <SectionCard
             icon={<Send className="size-4 text-violet-600" />}
             title="通知渠道"
-            description="管理 Telegram、Webhook、邮件、企业微信、钉钉、飞书等通知出口。"
+            description="管理邮件、企业微信、飞书通知出口。"
             action={
               <Button
                 size="sm"
@@ -1440,145 +1554,6 @@ export default function SettingsPage() {
           </SectionCard>
         </TabsContent>
 
-        <TabsContent value="captcha">
-          <SectionCard
-            icon={<KeyRound className="size-4 text-rose-600" />}
-            title="验证码服务"
-            description="管理用于处理 Turnstile 的打码平台，供渠道登录时自动调用。"
-            action={
-              <Button
-                size="sm"
-                variant="outline"
-                className="border-border bg-background"
-                onClick={() => {
-                  setEditingCaptcha(null);
-                  setCaptchaOpen(true);
-                }}
-              >
-                <Plus className="size-3.5" />
-                新增服务
-              </Button>
-            }
-          >
-            <div className="mb-4 grid gap-3 md:grid-cols-2">
-              <MiniMetric
-                title="服务数量"
-                value={String(captchas.data?.length ?? 0)}
-              />
-              <MiniMetric
-                title="用途"
-                value="登录验证"
-                hint="渠道启用 Turnstile 时调用"
-              />
-            </div>
-            {captchas.loading ? (
-              <EmptyLine text="验证码服务加载中..." />
-            ) : !captchas.data || captchas.data.length === 0 ? (
-              <EmptyPanel
-                title="还没有验证码服务"
-                description="如果某些渠道登录需要 Turnstile 验证，在这里接入 CapSolver、2Captcha 等服务。"
-              />
-            ) : (
-              <div className="space-y-3">
-                {captchas.data.map((item) => (
-                  <div
-                    key={item.id}
-                    className="rounded-2xl border border-border bg-background/80 p-4"
-                  >
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                      <div className="space-y-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="text-sm font-semibold text-foreground">
-                            {item.name}
-                          </p>
-                          <Badge
-                            variant="outline"
-                            className="border-border bg-muted/40"
-                          >
-                            {captchaLabel(item.type)}
-                          </Badge>
-                          <Badge
-                            variant="outline"
-                            className={cn(
-                              "border-transparent",
-                              item.enabled
-                                ? "bg-emerald-50 text-emerald-700"
-                                : "bg-slate-100 text-slate-500",
-                            )}
-                          >
-                            {item.enabled ? "启用中" : "已禁用"}
-                          </Badge>
-                          {item.proxy_enabled ? (
-                            <Badge
-                              variant="outline"
-                              className="border-transparent bg-cyan-50 text-cyan-700"
-                            >
-                              代理 IP
-                            </Badge>
-                          ) : null}
-                        </div>
-                        <p className="text-xs text-muted-foreground">
-                          {item.endpoint
-                            ? `自定义 Endpoint：${item.endpoint}`
-                            : "使用平台默认 Endpoint"}
-                        </p>
-                        <p
-                          className={cn(
-                            "text-xs",
-                            item.balance_error
-                              ? "text-destructive"
-                              : "text-muted-foreground",
-                          )}
-                        >
-                          剩余额度：{formatCaptchaBalance(item)}
-                          {item.balance_error
-                            ? ` · ${item.balance_error}`
-                            : item.balance_at
-                              ? ` · 更新于 ${relativeTime(item.balance_at)}`
-                              : " · 未更新"}
-                        </p>
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <Button
-                          size="icon-sm"
-                          variant="ghost"
-                          disabled={busyCaptchaID === item.id}
-                          onClick={() => handleRefreshCaptchaBalance(item)}
-                        >
-                          <RefreshCw
-                            className={cn(
-                              "size-4",
-                              busyCaptchaID === item.id ? "animate-spin" : "",
-                            )}
-                          />
-                        </Button>
-                        <Button
-                          size="icon-sm"
-                          variant="ghost"
-                          onClick={() => {
-                            setEditingCaptcha(item);
-                            setCaptchaOpen(true);
-                          }}
-                        >
-                          <PencilLine className="size-4" />
-                        </Button>
-                        <Button
-                          size="icon-sm"
-                          variant="ghost"
-                          className="text-destructive hover:bg-destructive/10 hover:text-destructive"
-                          disabled={busyCaptchaID === item.id}
-                          onClick={() => handleDeleteCaptcha(item)}
-                        >
-                          <Trash2 className="size-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </SectionCard>
-        </TabsContent>
       </Tabs>
 
       <NotificationFormDialog
@@ -1588,15 +1563,6 @@ export default function SettingsPage() {
           if (!open) setEditingNotification(null);
         }}
         channel={editingNotification}
-      />
-
-      <CaptchaFormDialog
-        open={captchaOpen}
-        onOpenChange={(open) => {
-          setCaptchaOpen(open);
-          if (!open) setEditingCaptcha(null);
-        }}
-        config={editingCaptcha}
       />
 
       {confirmDialog}
@@ -1783,43 +1749,19 @@ function EmptyLine({ text }: { text: string }) {
 }
 
 function typeLabel(type: NotificationChannelType) {
-  const map: Record<NotificationChannelType, string> = {
-    telegram: "Telegram",
-    webhook: "Webhook",
+  const map: Partial<Record<NotificationChannelType, string>> = {
     email: "邮件",
     wecom: "企业微信",
-    dingtalk: "钉钉",
     feishu: "飞书",
-    serverchan3: "Server酱³",
   };
   return map[type] ?? type;
-}
-
-function captchaLabel(type: CaptchaConfig["type"]) {
-  const map: Record<CaptchaConfig["type"], string> = {
-    capsolver: "CapSolver",
-    "2captcha": "2Captcha",
-    anticaptcha: "AntiCaptcha",
-    yescaptcha: "YesCaptcha",
-  };
-  return map[type] ?? type;
-}
-
-function formatCaptchaBalance(item: CaptchaConfig) {
-  if (item.last_balance == null) return "—";
-  if (item.balance_unit === "points") return `${decimal(item.last_balance, 0)} 点`;
-  return money(item.last_balance, { precise: true });
 }
 
 function notifyIcon(type: NotificationChannelType) {
   const map: Partial<Record<NotificationChannelType, typeof Send>> = {
-    telegram: Send,
-    webhook: Send,
     email: Send,
     wecom: Send,
-    dingtalk: Send,
     feishu: Send,
-    serverchan3: Send,
   };
   return map[type] ?? Send;
 }

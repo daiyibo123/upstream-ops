@@ -6,7 +6,6 @@ import {
   ArrowUpDown,
   CheckCircle2,
   ChevronDown,
-  CreditCard,
   ExternalLink,
   KeyRound,
   Loader2,
@@ -60,7 +59,6 @@ import { syncAllChannelsStream, syncChannelStream, testLoginStream, type Progres
 import type { Channel, ChannelRedeemResult, RateSnapshot } from "@/lib/api-types"
 import { ChannelFormDialog } from "@/components/monitor/channel-form-dialog"
 import { ChannelRedeemDialog } from "@/components/monitor/channel-redeem-dialog"
-import { ChannelRechargeDialog } from "@/components/monitor/channel-recharge-dialog"
 import { ChannelAPIKeysDialog } from "@/components/monitor/channel-api-keys-dialog"
 import {
   ChannelSubscriptionUsageMetricTiles,
@@ -427,7 +425,7 @@ interface BulkSyncState {
 }
 
 const stageLabel: Record<ProgressEvent["stage"], string> = {
-  captcha: "打码",
+  captcha: "Key/Token",
   session: "会话",
   login: "登录",
   balance: "余额",
@@ -527,7 +525,6 @@ export function ChannelCards() {
   const [creating, setCreating] = useState(false)
   const [groupsOpen, setGroupsOpen] = useState(false)
   const [redeeming, setRedeeming] = useState<Channel | null>(null)
-  const [recharging, setRecharging] = useState<Channel | null>(null)
   const [managingKeys, setManagingKeys] = useState<Channel | null>(null)
   const [busyAction, setBusyAction] = useState<string | null>(null)
   // 每个渠道当前 sync 进度（最新一条事件） + 历史事件
@@ -922,15 +919,6 @@ export function ChannelCards() {
                       variant="outline"
                       size="sm"
                       className="gap-1 text-xs"
-                      onClick={() => setRecharging(c)}
-                    >
-                      <CreditCard className="size-3" />
-                      {"充值"}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="gap-1 text-xs"
                       onClick={() => setRedeeming(c)}
                     >
                       <Gift className="size-3" />
@@ -1158,14 +1146,6 @@ export function ChannelCards() {
         onSuccess={(result) => {
           toast.success(renderRedeemSummary(result))
         }}
-      />
-
-      <ChannelRechargeDialog
-        open={recharging != null}
-        onOpenChange={(v) => {
-          if (!v) setRecharging(null)
-        }}
-        channel={recharging}
       />
 
       <ChannelAPIKeysDialog

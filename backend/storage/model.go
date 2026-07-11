@@ -14,7 +14,7 @@ const (
 //   - password: 经典模式，存账号 + 密码，由 Connector 走完整登录流程
 //   - token:    跳过登录，存用户已有的 cookie / access_token，直接构造 AuthSession
 //
-// token 模式不依赖打码 / 不会自动续期，token 失效时表现为 last_error 显示鉴权失败。
+// token 模式不依赖自动验证码 / 不会自动续期，token 失效时表现为 last_error 显示鉴权失败。
 type CredentialMode string
 
 const (
@@ -82,7 +82,7 @@ type AuthSession struct {
 
 func (AuthSession) TableName() string { return "auth_sessions" }
 
-// CaptchaProviderType 打码平台类型。
+// CaptchaProviderType 历史自动验证码平台类型，保留用于旧数据库兼容。
 type CaptchaProviderType string
 
 const (
@@ -92,7 +92,7 @@ const (
 	CaptchaYesCaptcha  CaptchaProviderType = "yescaptcha"
 )
 
-// CaptchaConfig 打码平台配置。APIKeyCipher 加密保存，Extra 存放各平台差异化 JSON。
+// CaptchaConfig 历史自动验证码配置。当前版本不再暴露配置入口，结构保留用于旧数据库兼容。
 type CaptchaConfig struct {
 	ID           uint                `gorm:"primaryKey" json:"id"`
 	Name         string              `gorm:"size:128;not null;uniqueIndex" json:"name"`
@@ -180,7 +180,7 @@ type CostSnapshot struct {
 
 func (CostSnapshot) TableName() string { return "cost_snapshots" }
 
-// NotificationChannelType 通知渠道类型。第一版至少 telegram，其它预留。
+// NotificationChannelType 通知渠道类型。旧类型常量保留用于读取历史数据。
 type NotificationChannelType string
 
 const (
@@ -298,6 +298,8 @@ type GatewayKey struct {
 	KeyHash     string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
 	KeyCipher   string     `gorm:"type:text;not null" json:"-"`
 	Enabled     bool       `gorm:"not null;default:true" json:"enabled"`
+	ClientFormat string    `gorm:"size:16;not null;default:'openai'" json:"client_format"`
+	AllowedGroupIDs string `gorm:"type:text" json:"allowed_group_ids,omitempty"`
 	DailyLimit  int64      `gorm:"not null;default:0" json:"daily_limit"`
 	TotalLimit  int64      `gorm:"not null;default:0" json:"total_limit"`
 	TodayTokens int64      `gorm:"not null;default:0" json:"today_tokens"`
@@ -334,12 +336,16 @@ type UpstreamGroupKey struct {
 	ChannelID        uint        `gorm:"not null;uniqueIndex:idx_upstream_group_key;index" json:"channel_id"`
 	ChannelName      string      `gorm:"size:128" json:"channel_name,omitempty"`
 	ChannelType      ChannelType `gorm:"size:32;not null" json:"channel_type"`
+	ClientFormat     string      `gorm:"size:16;not null;default:'openai';index" json:"client_format"`
+	RequestMode      string      `gorm:"size:16;not null;default:'responses';index" json:"request_mode"`
 	GroupRef         string      `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
 	GroupName        string      `gorm:"size:256;not null" json:"group_name"`
 	GroupDesc        string      `gorm:"size:512" json:"group_description,omitempty"`
 	Ratio            float64     `gorm:"not null;default:1" json:"ratio"`
+	Priority         int         `gorm:"not null;default:0;index" json:"priority"`
 	UpstreamKeyID    int64       `gorm:"not null;default:0" json:"upstream_key_id"`
 	KeyCipher        string      `gorm:"type:text;not null" json:"-"`
+	Enabled          bool        `gorm:"not null;default:true;index" json:"enabled"`
 	Status           string      `gorm:"size:16;not null;default:'unknown';index" json:"status"`
 	ConcurrencyLimit int         `gorm:"not null;default:0" json:"concurrency_limit"`
 	FailureCount     int         `gorm:"not null;default:0" json:"failure_count"`
@@ -347,6 +353,7 @@ type UpstreamGroupKey struct {
 	CompletionTokens int64       `gorm:"not null;default:0" json:"completion_tokens"`
 	TotalTokens      int64       `gorm:"not null;default:0" json:"total_tokens"`
 	LastCheckedAt    *time.Time  `json:"last_checked_at,omitempty"`
+	LastLatencyMS    int64       `gorm:"not null;default:0" json:"last_latency_ms"`
 	LastSuccessAt    *time.Time  `json:"last_success_at,omitempty"`
 	LastUsedAt       *time.Time  `json:"last_used_at,omitempty"`
 	DisabledUntil    *time.Time  `json:"disabled_until,omitempty"`

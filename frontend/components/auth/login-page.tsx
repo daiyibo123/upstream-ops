@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useState, type FormEvent } from "react"
+import { useNavigate } from "react-router-dom"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -11,6 +12,7 @@ import type { ApiError } from "@/lib/api"
 
 export function LoginPage() {
   const { login } = useAuth()
+  const navigate = useNavigate()
   const appVersion = useAppVersion()
   const [username, setUsername] = useState("")
   const [password, setPassword] = useState("")
@@ -28,6 +30,7 @@ export function LoginPage() {
     setSubmitting(true)
     try {
       await login(username.trim(), password)
+      navigate("/dashboard", { replace: true })
     } catch (err) {
       const e = err as ApiError
       if (e.status === 401) {

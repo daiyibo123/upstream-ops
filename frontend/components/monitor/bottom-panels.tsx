@@ -7,8 +7,6 @@ import {
   ArrowUpRight,
   Bell,
   Clock3,
-  RefreshCw,
-  KeyRound,
   Pencil,
   Plus,
   Send,
@@ -29,20 +27,17 @@ import {
 } from "@/components/ui/dialog"
 import {
   useAnnouncements,
-  useCaptchaConfigs,
   useDashboardSummary,
   useNotificationChannels,
   useNotificationLogs,
 } from "@/lib/queries"
 import { apiFetch } from "@/lib/api"
 import { useTriggerRefresh } from "@/lib/refresh-context"
-import { channelTypeLabel, dateTime, decimal, money, relativeTime } from "@/lib/format"
+import { channelTypeLabel, dateTime, relativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
-import { CaptchaFormDialog } from "@/components/monitor/captcha-form-dialog"
 import { NotificationFormDialog } from "@/components/monitor/notification-form-dialog"
 import type { LucideIcon } from "lucide-react"
 import type {
-  CaptchaConfig,
   NotificationChannel,
   NotificationEvent,
   NotificationChannelType,
@@ -51,10 +46,9 @@ import type {
   UpstreamAnnouncement,
 } from "@/lib/api-types"
 
-const eventMeta: Record<NotificationEvent, { icon: LucideIcon; cls: string }> = {
+const eventMeta: Partial<Record<NotificationEvent, { icon: LucideIcon; cls: string }>> = {
   balance_low: { icon: AlertTriangle, cls: "text-warning" },
   login_failed: { icon: ShieldX, cls: "text-danger" },
-  captcha_failed: { icon: KeyRound, cls: "text-danger" },
   rate_changed: { icon: ArrowUpRight, cls: "text-brand" },
   rate_structure_changed: { icon: ArrowUpRight, cls: "text-brand" },
   rate_added: { icon: Plus, cls: "text-brand" },
@@ -491,183 +485,10 @@ export function UpstreamAnnouncements() {
   )
 }
 
-const captchaTypeLabel: Record<string, string> = {
-  capsolver: "CapSolver",
-  "2captcha": "2Captcha",
-  anticaptcha: "AntiCaptcha",
-  yescaptcha: "YesCaptcha",
-}
-
-export function CaptchaStatus() {
-  const { data, loading } = useCaptchaConfigs()
-  const refresh = useTriggerRefresh()
-  const { confirm, dialog: confirmDialog } = useConfirm()
-  const [editing, setEditing] = useState<CaptchaConfig | null>(null)
-  const [open, setOpen] = useState(false)
-  const [busy, setBusy] = useState<number | null>(null)
-
-  async function handleRefreshBalance(c: CaptchaConfig) {
-    setBusy(c.id)
-    try {
-      await apiFetch(`/captcha-configs/${c.id}/refresh-balance`, { method: "POST" })
-      toast.success(`已更新 ${c.name} 剩余额度`)
-      refresh()
-    } catch (e) {
-      const err = e as Error
-      toast.error(err.message || "更新失败")
-      refresh()
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  async function handleDelete(c: CaptchaConfig) {
-    const ok = await confirm({
-      title: `删除打码配置 ${c.name}？`,
-      description: "删除后引用此配置的渠道将无法自动过码，需要重新指定打码 provider。",
-      confirmLabel: "删除",
-      destructive: true,
-    })
-    if (!ok) return
-    setBusy(c.id)
-    try {
-      await apiFetch(`/captcha-configs/${c.id}`, { method: "DELETE" })
-      toast.success(`已删除 ${c.name}`)
-      refresh()
-    } catch (e) {
-      const err = e as Error
-      toast.error(err.message || "删除失败")
-    } finally {
-      setBusy(null)
-    }
-  }
-
-  return (
-    <Card className="border border-border shadow-none">
-      <CardHeader className="flex flex-row items-center justify-between pb-2">
-        <CardTitle className="text-base font-semibold">{"验证码服务"}</CardTitle>
-        <Button
-          size="sm"
-          variant="outline"
-          className="h-7 gap-1 text-xs"
-          onClick={() => {
-            setEditing(null)
-            setOpen(true)
-          }}
-        >
-          <Plus className="size-3" />
-          {"新增"}
-        </Button>
-      </CardHeader>
-      <CardContent className="px-0">
-        {loading ? (
-          <p className="px-6 py-4 text-xs text-muted-foreground">{"加载中…"}</p>
-        ) : !data || data.length === 0 ? (
-          <p className="px-6 py-4 text-xs text-muted-foreground">{"暂未配置打码 provider"}</p>
-        ) : (
-          <ul className="divide-y divide-border">
-            {data.map((p) => (
-              <li key={p.id} className="flex items-center justify-between gap-2 px-6 py-2.5">
-                <div className="flex min-w-0 items-center gap-2.5">
-                  <span
-                    className={cn(
-                      "size-2 shrink-0 rounded-full",
-                      p.enabled ? "bg-success" : "bg-muted-foreground/30",
-                    )}
-                  />
-                  <span className="truncate text-sm font-medium text-foreground">{p.name}</span>
-                  <span className="shrink-0 text-xs text-muted-foreground">
-                    {captchaTypeLabel[p.type] ?? p.type}
-                  </span>
-                  <span className="shrink-0 text-xs font-medium text-foreground">
-                    {formatCaptchaBalance(p)}
-                  </span>
-                  <span
-                    className={cn(
-                      "truncate text-xs",
-                      p.balance_error ? "text-destructive" : "text-muted-foreground",
-                    )}
-                  >
-                    {p.balance_error
-                      ? p.balance_error
-                      : p.balance_at
-                        ? `更新于 ${relativeTime(p.balance_at)}`
-                        : "未更新"}
-                  </span>
-                </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  <span
-                    className={cn(
-                      "mr-1 text-xs",
-                      p.enabled ? "text-success" : "text-muted-foreground",
-                    )}
-                  >
-                    {p.enabled ? "已启用" : "已禁用"}
-                  </span>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-7 w-7"
-                    disabled={busy === p.id}
-                    onClick={() => handleRefreshBalance(p)}
-                  >
-                    <RefreshCw className={cn("size-3.5", busy === p.id ? "animate-spin" : "")} />
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-7 w-7"
-                    onClick={() => {
-                      setEditing(p)
-                      setOpen(true)
-                    }}
-                  >
-                    <Pencil className="size-3.5" />
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-7 w-7 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                    disabled={busy === p.id}
-                    onClick={() => handleDelete(p)}
-                  >
-                    <Trash2 className="size-3.5" />
-                  </Button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </CardContent>
-
-      <CaptchaFormDialog
-        open={open}
-        onOpenChange={(v) => {
-          setOpen(v)
-          if (!v) setEditing(null)
-        }}
-        config={editing}
-      />
-
-      {confirmDialog}
-    </Card>
-  )
-}
-
-function formatCaptchaBalance(c: CaptchaConfig) {
-  if (c.last_balance == null) return "余额 —"
-  if (c.balance_unit === "points") return `${decimal(c.last_balance, 0)} 点`
-  return money(c.last_balance, { precise: true })
-}
-
 const notifyTypeIcon: Partial<Record<NotificationChannelType, LucideIcon>> = {
-  telegram: Send,
-  webhook: Send,
   email: Send,
   wecom: Send,
-  dingtalk: Send,
   feishu: Send,
-  serverchan3: Send,
 }
 
 export function NotificationStatus() {

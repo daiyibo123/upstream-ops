@@ -77,6 +77,43 @@ func TestVersionEndpointKeepsResponseOnGitHubError(t *testing.T) {
 	}
 }
 
+func TestVersionEndpointFallsBackToLatestTagWhenReleaseMissing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"message":"not found"}`))
+	})
+	mux.HandleFunc("/tags", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"name":"v999.0.1"}]`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	oldReleaseURL := githubLatestReleaseURL
+	oldTagsURL := githubTagsURL
+	oldClient := githubReleaseClient
+	githubLatestReleaseURL = srv.URL + "/releases/latest"
+	githubTagsURL = srv.URL + "/tags"
+	githubReleaseClient = srv.Client()
+	t.Cleanup(func() {
+		githubLatestReleaseURL = oldReleaseURL
+		githubTagsURL = oldTagsURL
+		githubReleaseClient = oldClient
+	})
+
+	resp := requestVersion(t)
+	if resp.LatestVersion != "v999.0.1" {
+		t.Fatalf("latest_version = %q, want v999.0.1", resp.LatestVersion)
+	}
+	if strings.TrimSpace(resp.UpdateError) != "" {
+		t.Fatalf("update_error = %q, want empty", resp.UpdateError)
+	}
+}
+
 func withGitHubReleaseServer(t *testing.T, status int, body string) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

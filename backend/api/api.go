@@ -34,8 +34,6 @@ type channelService interface {
 	ClearLoginInfo(id uint) (*storage.Channel, error)
 	TestLogin(ctx context.Context, channelID uint) error
 	RedeemCode(ctx context.Context, channelID uint, code string) (*connector.RedeemResult, error)
-	GetRechargeInfo(ctx context.Context, channelID uint) (*connector.RechargeInfo, error)
-	CreateRecharge(ctx context.Context, channelID uint, req connector.RechargeRequest) (*connector.RechargeLaunch, error)
 	GetSubscriptionInfo(ctx context.Context, channelID uint) (*connector.SubscriptionInfo, error)
 	CreateSubscription(ctx context.Context, channelID uint, req connector.SubscriptionRequest) (*connector.SubscriptionLaunch, error)
 	GetSubscriptionUsage(ctx context.Context, channelID uint) (*connector.SubscriptionUsageInfo, error)
@@ -85,6 +83,7 @@ func Register(r *gin.Engine, d *Deps) {
 	})
 
 	api := r.Group("/api")
+	registerPublicDashboard(api.Group("/public"), d)
 	if d.Runtime != nil {
 		api.Use(d.Runtime.AuthMiddleware())
 	}
@@ -92,7 +91,6 @@ func Register(r *gin.Engine, d *Deps) {
 		registerVersion(api, d)
 		registerAuth(api, d)
 		registerChannels(api, d)
-		registerCaptchas(api, d)
 		registerNotifications(api, d)
 		registerAnnouncements(api, d)
 		registerRates(api, d)
