@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/bejix/upstream-ops/backend/global"
 	"github.com/gin-gonic/gin"
 )
@@ -111,6 +112,26 @@ func TestVersionEndpointFallsBackToLatestTagWhenReleaseMissing(t *testing.T) {
 	}
 	if strings.TrimSpace(resp.UpdateError) != "" {
 		t.Fatalf("update_error = %q, want empty", resp.UpdateError)
+	}
+}
+
+func TestVersionCheckClientRespectsVersionProxyToggle(t *testing.T) {
+	oldClient := githubReleaseClient
+	sentinel := &http.Client{}
+	githubReleaseClient = sentinel
+	t.Cleanup(func() {
+		githubReleaseClient = oldClient
+	})
+
+	cfg := config.ProxyConfig{
+		Enabled:             true,
+		VersionCheckEnabled: false,
+		Protocol:            "http",
+		Host:                "127.0.0.1",
+		Port:                1080,
+	}
+	if got := versionCheckClient(cfg, true); got != sentinel {
+		t.Fatalf("force=1 should not use proxy when versionCheckEnabled=false")
 	}
 }
 

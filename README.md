@@ -12,7 +12,7 @@
 - **公益 Key**：可在公开首页展示一个可复制的公益 Key，支持复制密码、提示词、到期时间。
 - **使用记录**：记录每次请求的渠道、分组、模型、token 与时间。
 - **手动添加渠道**：对无法登录的上游，可直接填分组名 + key 手动接入。
-- **一键部署 + 自动更新**：Docker 一条命令拉起；watchtower 侧车可选自动更新，支持一键重启、回退。
+- **一键部署 + 一键更新**：Docker 一条命令拉起；watchtower 侧车默认按需更新，支持面板一键更新重启、可选定时自动更新和回退。
 
 ## 快速部署（Docker）
 
@@ -30,8 +30,7 @@ ADMIN_PASSWORD=改成你的密码
 HTTP_PORT=127.0.0.1:8080
 EOF
 
-# 需要自动更新则加 --profile autoupdate
-docker compose --profile autoupdate pull && docker compose --profile autoupdate up -d
+docker compose pull && docker compose up -d
 ```
 
 - 账号密码在初始化时由 `.env` 设置，后续在 `.env` 里修改。
@@ -41,10 +40,10 @@ docker compose --profile autoupdate pull && docker compose --profile autoupdate 
 ## 更新
 
 ```bash
-cd /root/upstream-ops && docker compose --profile autoupdate pull && docker compose --profile autoupdate up -d
+cd /root/upstream-ops && docker compose pull && docker compose up -d app
 ```
 
-或在面板里点「检查更新 / 立即重启」。更新只替换镜像，`./data` 保持不变。
+或在面板里点「检查更新 / 立即更新并重启」。更新只替换镜像，`./data` 保持不变。若需要定时自动更新，在 `.env` 中设置 `WATCHTOWER_HTTP_API_PERIODIC_POLLS=true` 后重启 watchtower。
 
 ## 致谢
 

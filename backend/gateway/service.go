@@ -176,6 +176,7 @@ type usageTokens struct {
 	Completion int64
 	Total      int64
 	ResponseID string
+	SoftFailure string
 }
 
 type groupRuntimeState struct {
@@ -451,6 +452,14 @@ func (s *Service) ListGroupKeys() ([]storage.UpstreamGroupKey, error) {
 	return s.groupKeys.List()
 }
 
+func (s *Service) ListGroupKeysPage(limit, offset int) ([]storage.UpstreamGroupKey, int64, error) {
+	return s.groupKeys.ListPage(limit, offset)
+}
+
+func (s *Service) GroupKeyCounts() (storage.UpstreamGroupKeyCounts, error) {
+	return s.groupKeys.Counts()
+}
+
 func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.UpstreamGroupKey, error) {
 	if input.ConcurrencyLimit != nil {
 		limit := *input.ConcurrencyLimit
@@ -722,19 +731,16 @@ func (s *Service) TestAllGroupKeys(_ context.Context) (*HealthResult, error) {
 	// 关键：测活用独立的、够长的 context，绝不复用调用方（HTTP 请求）的 ctx。
 	// 之前直接用 c.Request.Context()，渠道一多、串行探测耗时超过浏览器/网关的请求超时，
 	// 整个 ctx 被取消，导致"正在测的 + 还没测的"全部 context canceled 被误判为死亡。
-	// 这里给一个基于总数的宽裕预算：每个渠道最坏 ~25s（首探 + 抖动 + 重探），再封顶 10 分钟。
-	budget := time.Duration(len(list))*25*time.Second + 30*time.Second
-	if budget > 10*time.Minute {
-		budget = 10 * time.Minute
-	}
+	// 全量测活应当同时发起，而不是按上游数量串行拉长。单个分组最坏为
+	// 两次 8 秒探测加最多 15 秒抖动重试，给整批 45 秒的独立预算即可。
+	budget := 45 * time.Second
 	probeCtx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
 	result := &HealthResult{Items: make([]HealthResultItem, len(list))}
 
-	// 并发探测，限制并发度，避免 2C1G 上一次性打太多请求。
-	const maxConcurrent = 6
-	sem := make(chan struct{}, maxConcurrent)
+	// 所有启用分组同时测活。每个请求都只有 1 token 的流式 "hi"，
+	// 不会因为分组数量多而让后面的分组排队、继承前面的超时。
 	var wg sync.WaitGroup
 	for i := range list {
 		if !list[i].Enabled {
@@ -752,8 +758,6 @@ func (s *Service) TestAllGroupKeys(_ context.Context) (*HealthResult, error) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 			result.Items[idx] = s.testGroupKey(probeCtx, &list[idx])
 		}(i)
 	}
@@ -775,6 +779,20 @@ func (s *Service) TestAllGroupKeys(_ context.Context) (*HealthResult, error) {
 		}
 	}
 	return result, nil
+}
+
+// TestGroupKey immediately tests one upstream group. It deliberately owns its
+// context so the browser request ending cannot turn a real probe into a false
+// "context canceled" death result.
+func (s *Service) TestGroupKey(id uint) (*HealthResultItem, error) {
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	result := s.testGroupKey(ctx, key)
+	return &result, nil
 }
 
 func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) error {
@@ -952,6 +970,9 @@ func (s *Service) attemptStream(
 		_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 		s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
 		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
+		if usage.SoftFailure != "" {
+			s.markProxyFailure(candidate.ID, usage.SoftFailure)
+		}
 		return candOutcome{kind: candSuccess}
 	}
 	errMsg := err.Error()
@@ -963,7 +984,10 @@ func (s *Service) attemptStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
+			s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
+			if usage.SoftFailure != "" {
+				s.markProxyFailure(candidate.ID, usage.SoftFailure)
+			}
 			return candOutcome{kind: candSuccess}
 		}
 		errMsg = reason + " retry failed: " + err.Error()
@@ -979,7 +1003,10 @@ func (s *Service) attemptStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
+			s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
+			if usage.SoftFailure != "" {
+				s.markProxyFailure(candidate.ID, usage.SoftFailure)
+			}
 			return candOutcome{kind: candSuccess}
 		}
 		errMsg = reason + " retry failed: " + err.Error()
@@ -1021,7 +1048,7 @@ func (s *Service) attemptNonStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
+			s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
 			writeProxyResponse(w, status, header, respBody, candidate, fallback.ResponseMode)
 			return candOutcome{kind: candSuccess}
 		}
@@ -1039,7 +1066,7 @@ func (s *Service) attemptNonStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
+			s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
 			writeProxyResponse(w, status, header, respBody, candidate, normalized.ResponseMode)
 			return candOutcome{kind: candSuccess}
 		}
@@ -1124,7 +1151,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			usage, err := streamChatAsResponsesEvents(w, buffered, reader)
 			return false, usage, err
 		}
-		usage, err := streamRawSSE(w, buffered, reader)
+		usage, err := streamRawSSE(w, buffered, reader, request.ResponseMode)
 		return false, usage, err
 	}
 	respBody, readErr := readLimitedBody(resp.Body, 64<<20)
@@ -1288,7 +1315,7 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 	}
 	req := healthGenerationProbeRequest(model)
 	req = requestForCandidate(req, key)
-	status, _, body, err = s.requestCandidate(ctx, req, key, healthProbeTimeout)
+	status, _, body, err = s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
 	latencyMS := time.Since(start).Milliseconds()
 	if err != nil {
 		return status, body, latencyMS, err
@@ -1313,7 +1340,7 @@ func (s *Service) healthProbeClaude(ctx context.Context, key *storage.UpstreamGr
 		"messages": []map[string]any{
 			{"role": "user", "content": "hi"},
 		},
-		"stream": false,
+		"stream": true,
 	})
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
@@ -1323,9 +1350,9 @@ func (s *Service) healthProbeClaude(ctx context.Context, key *storage.UpstreamGr
 		Header:       header,
 		Body:         body,
 		ResponseMode: "raw",
-		Stream:       false,
+		Stream:       true,
 	}
-	status, _, respBody, err := s.requestCandidate(ctx, req, key, healthProbeTimeout)
+	status, _, respBody, err := s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
 	latencyMS := time.Since(start).Milliseconds()
 	if err != nil {
 		return status, respBody, latencyMS, err
@@ -1349,7 +1376,13 @@ func looksLikeClaudeSuccess(body []byte) bool {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return false
 	}
-	if t, _ := raw["type"].(string); t == "message" {
+	if t, _ := raw["type"].(string); t != "" {
+		switch t {
+		case "message", "message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_stop":
+			return true
+		}
+	}
+	if _, ok := raw["message"]; ok {
 		return true
 	}
 	if _, ok := raw["content"]; ok {
@@ -1388,12 +1421,11 @@ func shouldFallbackHealthModelDiscovery(status int) bool {
 
 func healthGenerationProbeRequest(model string) normalizedRequest {
 	// 测活探针：发一句 "hi"，并把 max tokens 限到 1，尽量少烧 token（测活是付费的）。
-	// 保持非流式——测活只关心上游能不能正常出词，非流式解析更简单、开销更小。
 	responsesBody, _ := json.Marshal(map[string]any{
 		"model":             model,
 		"input":             "hi",
 		"max_output_tokens": 1,
-		"stream":            false,
+		"stream":            true,
 	})
 	chatBody, _ := json.Marshal(map[string]any{
 		"model": model,
@@ -1401,7 +1433,7 @@ func healthGenerationProbeRequest(model string) normalizedRequest {
 			{"role": "user", "content": "hi"},
 		},
 		"max_tokens": 1,
-		"stream":     false,
+		"stream":     true,
 	})
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
@@ -1411,11 +1443,11 @@ func healthGenerationProbeRequest(model string) normalizedRequest {
 		Header:       header,
 		Body:         responsesBody,
 		ResponseMode: "responses",
-		Stream:       false,
+		Stream:       true,
 		AltPath:      "/v1/chat/completions",
 		AltBody:      chatBody,
 		AltMode:      "raw",
-		AltStream:    false,
+		AltStream:    true,
 	}
 }
 
@@ -1550,6 +1582,14 @@ func looksLikeHealthGenerationSuccess(body []byte) bool {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return false
 	}
+	if typ := strings.ToLower(stringValue(raw["type"])); typ != "" {
+		if strings.HasPrefix(typ, "response.") || strings.Contains(typ, ".delta") || strings.Contains(typ, "_delta") {
+			return true
+		}
+	}
+	if obj := strings.ToLower(stringValue(raw["object"])); obj == "chat.completion.chunk" {
+		return true
+	}
 	for _, key := range []string{"id", "choices", "output", "output_text", "content", "usage"} {
 		if _, ok := raw[key]; ok {
 			return true
@@ -1658,6 +1698,76 @@ func (s *Service) requestCandidate(ctx context.Context, request normalizedReques
 		return resp.StatusCode, header, nil, readErr
 	}
 	return resp.StatusCode, header, respBody, nil
+}
+
+func (s *Service) requestHealthProbeCandidate(ctx context.Context, request normalizedRequest, key *storage.UpstreamGroupKey, timeout time.Duration) (int, http.Header, []byte, error) {
+	if !request.Stream {
+		return s.requestCandidate(ctx, request, key, timeout)
+	}
+	ch, err := s.channels.FindByID(key.ChannelID)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	upstreamKey, err := s.cipher.Decrypt(key.KeyCipher)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	upstreamURL, err := joinUpstreamURL(ch.SiteURL, request.Path)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	reqCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		reqCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, request.Method, upstreamURL, bytes.NewReader(request.Body))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	copyRequestHeaders(req.Header, request.Header)
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
+	req.Header.Set("X-UpstreamOps-Group", key.GroupName)
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "codex-cli/0.1 upstream-ops")
+	}
+
+	client := s.httpClientFor(ctx, ch)
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	header := cloneHeader(resp.Header)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || !isEventStream(header) {
+		respBody, readErr := readLimitedBody(resp.Body, 64<<20)
+		if readErr != nil {
+			return resp.StatusCode, header, nil, readErr
+		}
+		return resp.StatusCode, header, respBody, nil
+	}
+	reader := newSSEStreamReader(resp.Body)
+	buffered, err := preflightSSEStream(reader, resp.Body)
+	body := healthProbeSSEBody(buffered)
+	if err != nil {
+		return resp.StatusCode, header, body, err
+	}
+	return resp.StatusCode, header, body, nil
+}
+
+func healthProbeSSEBody(events []sseEvent) []byte {
+	for _, ev := range events {
+		data := strings.TrimSpace(ev.Data)
+		if data != "" && data != "[DONE]" {
+			return []byte(data)
+		}
+	}
+	if len(events) == 0 {
+		return nil
+	}
+	return []byte(strings.TrimSpace(events[0].Data))
 }
 
 func (s *Service) httpClientFor(ctx context.Context, ch *storage.Channel) *http.Client {
@@ -2855,7 +2965,9 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	// streamErr 已经用"补 completed"平滑收尾，且我们从没往调用方写头之外的坏数据，
 	// 这里吞掉它（若上游一个字都没发过，textBuf 为空，客户端至少拿到一个空的 completed，
 	// 也比断流强）。
-	_ = streamErr
+	if streamErr != nil {
+		best.SoftFailure = "upstream chat stream ended before normal completion: " + streamErr.Error()
+	}
 	return best, nil
 }
 
@@ -3214,7 +3326,11 @@ func streamEventReady(ev sseEvent) bool {
 	if typ == "response.completed" || typ == "response.output_text.done" {
 		return true
 	}
-	if strings.Contains(typ, ".delta") {
+	if strings.Contains(typ, ".delta") || strings.Contains(typ, "_delta") {
+		return true
+	}
+	switch typ {
+	case "message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_stop":
 		return true
 	}
 	switch strings.TrimSpace(ev.Event) {
@@ -3249,13 +3365,17 @@ func sseEventType(ev sseEvent) string {
 	return strings.TrimSpace(ev.Event)
 }
 
-func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader) (usageTokens, error) {
+func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader, responseMode string) (usageTokens, error) {
 	var best usageTokens
+	needsResponsesCompleted := responseMode == "responses"
 	completedSeen := false
 	sawAnyData := false
 	model := ""
 	respID := ""
 	err := readSSEEvents(buffered, reader, func(event, data string) error {
+		if needsResponsesCompleted && strings.TrimSpace(data) == "[DONE]" && !completedSeen {
+			return nil
+		}
 		if usage := usageFromSSEData(data); usage.Total > 0 {
 			best = usage
 		}
@@ -3286,9 +3406,14 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 	// 触发我们主动 Close，都会让 readSSEEvents 返回 err；这些情况下客户端其实已经拿到了
 	// 大部分内容，补一个 completed 让它平滑收尾，远好过把断流错误透传出去。
 	// 这正是 ccswitch 走 chat 路径时靠 [DONE] 达到的效果。
-	if sawAnyData && !completedSeen {
+	if needsResponsesCompleted && sawAnyData && !completedSeen {
 		if writeErr := writeSyntheticResponseCompleted(w, respID, model, best); writeErr != nil {
 			return best, writeErr
+		}
+		if err != nil {
+			best.SoftFailure = "upstream stream ended before response.completed: " + err.Error()
+		} else {
+			best.SoftFailure = "upstream stream ended before response.completed"
 		}
 		// 已经给了客户端完整的终止事件，这个"上游中途断"的错误就不再上抛，
 		// 否则上层会误判为候选失败并可能重复请求。
@@ -3345,7 +3470,10 @@ func writeSyntheticResponseCompleted(w http.ResponseWriter, id, model string, us
 		}
 	}
 	payload, _ := json.Marshal(map[string]any{"type": "response.completed", "response": resp})
-	return writeSSEEvent(w, sseEvent{Event: "response.completed", Data: string(payload)})
+	if err := writeSSEEvent(w, sseEvent{Event: "response.completed", Data: string(payload)}); err != nil {
+		return err
+	}
+	return writeSSEData(w, "[DONE]")
 }
 
 func writeSSEEvent(w http.ResponseWriter, ev sseEvent) error {

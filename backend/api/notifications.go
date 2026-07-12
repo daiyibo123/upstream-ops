@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/bejix/upstream-ops/backend/notify"
@@ -222,9 +223,10 @@ func testNotify(c *gin.Context, d *Deps) {
 		fail(c, http.StatusNotFound, err)
 		return
 	}
+	appTitle := publicDashboardTitle(d)
 	msg := notify.Message{
 		Subject: "测试通知",
-		Body:    "这是一条来自 UpstreamOps 的测试消息。",
+		Body:    fmt.Sprintf("这是一条来自 %s 的测试消息。", appTitle),
 	}
 	if err := d.Dispatcher.Send(c.Request.Context(), ch, msg); err != nil {
 		c.JSON(http.StatusOK, gin.H{"ok": false, "error": err.Error()})

@@ -135,7 +135,7 @@ export function useDashboardSummary() {
 }
 
 export function useAppVersion() {
-  return useApi<AppVersion>("/version", false)
+  return useApi<AppVersion>("/version")
 }
 
 export function useBalanceTrend(days = 7) {

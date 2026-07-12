@@ -147,3 +147,22 @@
     @apply bg-background text-foreground;
   }
 }
+
+@keyframes public-dispatch-scroll {
+  from { transform: translateY(0); }
+  to { transform: translateY(calc(-50% - 0.25rem)); }
+}
+
+.public-dispatch-scroll {
+  animation: public-dispatch-scroll 30s linear infinite;
+}
+
+.public-dispatch-scroll:hover {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .public-dispatch-scroll {
+    animation: none;
+  }
+}

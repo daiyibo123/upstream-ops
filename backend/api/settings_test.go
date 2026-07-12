@@ -33,7 +33,7 @@ func TestSaveSettingsKeepsAppVersion(t *testing.T) {
 	})
 
 	body := `{
-		"app":{"title":"New","notificationPrefix":"[New] "},
+		"app":{"title":"New","notificationPrefix":"[New] ","publicKey":{"enabled":true,"name":"公益 Key","key":"sk-public","password":"secret","passwordHint":"hint","expiresAt":"2099-01-01"}},
 		"auth":{"enabled":false,"username":"admin","password":"","tokenSecret":"","sessionTTLHours":168},
 		"scheduler":{"balanceCron":"37 */15 * * * *","rateCron":"13 */30 * * * *","concurrency":4,"retention":{"cron":"0 17 3 * * *","monitorLogsDays":30,"balanceSnapshotsDays":90,"notificationLogsDays":90,"announcementsDays":90}},
 		"notifications":{"batchRateChanges":true,"minChangePct":0,"balanceLowCooldownMinutes":60,"subscriptionDailyRemainingThresholdPct":0,"subscriptionWeeklyRemainingThresholdPct":0,"subscriptionMonthlyRemainingThresholdPct":0,"subscriptionExpiryThresholdHours":0,"subscriptionAlertCooldownMinutes":1440,"sendMaxAttempts":3},
@@ -57,6 +57,9 @@ func TestSaveSettingsKeepsAppVersion(t *testing.T) {
 	}
 	if got.App.NotificationPrefix != "[New] " {
 		t.Fatalf("notification prefix = %q", got.App.NotificationPrefix)
+	}
+	if !got.App.PublicKey.Enabled || got.App.PublicKey.Name != "公益 Key" || got.App.PublicKey.Key != "sk-public" || got.App.PublicKey.Password != "secret" || got.App.PublicKey.PasswordHint != "hint" || got.App.PublicKey.ExpiresAt != "2099-01-01" {
+		t.Fatalf("public key = %#v", got.App.PublicKey)
 	}
 	if !got.Proxy.Enabled || !got.Proxy.VersionCheckEnabled || got.Proxy.Protocol != "socks5" || got.Proxy.Host != "127.0.0.1" || got.Proxy.Port != 1080 || got.Proxy.Username != "u" || got.Proxy.Password != "p" {
 		t.Fatalf("proxy = %#v", got.Proxy)

@@ -37,11 +37,14 @@ import { apiFetch } from "@/lib/api"
 import { channelTypeLabel, formatRatio, relativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type {
+  Channel,
+  ChannelPage,
   GatewayBootstrapResult,
   GatewayHealthResult,
   GatewayKey,
   GatewayKeyReveal,
   UpstreamGroupKey,
+  UpstreamGroupKeyPage,
 } from "@/lib/api-types"
 
 const TOKEN_M = 1_000_000
@@ -75,6 +78,8 @@ function createDefaultDraft(): KeyDraft {
 }
 
 interface ManualDraft {
+  sourceMode: "new" | "existing"
+  channelId: string
   channelName: string
   siteUrl: string
   groupName: string
@@ -89,6 +94,8 @@ interface ManualDraft {
 
 function createDefaultManualDraft(): ManualDraft {
   return {
+    sourceMode: "new",
+    channelId: "",
     channelName: "",
     siteUrl: "",
     groupName: "",
@@ -186,6 +193,7 @@ function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
   return groups.slice().sort((a, b) => {
     return (
       groupStatusRank(effectiveStatus(a)) - groupStatusRank(effectiveStatus(b)) ||
+      Number(Boolean(b.charity)) - Number(Boolean(a.charity)) ||
       (b.priority || 0) - (a.priority || 0) ||
       a.ratio - b.ratio ||
       a.failure_count - b.failure_count ||
@@ -489,6 +497,12 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const showGroups = section === "all" || section === "groups"
   const [keys, setKeys] = useState<GatewayKey[]>([])
   const [groups, setGroups] = useState<UpstreamGroupKey[]>([])
+  const [groupTotal, setGroupTotal] = useState(0)
+  const [groupPages, setGroupPages] = useState(1)
+  const [groupAliveTotal, setGroupAliveTotal] = useState(0)
+  const [groupDeadTotal, setGroupDeadTotal] = useState(0)
+  const [groupEnabledTotal, setGroupEnabledTotal] = useState(0)
+  const [channels, setChannels] = useState<Channel[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
   const [createDraft, setCreateDraft] = useState<KeyDraft>(() => createDefaultDraft())
@@ -509,14 +523,19 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const deadCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "dead").length, [groups])
   const enabledGroupCount = useMemo(() => groups.filter((group) => group.enabled !== false).length, [groups])
 
-  const totalPages = Math.max(1, Math.ceil(groups.length / pageSize))
+  const serverGroupPaging = showGroups && !showKeys
+  const totalGroups = serverGroupPaging ? groupTotal : groups.length
+  const displayAliveCount = serverGroupPaging ? groupAliveTotal : aliveCount
+  const displayDeadCount = serverGroupPaging ? groupDeadTotal : deadCount
+  const displayEnabledCount = serverGroupPaging ? groupEnabledTotal : enabledGroupCount
+  const totalPages = serverGroupPaging ? Math.max(1, groupPages) : Math.max(1, Math.ceil(groups.length / pageSize))
   const currentPage = Math.min(page, totalPages)
   const pagedGroups = useMemo(
-    () => groups.slice((currentPage - 1) * pageSize, currentPage * pageSize),
-    [groups, currentPage, pageSize],
+    () => (serverGroupPaging ? groups : groups.slice((currentPage - 1) * pageSize, currentPage * pageSize)),
+    [groups, currentPage, pageSize, serverGroupPaging],
   )
-  const rangeStart = groups.length === 0 ? 0 : (currentPage - 1) * pageSize + 1
-  const rangeEnd = Math.min(currentPage * pageSize, groups.length)
+  const rangeStart = totalGroups === 0 ? 0 : (currentPage - 1) * pageSize + 1
+  const rangeEnd = Math.min(currentPage * pageSize, totalGroups)
 
   useEffect(() => {
     if (page > totalPages) setPage(totalPages)
@@ -525,12 +544,31 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   async function load() {
     setLoading(true)
     try {
-      const [keyList, groupList] = await Promise.all([
+      const groupRequest = serverGroupPaging
+        ? apiFetch<UpstreamGroupKeyPage>(`/gateway/group-keys?page=${currentPage}&page_size=${pageSize}`)
+        : apiFetch<UpstreamGroupKey[]>("/gateway/group-keys")
+      const [keyList, groupResult, channelPage] = await Promise.all([
         apiFetch<GatewayKey[]>("/gateway/keys"),
-        apiFetch<UpstreamGroupKey[]>("/gateway/group-keys"),
+        groupRequest,
+        apiFetch<ChannelPage>("/channels?page=1&page_size=-1"),
       ])
       setKeys(Array.isArray(keyList) ? keyList : [])
-      const nextGroups = sortGroupsForDisplay(Array.isArray(groupList) ? groupList : [])
+      setChannels(Array.isArray(channelPage?.items) ? channelPage.items : [])
+      const rawGroups = Array.isArray(groupResult) ? groupResult : groupResult.items ?? []
+      const nextGroups = sortGroupsForDisplay(rawGroups)
+      if (Array.isArray(groupResult)) {
+        setGroupTotal(nextGroups.length)
+        setGroupPages(Math.max(1, Math.ceil(nextGroups.length / pageSize)))
+        setGroupAliveTotal(nextGroups.filter((group) => effectiveStatus(group) === "alive").length)
+        setGroupDeadTotal(nextGroups.filter((group) => effectiveStatus(group) === "dead").length)
+        setGroupEnabledTotal(nextGroups.filter((group) => group.enabled !== false).length)
+      } else {
+        setGroupTotal(groupResult.total ?? nextGroups.length)
+        setGroupPages(groupResult.pages ?? 1)
+        setGroupAliveTotal(groupResult.alive ?? 0)
+        setGroupDeadTotal(groupResult.dead ?? 0)
+        setGroupEnabledTotal(groupResult.enabled ?? 0)
+      }
       setGroups(nextGroups)
       setConcurrencyDrafts(
         Object.fromEntries(nextGroups.map((group) => [group.id, String(group.concurrency_limit || 0)])),
@@ -548,7 +586,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
 
   useEffect(() => {
     void load()
-  }, [])
+  }, [currentPage, pageSize, serverGroupPaging])
 
   function validateDraft(draft: KeyDraft) {
     if (draft.scope === "selected" && draft.selectedGroupIds.length === 0) {
@@ -690,6 +728,21 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
+  async function testGroup(group: UpstreamGroupKey) {
+    setBusy(`test-${group.id}`)
+    try {
+      const result = await apiFetch<GatewayHealthResult["items"][number]>(`/gateway/group-keys/${group.id}/test`, { method: "POST" })
+      setHealthResults((prev) => ({ ...prev, [group.id]: result }))
+      toast.success(`${group.channel_name || "上游"} / ${group.group_name}：${result.status === "alive" ? "存活" : result.status === "disabled" ? "已禁用" : "不可用"}`)
+      await load()
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "分组测活失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
   async function updateGroup(
     group: UpstreamGroupKey,
     patch: { concurrency_limit?: number; enabled?: boolean; request_mode?: UpstreamRequestMode; priority?: number; client_format?: string; charity?: boolean },
@@ -806,13 +859,25 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       toast.error("请填写 Key")
       return
     }
+    if (manualDraft.sourceMode === "existing" && !manualDraft.channelId) {
+      toast.error("请选择已有渠道")
+      return
+    }
+    if (manualDraft.sourceMode === "new" && !manualDraft.siteUrl.trim()) {
+      toast.error("请填写上游地址")
+      return
+    }
     setBusy("manual-add")
     try {
       await apiFetch<UpstreamGroupKey>("/gateway/group-keys/manual", {
         method: "POST",
         body: JSON.stringify({
-          channel_name: manualDraft.channelName.trim() || undefined,
-          site_url: manualDraft.siteUrl.trim() || undefined,
+          ...(manualDraft.sourceMode === "existing"
+            ? { channel_id: Number(manualDraft.channelId) }
+            : {
+                channel_name: manualDraft.channelName.trim() || undefined,
+                site_url: manualDraft.siteUrl.trim() || undefined,
+              }),
           group_name: manualDraft.groupName.trim(),
           group_description: manualDraft.groupDescription.trim() || undefined,
           key: manualDraft.key.trim(),
@@ -849,13 +914,13 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
         {showGroups ? (
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline" className="border-success/20 bg-success/10 text-success">
-              存活 {aliveCount}
+              存活 {displayAliveCount}
             </Badge>
             <Badge variant="outline" className="border-danger/20 bg-danger/10 text-danger">
-              死亡 {deadCount}
+              死亡 {displayDeadCount}
             </Badge>
             <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
-              启用 {enabledGroupCount}/{groups.length}
+              启用 {displayEnabledCount}/{totalGroups}
             </Badge>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={() => setManualOpen(true)}>
               <Plus className="size-3.5" />
@@ -1184,7 +1249,20 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                       </TableCell>
                       <TableCell className="text-xs text-muted-foreground">
                         <div>{latestHealth?.checked_at ? relativeTime(latestHealth.checked_at) : group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}</div>
-                        <div className="text-[11px]">{latencyMS > 0 ? `${latencyMS}ms` : "延迟 —"}</div>
+                        <div className="mt-1 flex items-center gap-1.5 text-[11px]">
+                          <span>{latencyMS > 0 ? `${latencyMS}ms` : "延迟 —"}</span>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 px-1.5 text-[11px]"
+                            disabled={!!busy || group.enabled === false}
+                            title="仅测活此上游分组"
+                            onClick={() => void testGroup(group)}
+                          >
+                            {busy === `test-${group.id}` ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+                            测活
+                          </Button>
+                        </div>
                       </TableCell>
                       <TableCell className="max-w-72 text-xs text-danger">
                         <div className="flex items-center gap-2">
@@ -1222,10 +1300,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
         </div>
         ) : null}
 
-        {showGroups && groups.length > 0 ? (
+        {showGroups && totalGroups > 0 ? (
           <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/10 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
             <div className="text-xs text-muted-foreground">
-              显示 {rangeStart}-{rangeEnd} / {groups.length} 个分组
+              显示 {rangeStart}-{rangeEnd} / {totalGroups} 个分组
             </div>
             <div className="flex items-center gap-1.5">
               <div className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -1291,23 +1369,66 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </DialogHeader>
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="space-y-1.5">
-              <Label htmlFor="manual-channel-name">渠道名</Label>
-              <Input
-                id="manual-channel-name"
-                value={manualDraft.channelName}
-                onChange={(event) => setManualDraft((prev) => ({ ...prev, channelName: event.target.value }))}
-                placeholder="例如：某公益中转"
-              />
+              <Label>接入方式</Label>
+              <Select
+                value={manualDraft.sourceMode}
+                onValueChange={(value) =>
+                  setManualDraft((prev) => ({
+                    ...prev,
+                    sourceMode: value === "existing" ? "existing" : "new",
+                  }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="new">新建渠道</SelectItem>
+                  <SelectItem value="existing">选择已有渠道</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="manual-site-url">上游地址</Label>
-              <Input
-                id="manual-site-url"
-                value={manualDraft.siteUrl}
-                onChange={(event) => setManualDraft((prev) => ({ ...prev, siteUrl: event.target.value }))}
-                placeholder="https://..."
-              />
-            </div>
+            {manualDraft.sourceMode === "existing" ? (
+              <div className="space-y-1.5">
+                <Label>已有渠道</Label>
+                <Select
+                  value={manualDraft.channelId}
+                  onValueChange={(value) => setManualDraft((prev) => ({ ...prev, channelId: value }))}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder="选择渠道" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {channels.map((channel) => (
+                      <SelectItem key={channel.id} value={String(channel.id)}>
+                        {channel.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : (
+              <>
+                <div className="space-y-1.5">
+                  <Label htmlFor="manual-channel-name">渠道名</Label>
+                  <Input
+                    id="manual-channel-name"
+                    value={manualDraft.channelName}
+                    onChange={(event) => setManualDraft((prev) => ({ ...prev, channelName: event.target.value }))}
+                    placeholder="例如：某公益中转"
+                  />
+                </div>
+                <div className="space-y-1.5 sm:col-span-2">
+                  <Label htmlFor="manual-site-url">上游地址 *</Label>
+                  <Input
+                    id="manual-site-url"
+                    value={manualDraft.siteUrl}
+                    onChange={(event) => setManualDraft((prev) => ({ ...prev, siteUrl: event.target.value }))}
+                    placeholder="https://..."
+                  />
+                </div>
+              </>
+            )}
             <div className="space-y-1.5">
               <Label htmlFor="manual-group-name">分组名 *</Label>
               <Input

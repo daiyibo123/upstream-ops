@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -55,22 +57,16 @@ func registerVersion(api *gin.RouterGroup, d *Deps) {
 		c.JSON(http.StatusOK, buildVersionResponse(c.Request.Context(), d, force))
 	})
 
-	// /api/system/* 系列：Docker 场景下的自更新只能"重启由 restart 策略拉起"这一条路
-	// （容器内部没法优雅 docker pull 自身镜像并热替换）。因此这里只提供两个动作：
-	//   - restart：进程主动 os.Exit(0)，靠 compose 里的 restart: unless-stopped 立即拉起
-	//   - upgrade-command：把服务器上应执行的 docker 命令回给前端，用户复制到 SSH 执行
-	// upgrade-command 是纯"信息型"接口，本身不做危险动作；restart 才是真操作。
 	system := api.Group("/system")
 	system.POST("/restart", func(c *gin.Context) { handleSystemRestart(c) })
+	system.POST("/update", func(c *gin.Context) { handleSystemUpdate(c) })
 	system.GET("/upgrade-command", func(c *gin.Context) { handleUpgradeCommand(c) })
 }
 
 // handleSystemRestart 让当前进程主动退出，交给外部 restart 策略拉起。
 //
-// 为什么不做 docker pull：容器内没有 docker CLI、也不该给它挂 docker.sock（这
-// 等于给一个 Web 服务任意 host 权限）。sub2api 上游同样绕开了这个选项。
-// 正确的流程是：用户在服务器 SSH 里跑 `docker compose pull && docker compose up -d`，
-// 我们只帮他做"新版镜像已经 pull 好之后，让运行中的容器立刻用新版起来"这一步。
+// 更新镜像由 /system/update 触发内网 updater 侧车处理；这里保留一个轻量的
+// "仅重启"动作，用于配置变更或手动 SSH 更新后让容器快速拉起。
 func handleSystemRestart(c *gin.Context) {
 	// 先返回 202，让前端立刻能收到成功；真正的 exit 放到 goroutine 里延迟 500ms 执行，
 	// 保证 HTTP 响应能完整写回客户端（否则连接会被中途切断）。
@@ -88,13 +84,97 @@ func handleSystemRestart(c *gin.Context) {
 // 前端会展示出来 + 提供一键复制。
 func handleUpgradeCommand(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"command":       "docker compose pull && docker compose up -d",
-		"auto_update":   "docker compose --profile autoupdate up -d",
+		"command":       "docker compose pull && docker compose up -d app",
+		"auto_update":   "WATCHTOWER_HTTP_API_PERIODIC_POLLS=true docker compose up -d watchtower",
 		"rollback":      "IMAGE_TAG=<上一个可用版本> docker compose up -d app",
-		"description":   "只更新应用镜像，不覆盖 ./data 里的 config.yaml 和数据库。执行完后可点『立即重启』让容器切到新版本。若想自动更新，改用 auto_update 命令带起 watchtower 侧车（旧镜像仍保留，可用 rollback 一行回退）。",
+		"description":   "只更新应用镜像并重建 app 容器，不覆盖 ./data 里的 config.yaml 和数据库。面板里的『立即更新并重启』会触发内网 watchtower 侧车执行同等更新。",
 		"restart_after": true,
 		"repo_url":      githubRepoURL,
 	})
+}
+
+func handleSystemUpdate(c *gin.Context) {
+	runner, err := resolveSystemUpdateRunner()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"status":  "unsupported",
+			"message": err.Error(),
+			"command": "docker compose pull && docker compose up -d app",
+		})
+		return
+	}
+
+	c.JSON(http.StatusAccepted, gin.H{
+		"status":  "updating",
+		"message": "已开始拉取更新并重建应用容器，完成后服务会短暂重启。数据目录 ./data 不会被覆盖。",
+		"source":  runner.Source,
+	})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if err := runSystemUpdate(ctx, runner); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "system update failed: %v\n", err)
+		}
+	}()
+}
+
+type systemUpdateRunner struct {
+	Source string
+	Target string
+}
+
+func resolveSystemUpdateRunner() (systemUpdateRunner, error) {
+	if cmd := strings.TrimSpace(os.Getenv("SYSTEM_UPDATE_COMMAND")); cmd != "" {
+		return systemUpdateRunner{Source: "command", Target: cmd}, nil
+	}
+	endpoint := strings.TrimSpace(os.Getenv("SYSTEM_UPDATE_URL"))
+	if endpoint == "" {
+		return systemUpdateRunner{}, errors.New("当前环境未配置 SYSTEM_UPDATE_URL；请使用 docker-compose.yml 中的 watchtower 侧车，或设置 SYSTEM_UPDATE_COMMAND")
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return systemUpdateRunner{}, fmt.Errorf("SYSTEM_UPDATE_URL 无效: %w", err)
+	}
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return systemUpdateRunner{}, errors.New("SYSTEM_UPDATE_URL 必须是完整的 http(s) 地址")
+	}
+	return systemUpdateRunner{Source: "watchtower", Target: endpoint}, nil
+}
+
+func runSystemUpdate(ctx context.Context, runner systemUpdateRunner) error {
+	switch runner.Source {
+	case "command":
+		return runShellCommand(ctx, runner.Target)
+	default:
+		return triggerUpdateEndpoint(ctx, runner.Target, os.Getenv("SYSTEM_UPDATE_TOKEN"))
+	}
+}
+
+func triggerUpdateEndpoint(ctx context.Context, endpoint, token string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	if token = strings.TrimSpace(token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	return fmt.Errorf("updater status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+}
+
+func runShellCommand(ctx context.Context, command string) error {
+	cmd := exec.CommandContext(ctx, "sh", "-lc", command)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func buildVersionResponse(ctx context.Context, d *Deps, force bool) versionResponse {
@@ -126,7 +206,7 @@ func buildVersionResponse(ctx context.Context, d *Deps, force bool) versionRespo
 }
 
 func versionCheckClient(proxyCfg config.ProxyConfig, force bool) *http.Client {
-	if !proxyCfg.VersionCheckEnabled && !force {
+	if !proxyCfg.VersionCheckEnabled {
 		return githubReleaseClient
 	}
 	proxyURL, err := proxyCfg.ActiveURL()

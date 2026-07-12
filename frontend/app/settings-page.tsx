@@ -42,6 +42,7 @@ import type {
   NotificationChannelType,
   SystemConfig,
   SystemRestartResponse,
+  SystemUpdateResponse,
   UpgradeCommand,
 } from "@/lib/api-types";
 import { relativeTime } from "@/lib/format";
@@ -103,6 +104,7 @@ export default function SettingsPage() {
   const [configSavedPendingApply, setConfigSavedPendingApply] = useState(false);
   const [testingProxy, setTestingProxy] = useState(false);
   const [checkingVersion, setCheckingVersion] = useState(false);
+  const [updatingSystem, setUpdatingSystem] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [copyingUpgrade, setCopyingUpgrade] = useState(false);
   const [editingNotification, setEditingNotification] =
@@ -199,6 +201,7 @@ export default function SettingsPage() {
       toast.success("已写入配置文件");
       setConfigSavedPendingApply(true);
       query.refetch();
+      appVersion.refetch();
       refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "保存失败");
@@ -265,8 +268,29 @@ export default function SettingsPage() {
     }
   }
 
-  // 复制"服务器上如何拉新版镜像"的命令。后端返回 auto_update / rollback 一并说明，
-  // 用户复制到 SSH 执行即可；拉好之后再点"立即重启"切到新版本。
+  async function handleSystemUpdate() {
+    const ok = await confirm({
+      title: "立即更新并重启？",
+      description:
+        "系统会触发内网更新侧车拉取最新镜像并重建 app 容器，./data 里的配置和数据库不会被覆盖。完成时服务会短暂中断。",
+      confirmLabel: "立即更新",
+      destructive: true,
+    });
+    if (!ok) return;
+    setUpdatingSystem(true);
+    try {
+      const result = await apiFetch<SystemUpdateResponse>("/system/update", {
+        method: "POST",
+      });
+      toast.success(result.message || "已开始更新，服务稍后会自动重启");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "触发系统更新失败");
+    } finally {
+      setUpdatingSystem(false);
+    }
+  }
+
+  // 复制服务器上的备用升级命令，方便 updater 侧车不可用时 SSH 执行。
   async function handleCopyUpgrade() {
     setCopyingUpgrade(true);
     try {
@@ -290,14 +314,13 @@ export default function SettingsPage() {
     }
   }
 
-  // 立即重启：进程主动退出，靠 docker compose 的 restart 策略拉起。
-  // 镜像已 pull 到新版时，这一步让运行中的容器切到新版本；否则就是原版重启。
+  // 仅重启：进程主动退出，靠 docker compose 的 restart 策略拉起。
   async function handleRestart() {
     const ok = await confirm({
-      title: "立即重启服务？",
+      title: "仅重启服务？",
       description:
-        "服务会主动退出并由容器 restart 策略自动拉起，约 5 秒内恢复。若已拉取新版镜像，重启后即切到新版本。期间正在进行的请求会中断。",
-      confirmLabel: "立即重启",
+        "服务会主动退出并由容器 restart 策略自动拉起，约 5 秒内恢复。这个动作不会拉取新镜像。期间正在进行的请求会中断。",
+      confirmLabel: "仅重启",
       destructive: true,
     });
     if (!ok) return;
@@ -409,6 +432,21 @@ export default function SettingsPage() {
                   <Button
                     size="sm"
                     variant="outline"
+                    className="h-7 border-cyan-200 bg-cyan-50 px-2 text-xs text-cyan-700 hover:bg-cyan-100 hover:text-cyan-800"
+                    onClick={handleSystemUpdate}
+                    disabled={updatingSystem}
+                  >
+                    <RefreshCw
+                      className={cn(
+                        "size-3.5",
+                        updatingSystem ? "animate-spin" : "",
+                      )}
+                    />
+                    {updatingSystem ? "更新中..." : "立即更新并重启"}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
                     className="h-7 border-border bg-background px-2 text-xs"
                     onClick={handleCopyUpgrade}
                     disabled={copyingUpgrade}
@@ -426,7 +464,7 @@ export default function SettingsPage() {
                     <Power
                       className={cn("size-3.5", restarting ? "animate-pulse" : "")}
                     />
-                    {restarting ? "重启中..." : "立即重启"}
+                    {restarting ? "重启中..." : "仅重启"}
                   </Button>
                 </div>
                 <div className="grid gap-4 md:grid-cols-2">

@@ -130,6 +130,29 @@ func NewUpstreamGroupKeys(db *gorm.DB) *UpstreamGroupKeys {
 	return &UpstreamGroupKeys{db: db}
 }
 
+type UpstreamGroupKeyCounts struct {
+	Total   int64
+	Alive   int64
+	Dead    int64
+	Enabled int64
+}
+
+func orderUpstreamGroupKeys(q *gorm.DB, table string) *gorm.DB {
+	col := func(name string) string {
+		if table == "" {
+			return name
+		}
+		return table + "." + name
+	}
+	return q.
+		Order("CASE " + col("status") + " WHEN 'alive' THEN 0 WHEN 'unknown' THEN 1 WHEN 'dead' THEN 2 ELSE 3 END ASC").
+		Order(col("charity") + " DESC").
+		Order(col("priority") + " DESC").
+		Order(col("ratio") + " ASC").
+		Order(col("failure_count") + " ASC").
+		Order(col("id") + " ASC")
+}
+
 func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 	var existing UpstreamGroupKey
 	err := r.db.Where("channel_id = ? AND group_ref = ?", key.ChannelID, key.GroupRef).First(&existing).Error
@@ -179,10 +202,47 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 
 func (r *UpstreamGroupKeys) List() ([]UpstreamGroupKey, error) {
 	var list []UpstreamGroupKey
-	if err := r.db.Order("priority DESC").Order("ratio ASC").Order("channel_id ASC").Order("group_name ASC").Find(&list).Error; err != nil {
+	if err := orderUpstreamGroupKeys(r.db, "").Find(&list).Error; err != nil {
 		return nil, err
 	}
 	return list, nil
+}
+
+func (r *UpstreamGroupKeys) ListPage(limit, offset int) ([]UpstreamGroupKey, int64, error) {
+	var total int64
+	if err := r.db.Model(&UpstreamGroupKey{}).Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	var list []UpstreamGroupKey
+	err := orderUpstreamGroupKeys(r.db, "").Limit(limit).Offset(offset).Find(&list).Error
+	if err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
+}
+
+func (r *UpstreamGroupKeys) Counts() (UpstreamGroupKeyCounts, error) {
+	var out UpstreamGroupKeyCounts
+	count := func(dest *int64, where ...any) error {
+		q := r.db.Model(&UpstreamGroupKey{})
+		if len(where) > 0 {
+			q = q.Where(where[0], where[1:]...)
+		}
+		return q.Count(dest).Error
+	}
+	if err := count(&out.Total); err != nil {
+		return out, err
+	}
+	if err := count(&out.Alive, "enabled = ? AND status = ?", true, "alive"); err != nil {
+		return out, err
+	}
+	if err := count(&out.Dead, "enabled = ? AND status = ?", true, "dead"); err != nil {
+		return out, err
+	}
+	if err := count(&out.Enabled, "enabled = ?", true); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
 // ListByChannel 返回某个渠道下的全部分组密钥，用于同步时对比"上游还剩哪些分组"。
@@ -202,12 +262,8 @@ func (r *UpstreamGroupKeys) ListCandidates(now time.Time) ([]UpstreamGroupKey, e
 		Where("upstream_group_keys.enabled = ?", true).
 		Where("channels.monitor_enabled = ?", true).
 		Where("(disabled_until IS NULL OR disabled_until <= ?)", now).
-		Where("upstream_group_keys.status <> ?", "disabled").
-		Order("upstream_group_keys.priority DESC").
-		Order("upstream_group_keys.ratio ASC").
-		Order("upstream_group_keys.failure_count ASC").
-		Order("upstream_group_keys.channel_id ASC").
-		Order("upstream_group_keys.group_name ASC")
+		Where("upstream_group_keys.status <> ?", "disabled")
+	q = orderUpstreamGroupKeys(q, "upstream_group_keys")
 	if err := q.Find(&list).Error; err != nil {
 		return nil, err
 	}

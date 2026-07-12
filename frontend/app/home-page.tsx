@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react"
 import { Link } from "react-router-dom"
-import { Activity, ArrowRight, Copy, KeyRound, RadioTower, Route, ShieldCheck, Sparkles, Zap } from "lucide-react"
+import { Activity, ArrowRight, Copy, Eye, EyeOff, RadioTower, Route, ShieldCheck, Sparkles, Zap } from "lucide-react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -65,6 +65,12 @@ function formatTokens(value: number | null | undefined) {
   return String(n)
 }
 
+function maskPublicKey(value: string) {
+  if (!value) return ""
+  if (value.length <= 12) return "********"
+  return `${value.slice(0, 6)}******${value.slice(-4)}`
+}
+
 function Metric({ label, value, icon: Icon }: { label: string; value: string; icon: typeof Activity }) {
   return (
     <div className="rounded-md border border-white/10 bg-white/[0.06] p-4 backdrop-blur">
@@ -83,6 +89,9 @@ export default function HomePage() {
   const [publicKeyOpen, setPublicKeyOpen] = useState(false)
   const [publicKeyPassword, setPublicKeyPassword] = useState("")
   const [copyingPublicKey, setCopyingPublicKey] = useState(false)
+  const [revealedPublicKey, setRevealedPublicKey] = useState("")
+  const [publicKeyVisible, setPublicKeyVisible] = useState(false)
+  const [publicKeyIntent, setPublicKeyIntent] = useState<"view" | "copy">("view")
   const appVersion = useAppVersion()
   const appTitle = appVersion.data?.title?.trim() || "UpstreamOps"
 
@@ -98,42 +107,76 @@ export default function HomePage() {
 
   const preview = useMemo(
     () => {
-      const statusRank = (status: string) => (status === "alive" ? 0 : status === "unknown" ? 1 : 2)
       return (summary?.dispatch_preview ?? [])
         .slice()
-        .sort((a, b) => statusRank(a.status) - statusRank(b.status) || (b.priority || 0) - (a.priority || 0) || a.ratio - b.ratio)
-        .slice(0, 5)
+        .sort((a, b) => a.ratio - b.ratio || a.id - b.id)
+        .slice(0, 10)
     },
     [summary],
   )
   const publicKey = summary?.public_key
 
-  async function revealPublicKey(password = "") {
+  async function fetchPublicKey(password = "") {
+    const res = await apiFetch<PublicKeyReveal>("/public/key/reveal", {
+      method: "POST",
+      body: JSON.stringify({ password }),
+      skipAuthErrorHandler: true,
+    })
+    setRevealedPublicKey(res.key)
+    setPublicKeyVisible(true)
+    setPublicKeyOpen(false)
+    setPublicKeyPassword("")
+    return res.key
+  }
+
+  async function revealPublicKey(password = "", copyAfterReveal = false) {
     setCopyingPublicKey(true)
     try {
-      const res = await apiFetch<PublicKeyReveal>("/public/key/reveal", {
-        method: "POST",
-        body: JSON.stringify({ password }),
-        skipAuthErrorHandler: true,
-      })
-      await navigator.clipboard.writeText(res.key)
+      const key = await fetchPublicKey(password)
+      if (copyAfterReveal) {
+        await navigator.clipboard.writeText(key)
+        toast.success("公益 Key 已复制")
+      } else {
+        toast.success("公益 Key 已显示")
+      }
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || (copyAfterReveal ? "复制公益 Key 失败" : "查看公益 Key 失败"))
+    } finally {
+      setCopyingPublicKey(false)
+    }
+  }
+
+  function handlePublicKeyRevealClick() {
+    if (revealedPublicKey) {
+      setPublicKeyVisible(true)
+      return
+    }
+    if (publicKey?.password_required) {
+      setPublicKeyIntent("view")
+      setPublicKeyOpen(true)
+      return
+    }
+    void revealPublicKey("")
+  }
+
+  async function handlePublicKeyCopy() {
+    if (!revealedPublicKey && publicKey?.password_required) {
+      setPublicKeyIntent("copy")
+      setPublicKeyOpen(true)
+      return
+    }
+    setCopyingPublicKey(true)
+    try {
+      const key = revealedPublicKey || (await fetchPublicKey(""))
+      await navigator.clipboard.writeText(key)
       toast.success("公益 Key 已复制")
-      setPublicKeyOpen(false)
-      setPublicKeyPassword("")
     } catch (e) {
       const err = e as Error
       toast.error(err.message || "复制公益 Key 失败")
     } finally {
       setCopyingPublicKey(false)
     }
-  }
-
-  function handlePublicKeyClick() {
-    if (publicKey?.password_required) {
-      setPublicKeyOpen(true)
-      return
-    }
-    void revealPublicKey("")
   }
 
   return (
@@ -172,6 +215,61 @@ export default function HomePage() {
             <p className="mt-5 max-w-2xl text-base leading-7 text-slate-300 sm:text-lg">
               按存活状态、人工优先级和低倍率调度，上游恢复后自动回到更合适的线路。公开页只展示概览，不暴露敏感配置。
             </p>
+            {summary?.public_key_enabled && publicKey?.status === "available" ? (
+              <div className="mt-6 max-w-2xl rounded-md border border-cyan-300/20 bg-cyan-300/10 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-cyan-50">{publicKey.name || "公益 Key"}</p>
+                    <p className="mt-1 text-xs text-cyan-100/75">
+                      今日 {formatTokens(publicKey.today_tokens)} · 累计 {formatTokens(publicKey.total_tokens)}
+                      {publicKey.expires_at ? ` · 有效期至 ${publicKey.expires_at}` : ""}
+                    </p>
+                  </div>
+                  <Badge className="bg-cyan-200 text-slate-950 hover:bg-cyan-200">
+                    {publicKey.password_required ? "需密码" : "可直接查看"}
+                  </Badge>
+                </div>
+                <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                  <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-cyan-200/20 bg-slate-950/40 px-3 py-2">
+                    <span className="min-w-0 flex-1 truncate font-mono text-sm text-cyan-50">
+                      {revealedPublicKey
+                        ? publicKeyVisible
+                          ? revealedPublicKey
+                          : maskPublicKey(revealedPublicKey)
+                        : "验证后显示"}
+                    </span>
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="size-8 shrink-0 text-cyan-100 hover:bg-cyan-300/10 hover:text-white"
+                      disabled={!revealedPublicKey}
+                      onClick={() => setPublicKeyVisible((value) => !value)}
+                      title={publicKeyVisible ? "隐藏公益 Key" : "查看公益 Key"}
+                    >
+                      {publicKeyVisible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                    </Button>
+                  </div>
+                  <Button
+                    className="bg-cyan-300 text-slate-950 hover:bg-cyan-200 sm:w-24"
+                    disabled={copyingPublicKey}
+                    onClick={handlePublicKeyRevealClick}
+                  >
+                    <Eye className="size-4" />
+                    {copyingPublicKey ? "处理中..." : "查看"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="border-cyan-200/30 bg-white/5 text-cyan-50 hover:bg-cyan-300/10 hover:text-white sm:w-24"
+                    disabled={copyingPublicKey}
+                    onClick={() => void handlePublicKeyCopy()}
+                  >
+                    <Copy className="size-4" />
+                    复制
+                  </Button>
+                </div>
+              </div>
+            ) : null}
             <div className="mt-8 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <Metric label="渠道状态" value={`${summary?.active_channels ?? 0}/${summary?.total_channels ?? 0}`} icon={RadioTower} />
               <Metric label="上游分组" value={String(summary?.upstream_groups ?? 0)} icon={Activity} />
@@ -190,22 +288,24 @@ export default function HomePage() {
                 {summary?.gateway_status ?? "online"}
               </Badge>
             </div>
-            <div className="space-y-2">
-              {preview.map((group) => (
-                <div key={group.id} className="rounded-md border border-white/10 bg-slate-950/35 px-3 py-3">
+            <div className="h-80 overflow-hidden">
+              <div className={preview.length > 3 ? "public-dispatch-scroll space-y-2" : "space-y-2"}>
+              {[...preview, ...(preview.length > 3 ? preview : [])].map((group, index) => (
+                <div key={`${group.id}-${index}`} className="rounded-md border border-white/10 bg-slate-950/35 px-3 py-3">
                   <div className="flex items-center justify-between gap-3">
                     <p className="min-w-0 truncate text-sm font-medium">
-                      {group.channel_name} / {group.group_name}
+                      {group.site_domain || group.channel_name} / {group.group_name}
                     </p>
                     <span className="rounded bg-cyan-300/10 px-2 py-1 font-mono text-xs text-cyan-100">
                       {formatRatio(group.ratio)}
                     </span>
                   </div>
                   <p className="mt-1 text-xs text-slate-400">
-                    优先级 {group.priority || 0} · {group.status} · {group.last_used_at ? relativeTime(group.last_used_at) : "未使用"}
+                    {group.charity ? "公益 · " : ""}优先级 {group.priority || 0} · {group.status} · {group.last_used_at ? relativeTime(group.last_used_at) : "未使用"}
                   </p>
                 </div>
               ))}
+              </div>
               {preview.length === 0 ? (
                 <div className="rounded-md border border-dashed border-white/15 px-3 py-8 text-center text-sm text-slate-400">
                   暂无可展示分组
@@ -222,37 +322,6 @@ export default function HomePage() {
                 <span className="mt-1 block text-lg font-semibold text-white">{summary?.claude_groups ?? 0}</span>
               </div>
             </div>
-            {summary?.public_key_enabled && publicKey?.status === "available" ? (
-              <div className="mt-4 rounded-md border border-cyan-300/20 bg-cyan-300/10 p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <p className="truncate text-sm font-semibold text-cyan-50">{publicKey.name || "公益 Key"}</p>
-                    <p className="mt-1 text-xs text-cyan-100/75">
-                      今日 {formatTokens(publicKey.today_tokens)} · 累计 {formatTokens(publicKey.total_tokens)}
-                    </p>
-                  </div>
-                  <Badge className="bg-cyan-200 text-slate-950 hover:bg-cyan-200">
-                    {publicKey.password_required ? "密码复制" : "直接复制"}
-                  </Badge>
-                </div>
-                {publicKey.expires_at ? (
-                  <p className="mt-2 text-xs text-cyan-100/70">有效期至 {publicKey.expires_at}</p>
-                ) : null}
-                <Button
-                  className="mt-3 w-full bg-cyan-300 text-slate-950 hover:bg-cyan-200"
-                  disabled={copyingPublicKey}
-                  onClick={handlePublicKeyClick}
-                >
-                  <Copy className="size-4" />
-                  {copyingPublicKey ? "复制中..." : "复制公益 Key"}
-                </Button>
-              </div>
-            ) : (
-              <div className="mt-4 flex items-center gap-2 rounded-md border border-white/10 bg-white/[0.04] px-3 py-2 text-xs text-slate-400">
-                <KeyRound className="size-4" />
-                公益 Key 未开启
-              </div>
-            )}
           </Card>
         </section>
         {error ? <p className="pb-4 text-xs text-red-300">{error}</p> : null}
@@ -260,7 +329,7 @@ export default function HomePage() {
       <Dialog open={publicKeyOpen} onOpenChange={setPublicKeyOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>复制公益 Key</DialogTitle>
+            <DialogTitle>{publicKeyIntent === "copy" ? "复制公益 Key" : "查看公益 Key"}</DialogTitle>
             <DialogDescription>
               {publicKey?.password_hint || "请输入后台设置的复制密码。"}
             </DialogDescription>
@@ -281,8 +350,8 @@ export default function HomePage() {
             <Button variant="outline" onClick={() => setPublicKeyOpen(false)} disabled={copyingPublicKey}>
               取消
             </Button>
-            <Button onClick={() => void revealPublicKey(publicKeyPassword)} disabled={copyingPublicKey}>
-              {copyingPublicKey ? "复制中..." : "复制"}
+            <Button onClick={() => void revealPublicKey(publicKeyPassword, publicKeyIntent === "copy")} disabled={copyingPublicKey}>
+              {copyingPublicKey ? (publicKeyIntent === "copy" ? "复制中..." : "查看中...") : publicKeyIntent === "copy" ? "复制" : "查看"}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -3,9 +3,11 @@ package api
 import (
 	"crypto/subtle"
 	"net/http"
+	"net/url"
 	"runtime"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bejix/upstream-ops/backend/config"
@@ -27,15 +29,31 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 		channels, _ := d.Channels.List()
 		gateway := dashboardGateway(d)
 		publicKey := publicKeySummary(d)
-		publicGroups := make([]dashboardGatewayGroup, 0, 8)
+		title := publicDashboardTitle(d)
+		// 公开页每个上游只展示一个当前可用且最便宜的分组，最多十个上游。
+		// 这和调度的优先级策略分开：这里展示的是可对外说明的成本顺序。
+		cheapestByChannel := make(map[uint]dashboardGatewayGroup)
 		for _, group := range gateway.Groups {
-			if !group.Enabled || group.Status == "dead" || group.Status == "disabled" {
+			if !group.Enabled || (group.Status != "alive" && group.Status != "unknown") {
 				continue
 			}
-			publicGroups = append(publicGroups, group)
-			if len(publicGroups) >= 8 {
-				break
+			best, exists := cheapestByChannel[group.ChannelID]
+			if !exists || group.Ratio < best.Ratio || (group.Ratio == best.Ratio && group.ID < best.ID) {
+				cheapestByChannel[group.ChannelID] = group
 			}
+		}
+		publicGroups := make([]dashboardGatewayGroup, 0, len(cheapestByChannel))
+		for _, group := range cheapestByChannel {
+			publicGroups = append(publicGroups, group)
+		}
+		sort.SliceStable(publicGroups, func(i, j int) bool {
+			if publicGroups[i].Ratio != publicGroups[j].Ratio {
+				return publicGroups[i].Ratio < publicGroups[j].Ratio
+			}
+			return publicGroups[i].ID < publicGroups[j].ID
+		})
+		if len(publicGroups) > 10 {
+			publicGroups = publicGroups[:10]
 		}
 		openaiCount := 0
 		claudeCount := 0
@@ -51,7 +69,7 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			}
 		}
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{
-			"title":              "UpstreamOps",
+			"title":              title,
 			"total_channels":     len(channels),
 			"active_channels":    gateway.AliveGroups,
 			"upstream_groups":    gateway.TotalGroups,
@@ -95,6 +113,20 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			"expires_at": cfg.ExpiresAt,
 		}})
 	})
+}
+
+func publicDashboardTitle(d *Deps) string {
+	if d == nil || d.Runtime == nil {
+		return "UpstreamOps"
+	}
+	cfg, err := config.LoadFile(d.Runtime.ConfigPath())
+	if err != nil {
+		return "UpstreamOps"
+	}
+	if title := strings.TrimSpace(cfg.App.Title); title != "" {
+		return title
+	}
+	return "UpstreamOps"
 }
 
 type publicKeyStat struct {
@@ -241,10 +273,12 @@ type dashboardGatewayGroup struct {
 	ID            uint       `json:"id"`
 	ChannelID     uint       `json:"channel_id"`
 	ChannelName   string     `json:"channel_name"`
+	SiteDomain    string     `json:"site_domain,omitempty"`
 	ClientFormat  string     `json:"client_format"`
 	GroupName     string     `json:"group_name"`
 	Ratio         float64    `json:"ratio"`
 	Priority      int        `json:"priority"`
+	Charity       bool       `json:"charity"`
 	Enabled       bool       `json:"enabled"`
 	Status        string     `json:"status"`
 	FailureCount  int        `json:"failure_count"`
@@ -356,6 +390,13 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 	}
 	keys, _ := d.Gateway.ListGatewayKeys()
 	groups, _ := d.Gateway.ListGroupKeys()
+	siteDomains := make(map[uint]string)
+	if d.Channels != nil {
+		channels, _ := d.Channels.List()
+		for _, channel := range channels {
+			siteDomains[channel.ID] = channelSiteDomain(channel.SiteURL)
+		}
+	}
 	stat.TotalKeys = int64(len(keys))
 	today := time.Now().Format("2006-01-02")
 	for _, key := range keys {
@@ -402,10 +443,12 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			ID:            group.ID,
 			ChannelID:     group.ChannelID,
 			ChannelName:   group.ChannelName,
+			SiteDomain:    siteDomains[group.ChannelID],
 			ClientFormat:  group.ClientFormat,
 			GroupName:     group.GroupName,
 			Ratio:         group.Ratio,
 			Priority:      group.Priority,
+			Charity:       group.Charity,
 			Enabled:       group.Enabled,
 			Status:        status,
 			FailureCount:  group.FailureCount,
@@ -428,9 +471,20 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 	return stat
 }
 
+func channelSiteDomain(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Hostname() == "" {
+		return strings.TrimSpace(raw)
+	}
+	return u.Hostname()
+}
+
 func dashboardGroupLess(a, b dashboardGatewayGroup) bool {
 	if rankA, rankB := dashboardStatusRank(a.Status), dashboardStatusRank(b.Status); rankA != rankB {
 		return rankA < rankB
+	}
+	if a.Charity != b.Charity {
+		return a.Charity
 	}
 	if a.Priority != b.Priority {
 		return a.Priority > b.Priority

@@ -2,10 +2,10 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-> 本项目基于 [worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub) 二次开发，感谢原作者 [@worryzyy](https://github.com/worryzyy) 的开源工作。
+> 本项目基于 [bejix/upstream-ops](https://github.com/bejix/upstream-ops) 二次开发，其上游最初来自 [worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub)。感谢 [@bejix](https://github.com/bejix)、[@worryzyy](https://github.com/worryzyy) 的开源工作，也感谢 [sub2api](https://github.com/Wei-Shaw/sub2api)、[new-api](https://github.com/QuantumNous/new-api) 等项目提供的实现参考。
 
-> UpstreamOps 是一个面向 NewAPI / Sub2API 上游站点的集中监控与运维面板，用来统一管理上游账号、查看余额与消费、同步模型倍率、追踪倍率变化、维护上游 API Key、发起充值/兑换，并通过多种通知渠道推送余额告警、倍率变更、登录异常、监控异常和上游公告。
-这不是一个代理网关，也不处理模型请求转发；它更像是给多个上游后台做的“运维控制台”。
+> UpstreamOps 是一个面向 NewAPI / Sub2API 上游站点的集中监控、运维与 AI API 聚合调度网关。它可以统一管理上游账号、查看余额与消费、同步模型倍率、追踪倍率变化、维护上游 API Key、发起充值/兑换，并通过多种通知渠道推送余额告警、倍率变更、登录异常、监控异常和上游公告。
+它也可以创建本站密钥并转发 `/v1/*` 模型请求，在多个存活上游之间按公益优先、优先级和低倍率自动调度。
 
 
 ## ❤️赞助商
@@ -252,6 +252,12 @@ Docker 默认拉取 `ghcr.io/daiyibo123/upstream-ops:${IMAGE_TAG:-latest}`，不
 docker compose up -d
 ```
 
+Compose 会默认启动 watchtower 更新侧车。默认只响应面板里的「立即更新并重启」，不会定时轮询；如果需要定时自动更新，在 `.env` 中设置：
+
+```env
+WATCHTOWER_HTTP_API_PERIODIC_POLLS=true
+```
+
 默认访问地址：
 
 ```text
@@ -265,6 +271,16 @@ http://localhost:8080
 ```
 
 宿主机对应文件是项目根目录下的 `data/upstream-ops.db`。系统设置配置文件会持久化到 `data/config.yaml`。
+
+### 更新
+
+推荐在系统设置里点击「检查更新 / 立即更新并重启」。这会触发内网 watchtower 侧车拉取最新镜像并重建 `app` 容器，不会覆盖 `./data`。
+
+SSH 备用命令：
+
+```bash
+docker compose pull && docker compose up -d app
+```
 
 ### 固定镜像版本
 

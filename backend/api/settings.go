@@ -70,6 +70,7 @@ func saveSettingsConfig(c *gin.Context, d *Deps) {
 
 	cfg.App.Title = in.App.Title
 	cfg.App.NotificationPrefix = in.App.NotificationPrefix
+	cfg.App.PublicKey = in.App.PublicKey
 	cfg.Auth = in.Auth
 	cfg.Scheduler = in.Scheduler
 	cfg.Notifications = in.Notifications

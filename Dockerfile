@@ -19,9 +19,7 @@ RUN corepack enable && corepack prepare pnpm@10.4.0 --activate
 
 # 先拷依赖清单走缓存层
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
-# 不用 --frozen-lockfile：lockfile 不严格匹配时只警告不报错；
-# 在 CI 里如果发现 lockfile 已经稳定可信，可以改回 --frozen-lockfile 锁定可复现性。
-RUN pnpm install --no-frozen-lockfile
+RUN pnpm install --frozen-lockfile
 
 # 再拷源码，build 产物在 /web/dist
 COPY frontend/ ./
@@ -30,6 +28,7 @@ RUN pnpm build
 # ---------- Stage 2: 后端 ----------
 FROM golang:1.23-alpine AS go-builder
 WORKDIR /src
+ARG VERSION=0.21.0
 
 # 先 go.mod / go.sum 走缓存
 COPY go.mod go.sum ./
@@ -44,7 +43,7 @@ COPY --from=frontend-builder /web/dist ./web/dist
 
 RUN CGO_ENABLED=0 GOOS=linux go build \
         -trimpath \
-        -ldflags="-s -w" \
+        -ldflags="-s -w -X github.com/bejix/upstream-ops/backend/global.VERSION=${VERSION}" \
         -o /out/upstream-ops \
         ./cmd/server
 

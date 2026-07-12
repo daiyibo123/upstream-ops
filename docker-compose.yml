@@ -8,6 +8,7 @@ services:
     labels:
       # 只有带这个 label 的容器才会被 watchtower 纳管，避免它去动别的容器。
       com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: "${WATCHTOWER_SCOPE:-upstream-ops}"
     environment:
       TZ: Asia/Shanghai
       SERVER_PORT: 8418
@@ -17,12 +18,14 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       APP_SECRET: ${APP_SECRET:?APP_SECRET is required, set it in .env}
       # 自用模式建议默认开启鉴权；账号密码通过 .env / docker 环境变量初始化。
-      # AUTH_ENABLED=true 时必须显式设置 ADMIN_PASSWORD，否则 docker-compose 直接报错，
-      # 避免 auth 初始化失败导致容器无休止 crash-loop。
+      # AUTH_ENABLED=true 时请在 .env 里显式设置 ADMIN_PASSWORD；
+      # AUTH_ENABLED=false 的内网部署可以留空。
       AUTH_ENABLED: ${AUTH_ENABLED:-true}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required (set it in .env, or export AUTH_ENABLED=false for internal-only deployments)}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       AUTH_TOKEN_SECRET: ${AUTH_TOKEN_SECRET:-}
+      SYSTEM_UPDATE_URL: http://watchtower:8080/v1/update
+      SYSTEM_UPDATE_TOKEN: "${WATCHTOWER_HTTP_API_TOKEN:-upstream-ops-update}"
     ports:
       - "${HTTP_PORT:-8080}:8418"
     volumes:
@@ -34,29 +37,28 @@ services:
       retries: 5
       start_period: 10s
 
-  # ── 自动更新侧车 ──────────────────────────────────────────────────────────
-  # watchtower 定时检查 app 镜像有没有新版：一旦 GitHub Actions 推了新的
-  # ghcr.io/daiyibo123/upstream-ops:latest，它会 docker pull 新镜像并用新版重建 app 容器。
+  # ── 更新侧车 ──────────────────────────────────────────────────────────────
+  # watchtower 默认只监听内网 HTTP API：面板点击「立即更新并重启」时，它会检查
+  # ghcr.io/daiyibo123/upstream-ops:latest，拉取新镜像并用新版重建 app 容器。
+  # 若想让它定时自动检查，把 WATCHTOWER_HTTP_API_PERIODIC_POLLS 设为 true。
   #
   # 关键取舍（都是为了 2C1G 上的稳定 + 可回退）：
   #   * WATCHTOWER_LABEL_ENABLE=true —— 只动带 watchtower.enable=true 的 app，
   #     绝不误伤别的容器，也不会更新 watchtower 自己。
   #   * 不设 --cleanup —— 故意保留旧镜像。更新翻车时旧镜像还在本地，
   #     `IMAGE_TAG=<旧 tag> docker compose up -d app` 一行即可秒回退。
-  #   * WATCHTOWER_POLL_INTERVAL 默认 6 小时，避免频繁拉取给小机器添压力；
-  #     想更快可在 .env 里调小，或直接在面板点「立即重启」让当前镜像先重启。
+  #   * WATCHTOWER_POLL_INTERVAL 默认 6 小时，仅在打开定时轮询时生效；
+  #     默认按需更新，避免频繁拉取给小机器添压力。
   #   * WATCHTOWER_INCLUDE_RESTARTING/ROLLING_RESTART 关闭 —— 单容器无需滚动，
   #     直接停旧起新，healthcheck 没过 compose 会自己重试拉起。
   #
-  # profile=autoupdate：默认 `docker compose up -d` 不会带起 watchtower，
-  # 需要自动更新时用 `docker compose --profile autoupdate up -d` 显式开启，
-  # 不想要自动更新的用户零负担。
   watchtower:
     # containrrr/watchtower 已停更，用的 Docker API 1.25 在新版 Docker（>=25）上会被拒。
     # 换用社区活跃维护的 fork nickfedor/watchtower，配置与环境变量完全兼容。
     image: nickfedor/watchtower:latest
     restart: unless-stopped
-    profiles: ["autoupdate"]
+    expose:
+      - "8080"
     environment:
       TZ: Asia/Shanghai
       WATCHTOWER_LABEL_ENABLE: "true"
@@ -64,10 +66,12 @@ services:
       WATCHTOWER_POLL_INTERVAL: ${WATCHTOWER_POLL_INTERVAL:-21600}
       WATCHTOWER_INCLUDE_RESTARTING: "false"
       WATCHTOWER_ROLLING_RESTART: "false"
-      # 只监控本 compose 项目内的容器，进一步缩小影响面。
-      WATCHTOWER_SCOPE: ""
+      WATCHTOWER_HTTP_API_UPDATE: "true"
+      WATCHTOWER_HTTP_API_PERIODIC_POLLS: "${WATCHTOWER_HTTP_API_PERIODIC_POLLS:-false}"
+      WATCHTOWER_HTTP_API_TOKEN: "${WATCHTOWER_HTTP_API_TOKEN:-upstream-ops-update}"
+      # 只监控带同一 scope label 的 app 容器，进一步缩小影响面。
+      WATCHTOWER_SCOPE: "${WATCHTOWER_SCOPE:-upstream-ops}"
     volumes:
       # 只读挂 docker.sock：watchtower 需要它来 pull + 重建容器。
       # 这是自动更新的固有代价，已通过 label-enable + 只读把权限收到最小。
       - /var/run/docker.sock:/var/run/docker.sock:ro
-

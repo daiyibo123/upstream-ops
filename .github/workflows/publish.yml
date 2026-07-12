@@ -20,7 +20,7 @@ on:
         default: ''
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -67,6 +67,18 @@ jobs:
           flavor: |
             latest=false
 
+      - name: Resolve app version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
       # 多架构构建 + 推送。GitHub Actions 内置 cache (type=gha) 把
       # 前端 pnpm install 和后端 go mod download 都缓存住，二次构建 1-2 分钟。
       - name: Build and push
@@ -78,9 +90,17 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: false
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
 
       - name: Summary
         run: |

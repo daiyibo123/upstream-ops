@@ -79,6 +79,38 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 	gp.GET("/group-keys", func(c *gin.Context) {
+		if c.Query("page") != "" || c.Query("page_size") != "" {
+			page, pageSize, err := parsePageQuery(c)
+			if err != nil {
+				fail(c, http.StatusBadRequest, err)
+				return
+			}
+			items, total, err := d.Gateway.ListGroupKeysPage(pageSize, (page-1)*pageSize)
+			if err != nil {
+				fail(c, http.StatusInternalServerError, err)
+				return
+			}
+			counts, err := d.Gateway.GroupKeyCounts()
+			if err != nil {
+				fail(c, http.StatusInternalServerError, err)
+				return
+			}
+			pages := 1
+			if total > 0 {
+				pages = int((total + int64(pageSize) - 1) / int64(pageSize))
+			}
+			c.JSON(http.StatusOK, gin.H{"data": gin.H{
+				"items":     items,
+				"total":     total,
+				"alive":     counts.Alive,
+				"dead":      counts.Dead,
+				"enabled":   counts.Enabled,
+				"page":      page,
+				"page_size": pageSize,
+				"pages":     pages,
+			}})
+			return
+		}
 		list, err := d.Gateway.ListGroupKeys()
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
@@ -123,6 +155,19 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 			return
 		}
 		item, err := d.Gateway.ClearGroupKeyCooldown(id)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": item})
+	})
+	gp.POST("/group-keys/:id/test", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		item, err := d.Gateway.TestGroupKey(id)
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return

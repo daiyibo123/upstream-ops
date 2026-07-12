@@ -180,10 +180,12 @@ export interface DashboardGatewayGroup {
   id: number
   channel_id: number
   channel_name: string
+  site_domain?: string
   client_format?: "openai" | "claude" | "any" | string
   group_name: string
   ratio: number
   priority: number
+  charity?: boolean
   enabled: boolean
   status: string
   failure_count: number
@@ -373,6 +375,12 @@ export interface SystemRestartResponse {
   message: string
 }
 
+export interface SystemUpdateResponse {
+  status: string
+  message: string
+  source?: string
+}
+
 export interface ApplyConfigResult {
   applied_sections: string[]
   message: string
@@ -538,6 +546,17 @@ export interface UpstreamGroupKey {
   last_error?: string
   created_at: string
   updated_at: string
+}
+
+export interface UpstreamGroupKeyPage {
+  items: UpstreamGroupKey[]
+  total: number
+  alive: number
+  dead: number
+  enabled: number
+  page: number
+  page_size: number
+  pages: number
 }
 
 export interface UsageLog {

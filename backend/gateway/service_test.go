@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -652,6 +653,154 @@ func TestHealthProbeRequiresGenerationSuccess(t *testing.T) {
 	}
 }
 
+func TestHealthProbeUsesStreamingOpenAIRequest(t *testing.T) {
+	var seen map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test"}]}`))
+		case "/v1/responses":
+			if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+				t.Errorf("decode response probe body: %v", err)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: response.output_text.delta\n"))
+			_, _ = w.Write([]byte(`data: {"type":"response.output_text.delta","delta":"ok"}` + "\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("m", 32))
+	channel := &storage.Channel{Name: "stream-openai", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "stream-openai", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "default")
+	if err != nil {
+		t.Fatalf("load group: %v", err)
+	}
+	status, _, _, err := env.svc.healthProbeCandidate(context.Background(), group)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if seen["stream"] != true || seen["max_output_tokens"] != float64(1) {
+		t.Fatalf("probe body = %#v", seen)
+	}
+}
+
+func TestHealthProbeUsesStreamingClaudeRequest(t *testing.T) {
+	var seen map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			http.NotFound(w, r)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+			t.Errorf("decode claude probe body: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: message_start\n"))
+		_, _ = w.Write([]byte(`data: {"type":"message_start","message":{"id":"msg_1","role":"assistant"}}` + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("n", 32))
+	channel := &storage.Channel{Name: "stream-claude", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "stream-claude", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "unknown", ClientFormat: "claude",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "default")
+	if err != nil {
+		t.Fatalf("load group: %v", err)
+	}
+	status, _, _, err := env.svc.healthProbeCandidate(context.Background(), group)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if seen["stream"] != true || seen["max_tokens"] != float64(1) {
+		t.Fatalf("probe body = %#v", seen)
+	}
+}
+
+func TestTestAllGroupKeysStartsAllEnabledGroupsConcurrently(t *testing.T) {
+	var inFlight int64
+	var maxInFlight int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt64(&inFlight, 1)
+		defer atomic.AddInt64(&inFlight, -1)
+		for {
+			previous := atomic.LoadInt64(&maxInFlight)
+			if current <= previous || atomic.CompareAndSwapInt64(&maxInFlight, previous, current) {
+				break
+			}
+		}
+		time.Sleep(120 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test"}]}`))
+		case "/v1/responses":
+			_, _ = w.Write([]byte(`{"id":"resp_probe","output_text":"ok"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("p", 32))
+	channel := &storage.Channel{Name: "parallel-health", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	for i := 0; i < 7; i++ {
+		ref := "group-" + strconv.Itoa(i)
+		if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+			ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+			GroupRef: ref, GroupName: ref, Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+		}); err != nil {
+			t.Fatalf("insert group %d: %v", i, err)
+		}
+	}
+
+	result, err := env.svc.TestAllGroupKeys(context.Background())
+	if err != nil {
+		t.Fatalf("test all groups: %v", err)
+	}
+	if result.Alive != 7 {
+		t.Fatalf("alive = %d, want 7; result=%#v", result.Alive, result)
+	}
+	if got := atomic.LoadInt64(&maxInFlight); got < 7 {
+		t.Fatalf("maximum concurrent upstream requests = %d, want all 7 groups to start together", got)
+	}
+}
+
 func TestProxySkipsCandidateAtConcurrencyLimit(t *testing.T) {
 	var limitedHits int64
 	limitedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1171,6 +1320,26 @@ func TestExtractStreamUsageFromResponsesSSE(t *testing.T) {
 	usage := extractStreamUsage(body)
 	if usage.Prompt != 7 || usage.Completion != 5 || usage.Total != 12 {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestStreamRawSSEPreservesChatDone(t *testing.T) {
+	body := strings.NewReader("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n" +
+		"data: [DONE]\n\n")
+	rec := httptest.NewRecorder()
+	usage, err := streamRawSSE(rec, nil, newSSEStreamReader(body), "raw")
+	if err != nil {
+		t.Fatalf("stream raw sse: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("raw chat stream should preserve [DONE]: %s", out)
+	}
+	if strings.Contains(out, "response.completed") {
+		t.Fatalf("raw chat stream should not synthesize responses events: %s", out)
+	}
+	if usage.SoftFailure != "" {
+		t.Fatalf("raw chat stream should not mark soft failure: %#v", usage)
 	}
 }
 
