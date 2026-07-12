@@ -40,10 +40,17 @@ docker compose pull && docker compose up -d
 ## 更新
 
 ```bash
-cd /root/upstream-ops && docker compose pull && docker compose up -d app
+cd /root/upstream-ops
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.21.2/docker-compose.yml
+sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=latest/' .env
+docker compose pull && docker compose up -d
 ```
 
-或在面板里点「检查更新 / 立即更新并重启」。更新只替换镜像，`./data` 保持不变。若需要定时自动更新，在 `.env` 中设置 `WATCHTOWER_HTTP_API_PERIODIC_POLLS=true` 后重启 watchtower。
+这会补齐页面一键更新所需的 watchtower 服务；不会覆盖 `.env` 或 `./data`。之后可在面板点「检查更新 / 立即更新并重启」。若需要定时自动更新，在 `.env` 中设置 `WATCHTOWER_HTTP_API_PERIODIC_POLLS=true` 后重启 watchtower。
+
+## 版本与更新日志
+
+使用语义化版本 `vMAJOR.MINOR.PATCH`：不兼容变更增加 `MAJOR`，新功能增加 `MINOR`，修复与小优化增加 `PATCH`。每次发布必须更新 [CHANGELOG.md](CHANGELOG.md)、应用版本和 Docker 构建版本，并创建相同版本的 Git tag。GitHub Release 与更新日志会记录每个版本的具体变更。
 
 ## 致谢
 

@@ -276,6 +276,14 @@ http://localhost:8080
 
 推荐在系统设置里点击「检查更新 / 立即更新并重启」。这会触发内网 watchtower 侧车拉取最新镜像并重建 `app` 容器，不会覆盖 `./data`。
 
+首次升级到带有更新侧车的版本时，请在服务器项目目录执行下面的命令。它会保留 `.env` 与 `data/`，并同时启动 `app` 和 `watchtower`；之后页面内的「立即更新并重启」即可使用。
+
+```bash
+git fetch --tags && git checkout v0.21.2 && sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=latest/' .env && docker compose pull && docker compose up -d
+```
+
+如果页面提示更新侧车未配置，请执行上面的命令后刷新页面；不要只执行 `docker compose up -d app`，否则旧的 Compose 配置不会创建 `watchtower` 服务。
+
 SSH 备用命令：
 
 ```bash
@@ -295,6 +303,10 @@ IMAGE_TAG=latest
 ```env
 IMAGE_TAG=v0.0.5
 ```
+
+### 版本与更新日志
+
+发布采用语义化版本号 `v主版本.次版本.修订版本`：重大不兼容变更增加主版本，新增功能增加次版本，修复与小优化增加修订版本。每次发布都必须同步更新 `backend/global/version.go`、`Dockerfile` 的默认版本和 [CHANGELOG.md](CHANGELOG.md)，再创建同名 Git tag（例如 `v0.21.2`）。完整变更内容以更新日志和 GitHub Release 为准。
 
 ## MySQL 部署
 

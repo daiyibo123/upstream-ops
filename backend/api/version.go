@@ -146,6 +146,9 @@ func handleSystemUpdate(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"status":  "unsupported",
+			// apiFetch renders `error` for failed HTTP requests. Returning it
+			// keeps the setup problem actionable instead of showing only HTTP 400.
+			"error":    err.Error(),
 			"message": err.Error(),
 			"command": "docker compose pull && docker compose up -d app",
 		})
