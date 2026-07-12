@@ -1,7 +1,7 @@
 "use client"
 
 import { Outlet, useLocation, useNavigate } from "react-router-dom"
-import { Bell, History, KeyRound, LayoutDashboard, Plus, Server, Settings, type LucideIcon } from "lucide-react"
+import { History, KeyRound, LayoutDashboard, Plus, Server, Settings, type LucideIcon } from "lucide-react"
 import { MonitorHeader } from "@/components/monitor/monitor-header"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
@@ -25,7 +25,6 @@ const NAV_ITEMS: NavItem[] = [
   { icon: KeyRound, label: "创建 Key", path: "/keys" },
   { icon: Server, label: "可用渠道", path: "/gateway" },
   { icon: History, label: "使用记录", path: "/usage" },
-  { icon: Bell, label: "通知渠道", path: "/notifications" },
   { icon: Settings, label: "系统设置", path: "/settings" },
 ]
 

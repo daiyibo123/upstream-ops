@@ -12,6 +12,7 @@ export type ProgressStage =
   | "cost"
   | "subscription"
   | "rates"
+  | "gateway_health"
   | "done"
   | "error"
 
@@ -118,4 +119,9 @@ export function syncAllChannelsStream(options: SyncOptions) {
 /** 触发 /api/channels/:id/test-login（仅登录验证，session 落库以便后续 sync 复用）。 */
 export function testLoginStream(channelID: number, options: SyncOptions) {
   return streamSSE(`/api/channels/${channelID}/test-login`, options)
+}
+
+/** 触发 /api/gateway/group-keys/test（按批次一键测活）。 */
+export function testGatewayHealthStream(options: SyncOptions) {
+  return streamSSE("/api/gateway/group-keys/test?stream=1&batch_size=30", options)
 }

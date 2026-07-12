@@ -27,17 +27,8 @@ import {
 } from "recharts"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useDashboardSummary } from "@/lib/queries"
-import { formatRatio, relativeTime } from "@/lib/format"
+import { formatRatio, formatTokens, relativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
-
-function formatTokens(value: number | null | undefined) {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return "0"
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return n.toLocaleString("en-US")
-}
 
 function formatBytes(value: number | null | undefined) {
   const n = Number(value ?? 0)
@@ -74,7 +65,15 @@ interface TooltipItem {
   payload?: { label?: string; name?: string; value?: number }
 }
 
-function ChartTooltip({ active, payload }: { active?: boolean; payload?: TooltipItem[] }) {
+function ChartTooltip({
+  active,
+  payload,
+  valueFormatter = chartValue,
+}: {
+  active?: boolean
+  payload?: TooltipItem[]
+  valueFormatter?: (value: number) => string
+}) {
   if (!active || !payload?.length) return null
   return (
     <div className="rounded-md border border-border bg-popover px-3 py-2 text-xs shadow-md">
@@ -84,7 +83,7 @@ function ChartTooltip({ active, payload }: { active?: boolean; payload?: Tooltip
         return (
           <p key={`${label}-${index}`} className="flex min-w-32 items-center justify-between gap-4">
             <span className="text-muted-foreground">{label}</span>
-            <span className="font-semibold text-foreground">{chartValue(value)}</span>
+            <span className="font-semibold text-foreground">{valueFormatter(value)}</span>
           </p>
         )
       })}
@@ -316,7 +315,7 @@ export function GatewayStatusDashboard() {
                         tick={{ fill: "var(--muted-foreground)", fontSize: 10 }}
                         tickFormatter={formatTokens}
                       />
-                      <Tooltip content={<ChartTooltip />} cursor={{ fill: "var(--muted)" }} />
+                      <Tooltip content={<ChartTooltip valueFormatter={formatTokens} />} cursor={{ fill: "var(--muted)" }} />
                       <Bar dataKey="value" radius={[4, 4, 0, 0]} fill="var(--brand)" />
                     </BarChart>
                   </ResponsiveContainer>
@@ -421,7 +420,7 @@ export function GatewayStatusDashboard() {
                       axisLine={false}
                       tick={{ fill: "var(--muted-foreground)", fontSize: 10 }}
                     />
-                    <Tooltip content={<ChartTooltip />} cursor={{ fill: "var(--muted)" }} />
+                    <Tooltip content={<ChartTooltip valueFormatter={formatTokens} />} cursor={{ fill: "var(--muted)" }} />
                     <Bar dataKey="value" radius={[0, 4, 4, 0]} fill="var(--warning)" />
                   </BarChart>
                 </ResponsiveContainer>

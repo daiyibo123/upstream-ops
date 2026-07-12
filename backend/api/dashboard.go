@@ -1,7 +1,6 @@
 package api
 
 import (
-	"crypto/subtle"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	"github.com/bejix/upstream-ops/backend/config"
-	gatewaySvc "github.com/bejix/upstream-ops/backend/gateway"
 	"github.com/gin-gonic/gin"
 )
 
@@ -98,23 +96,25 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		cfg, gatewayKey, ok := loadPublicKeyConfig(d)
-		if !ok || !cfg.Enabled || cfg.Key == "" || gatewayKey == nil {
+		if d.Gateway == nil {
 			fail(c, http.StatusNotFound, errPublicKeyUnavailable())
 			return
 		}
-		if publicKeyExpired(cfg.ExpiresAt) {
-			fail(c, http.StatusGone, errPublicKeyExpired())
-			return
-		}
-		if cfg.Password != "" && subtle.ConstantTimeCompare([]byte(in.Password), []byte(cfg.Password)) != 1 {
-			fail(c, http.StatusUnauthorized, errPublicKeyPassword())
+		raw, key, err := d.Gateway.RevealPublicGatewayKey(in.Password)
+		if err != nil {
+			status := http.StatusNotFound
+			if err.Error() == "public key expired" {
+				status = http.StatusGone
+			} else if err.Error() == "public key password mismatch" {
+				status = http.StatusUnauthorized
+			}
+			fail(c, status, err)
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{
-			"key":        cfg.Key,
-			"name":       publicKeyName(cfg),
-			"expires_at": cfg.ExpiresAt,
+			"key":        raw,
+			"name":       key.Name,
+			"expires_at": key.ExpiresAt,
 		}})
 	})
 }
@@ -146,82 +146,35 @@ type publicKeyStat struct {
 }
 
 func publicKeySummary(d *Deps) publicKeyStat {
-	cfg, gatewayKey, ok := loadPublicKeyConfig(d)
-	if !ok {
+	if d == nil || d.Gateway == nil {
+		return publicKeyStat{Status: "disabled"}
+	}
+	key, err := d.Gateway.GetPublicGatewayKey()
+	if err != nil || key == nil {
 		return publicKeyStat{Status: "disabled"}
 	}
 	stat := publicKeyStat{
-		Enabled:          cfg.Enabled && cfg.Key != "",
-		Name:             publicKeyName(cfg),
-		PasswordRequired: cfg.Password != "",
-		PasswordHint:     cfg.PasswordHint,
-		ExpiresAt:        cfg.ExpiresAt,
+		Enabled:          key.Enabled,
+		Name:             key.Name,
+		PasswordRequired: key.PasswordRequired,
+		PasswordHint:     key.PasswordHint,
 		Status:           "disabled",
 	}
 	if !stat.Enabled {
 		return stat
 	}
-	if publicKeyExpired(cfg.ExpiresAt) {
+	if key.ExpiresAt != nil && time.Now().After(*key.ExpiresAt) {
 		stat.Status = "expired"
 		return stat
 	}
-	if gatewayKey == nil {
-		stat.Status = "unavailable"
-		return stat
+	if key.ExpiresAt != nil {
+		stat.ExpiresAt = key.ExpiresAt.Format("2006-01-02")
 	}
 	stat.Status = "available"
-	todayTokens := gatewayKey.TodayTokens
-	if gatewayKey.UsageDate != "" && gatewayKey.UsageDate != time.Now().Format("2006-01-02") {
-		todayTokens = 0
-	}
-	stat.TodayTokens = todayTokens
-	stat.TotalTokens = gatewayKey.TotalTokens
-	stat.LastUsedAt = gatewayKey.LastUsedAt
+	stat.TodayTokens = key.TodayTokens
+	stat.TotalTokens = key.TotalTokens
+	stat.LastUsedAt = key.LastUsedAt
 	return stat
-}
-
-func loadPublicKeyConfig(d *Deps) (config.PublicKeyConfig, *gatewaySvc.GatewayKeyOutput, bool) {
-	if d == nil || d.Runtime == nil {
-		return config.PublicKeyConfig{}, nil, false
-	}
-	cfg, err := config.LoadFile(d.Runtime.ConfigPath())
-	if err != nil {
-		return config.PublicKeyConfig{}, nil, false
-	}
-	publicKey := cfg.App.PublicKey
-	if d.Gateway == nil || publicKey.Key == "" {
-		return publicKey, nil, true
-	}
-	key, err := d.Gateway.FindGatewayKeyByRaw(publicKey.Key)
-	if err != nil {
-		return publicKey, nil, true
-	}
-	return publicKey, key, true
-}
-
-func publicKeyName(cfg config.PublicKeyConfig) string {
-	if cfg.Name != "" {
-		return cfg.Name
-	}
-	return "公益 Key"
-}
-
-func publicKeyExpired(raw string) bool {
-	expiresAt, ok := parsePublicKeyExpiry(raw)
-	return ok && time.Now().After(expiresAt)
-}
-
-func parsePublicKeyExpiry(raw string) (time.Time, bool) {
-	if raw == "" {
-		return time.Time{}, false
-	}
-	if t, err := time.Parse(time.RFC3339, raw); err == nil {
-		return t, true
-	}
-	if t, err := time.Parse("2006-01-02", raw); err == nil {
-		return t.Add(24*time.Hour - time.Nanosecond), true
-	}
-	return time.Time{}, false
 }
 
 func errPublicKeyUnavailable() error {

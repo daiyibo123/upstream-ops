@@ -28,7 +28,7 @@ RUN pnpm build
 # ---------- Stage 2: 后端 ----------
 FROM golang:1.23-alpine AS go-builder
 WORKDIR /src
-ARG VERSION=0.21.0
+ARG VERSION=0.21.1
 
 # 先 go.mod / go.sum 走缓存
 COPY go.mod go.sum ./

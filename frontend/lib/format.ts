@@ -64,6 +64,22 @@ export function decimal(value: number | null | undefined, digits = 2) {
   })
 }
 
+export function formatTokens(value: number | null | undefined) {
+  const n = Number(value ?? 0)
+  if (!Number.isFinite(n) || n <= 0) return "0M"
+  if (n >= 1_000_000_000) return `${trimFixed(n / 1_000_000_000, 2)}B`
+  const millions = n / 1_000_000
+  if (millions < 0.001) return "<0.001M"
+  if (millions < 1) return `${trimFixed(millions, 3)}M`
+  if (millions < 10) return `${trimFixed(millions, 2)}M`
+  if (millions < 100) return `${trimFixed(millions, 1)}M`
+  return `${trimFixed(millions, 0)}M`
+}
+
+function trimFixed(value: number, digits: number) {
+  return value.toFixed(digits).replace(/\.0+$|(\.\d*[1-9])0+$/, "$1")
+}
+
 export function formatRatio(value: number | null | undefined) {
   if (value == null || !Number.isFinite(value)) return "—"
   return value.toLocaleString("en-US", {

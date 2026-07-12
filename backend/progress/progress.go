@@ -20,6 +20,7 @@ const (
 	StageCost         Stage = "cost"
 	StageSubscription Stage = "subscription"
 	StageRates        Stage = "rates"
+	StageGatewayHealth Stage = "gateway_health"
 	StageDone         Stage = "done"
 	StageError        Stage = "error"
 )

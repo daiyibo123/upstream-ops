@@ -145,12 +145,17 @@ function InlineRates({ channelID }: { channelID: number }) {
   if (rates.length === 0) return null
 
   const showToggle = hasOverflow || expanded
+  const latest = rates.reduce<string | null>((acc, rate) => {
+    if (!rate.last_seen_at) return acc
+    if (!acc || new Date(rate.last_seen_at).getTime() > new Date(acc).getTime()) return rate.last_seen_at
+    return acc
+  }, null)
 
   return (
     <div className="mt-3 border-t border-border pt-2.5">
       <div className="mb-1.5 flex items-center justify-between">
         <p className="text-[11px] text-muted-foreground">
-          {rates.length} 个分组
+          自动采集 · {rates.length} 个分组{latest ? ` · ${relativeTime(latest)}` : ""}
         </p>
         {showToggle ? (
           <button
@@ -433,6 +438,7 @@ const stageLabel: Record<ProgressEvent["stage"], string> = {
   cost: "消费",
   subscription: "订阅",
   rates: "倍率",
+  gateway_health: "测活",
   done: "完成",
   error: "失败",
 }
@@ -445,6 +451,7 @@ const stageOrder: Record<ProgressEvent["stage"], number> = {
   cost: 5,
   subscription: 6,
   rates: 7,
+  gateway_health: 8,
   done: 9,
   error: 9,
 }
@@ -1026,6 +1033,20 @@ export function ChannelCards() {
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-44">
+                        <DropdownMenuItem
+                          disabled={busyAction === `rates-${c.id}` || !!syncState[c.id]?.running || anySyncRunning}
+                          onSelect={(e) => {
+                            e.preventDefault()
+                            void withBusy(`rates-${c.id}`, async () => {
+                              await apiFetch(`/channels/${c.id}/refresh-rates`, { method: "POST" })
+                              toast.success("已刷新该渠道倍率")
+                            })
+                          }}
+                        >
+                          <RefreshCw className={cn("size-3.5", busyAction === `rates-${c.id}` && "animate-spin")} />
+                          {"仅刷新倍率"}
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
                         <DropdownMenuItem
                           disabled={busyAction === `clear-login-${c.id}`}
                           onSelect={async (e) => {

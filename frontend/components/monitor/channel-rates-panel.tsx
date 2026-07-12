@@ -114,7 +114,7 @@ export function ChannelRatesPanel() {
       <CardHeader className="flex flex-row items-baseline justify-between pb-2">
         <CardTitle className="text-base font-semibold">{"分组倍率"}</CardTitle>
         <span className="text-xs text-muted-foreground">
-          {"每个渠道的当前可用分组及倍率（绿=折扣 · 红=溢价）"}
+          {"自动从上游采集；也可在渠道卡片“更多”里仅刷新倍率（绿=折扣 · 红=溢价）"}
         </span>
       </CardHeader>
       <CardContent className="space-y-2">

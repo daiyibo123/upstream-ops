@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -20,12 +21,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bejix/upstream-ops/backend/channel"
 	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/bejix/upstream-ops/backend/connector"
 	appcrypto "github.com/bejix/upstream-ops/backend/crypto"
+	"github.com/bejix/upstream-ops/backend/progress"
 	"github.com/bejix/upstream-ops/backend/storage"
 )
 
@@ -35,7 +38,7 @@ const (
 	responsesPath    = "/v1/responses"
 
 	proxyAttemptTimeout       = 60 * time.Second
-	healthProbeTimeout        = 8 * time.Second
+	healthProbeTimeout        = 15 * time.Second
 	healthProbeRetryJitterMax = 15 * time.Second
 	// streamFirstEventTimeout 是"等上游吐出第一个 SSE 事件"的最长等待。
 	// 这里必须给足：Codex / o1 / o3 这类带 reasoning 的请求，首个可见事件
@@ -50,8 +53,8 @@ const (
 	streamPreflightMaxEvents = 16
 	streamPreflightMaxBytes  = 64 << 10
 	// proxyFailureCooldown 是"请求失败后该候选临时不可调度"的固定时长。
-	proxyFailureCooldown   = 5 * time.Minute
-	healthProbeConcurrency = 8
+	proxyFailureCooldown      = 5 * time.Minute
+	defaultHealthProbeBatchSize = 30
 )
 
 type Service struct {
@@ -75,6 +78,7 @@ type CreateGatewayKeyInput struct {
 	AllowedGroupIDs []uint `json:"allowed_group_ids"`
 	DailyLimit      int64  `json:"daily_limit"`
 	TotalLimit      int64  `json:"total_limit"`
+	CostPerMillion  float64 `json:"cost_per_million"`
 	ExpiresInDays   int    `json:"expires_in_days"`
 }
 
@@ -85,6 +89,7 @@ type UpdateGatewayKeyInput struct {
 	AllowedGroupIDs []uint     `json:"allowed_group_ids"`
 	DailyLimit      *int64     `json:"daily_limit"`
 	TotalLimit      *int64     `json:"total_limit"`
+	CostPerMillion  *float64   `json:"cost_per_million"`
 	ExpiresInDays   *int       `json:"expires_in_days"`
 	ExpiresAt       *time.Time `json:"expires_at"`
 }
@@ -101,12 +106,39 @@ type GatewayKeyOutput struct {
 	TotalLimit      int64      `json:"total_limit"`
 	TodayTokens     int64      `json:"today_tokens"`
 	TotalTokens     int64      `json:"total_tokens"`
+	CostPerMillion  float64    `json:"cost_per_million"`
+	TodayCost       float64    `json:"today_cost"`
+	TotalCost       float64    `json:"total_cost"`
 	UsageDate       string     `json:"usage_date,omitempty"`
 	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	IsPublic        bool       `json:"is_public"`
+	PublicName      string     `json:"public_name,omitempty"`
+	PublicPasswordHint string  `json:"public_password_hint,omitempty"`
 	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
 	LastUsedIP      string     `json:"last_used_ip,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+type ConfigurePublicGatewayKeyInput struct {
+	GatewayKeyID uint   `json:"gateway_key_id"`
+	Enabled      bool   `json:"enabled"`
+	Name         string `json:"name"`
+	Password     *string `json:"password"`
+	PasswordHint string `json:"password_hint"`
+}
+
+type PublicGatewayKeyOutput struct {
+	ID               uint       `json:"id"`
+	Enabled          bool       `json:"enabled"`
+	Name             string     `json:"name"`
+	KeyPrefix        string     `json:"key_prefix"`
+	PasswordRequired bool       `json:"password_required"`
+	PasswordHint     string     `json:"password_hint,omitempty"`
+	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	TodayTokens      int64      `json:"today_tokens"`
+	TotalTokens      int64      `json:"total_tokens"`
+	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
 }
 
 type BootstrapResult struct {
@@ -130,9 +162,12 @@ type BootstrapItem struct {
 }
 
 type HealthResult struct {
+	Total   int                `json:"total"`
 	Checked int                `json:"checked"`
 	Alive   int                `json:"alive"`
 	Dead    int                `json:"dead"`
+	BatchSize int              `json:"batch_size"`
+	Batches int                `json:"batches"`
 	Items   []HealthResultItem `json:"items"`
 }
 
@@ -147,6 +182,7 @@ type HealthResultItem struct {
 	LatencyMS   int64      `json:"latency_ms"`
 	Error       string     `json:"error,omitempty"`
 	CheckedAt   *time.Time `json:"checked_at,omitempty"`
+	Batch       int        `json:"batch,omitempty"`
 }
 
 type UpdateGroupKeyInput struct {
@@ -332,6 +368,7 @@ func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutp
 		AllowedGroupIDs: encodeUintList(input.AllowedGroupIDs),
 		DailyLimit:      maxInt64(0, input.DailyLimit),
 		TotalLimit:      maxInt64(0, input.TotalLimit),
+		CostPerMillion:  math.Max(0, input.CostPerMillion),
 	}
 	if input.ExpiresInDays > 0 {
 		expiresAt := time.Now().AddDate(0, 0, input.ExpiresInDays)
@@ -397,6 +434,9 @@ func (s *Service) UpdateGatewayKey(id uint, input UpdateGatewayKeyInput) (*Gatew
 	if input.TotalLimit != nil {
 		key.TotalLimit = maxInt64(0, *input.TotalLimit)
 	}
+	if input.CostPerMillion != nil {
+		key.CostPerMillion = math.Max(0, *input.CostPerMillion)
+	}
 	if input.ExpiresInDays != nil {
 		days := *input.ExpiresInDays
 		if days > 0 {
@@ -425,6 +465,78 @@ func (s *Service) RevealGatewayKey(id uint) (string, error) {
 		return "", err
 	}
 	return s.cipher.Decrypt(key.KeyCipher)
+}
+
+func (s *Service) GetPublicGatewayKey() (*PublicGatewayKeyOutput, error) {
+	key, err := s.gateway.FindPublic()
+	if err != nil || key == nil {
+		return nil, err
+	}
+	return publicGatewayKeyOutput(key), nil
+}
+
+func (s *Service) ConfigurePublicGatewayKey(input ConfigurePublicGatewayKeyInput) (*PublicGatewayKeyOutput, error) {
+	if input.GatewayKeyID == 0 {
+		return nil, errors.New("请选择一个调用 key")
+	}
+	key, err := s.gateway.FindByID(input.GatewayKeyID)
+	if err != nil {
+		return nil, err
+	}
+	if input.Enabled && !key.Enabled {
+		return nil, errors.New("不能将已停用的调用 key 设置为公益 key")
+	}
+	key.IsPublic = input.Enabled
+	key.PublicName = strings.TrimSpace(input.Name)
+	key.PublicPasswordHint = strings.TrimSpace(input.PasswordHint)
+	if input.Password != nil {
+		if *input.Password == "" {
+			key.PublicPasswordCipher = ""
+		} else {
+			ciphertext, err := s.cipher.Encrypt(*input.Password)
+			if err != nil {
+				return nil, err
+			}
+			key.PublicPasswordCipher = ciphertext
+		}
+	}
+	if !input.Enabled {
+		key.PublicName = ""
+		key.PublicPasswordHint = ""
+		key.PublicPasswordCipher = ""
+		if err := s.gateway.Update(key); err != nil {
+			return nil, err
+		}
+		return publicGatewayKeyOutput(key), nil
+	}
+	if err := s.gateway.SetPublic(key); err != nil {
+		return nil, err
+	}
+	return publicGatewayKeyOutput(key), nil
+}
+
+func (s *Service) RevealPublicGatewayKey(password string) (string, *PublicGatewayKeyOutput, error) {
+	key, err := s.gateway.FindPublic()
+	if err != nil || key == nil || !key.Enabled {
+		return "", nil, errors.New("public key is not available")
+	}
+	if key.ExpiresAt != nil && time.Now().After(*key.ExpiresAt) {
+		return "", nil, errors.New("public key expired")
+	}
+	if key.PublicPasswordCipher != "" {
+		expected, err := s.cipher.Decrypt(key.PublicPasswordCipher)
+		if err != nil {
+			return "", nil, err
+		}
+		if subtle.ConstantTimeCompare([]byte(password), []byte(expected)) != 1 {
+			return "", nil, errors.New("public key password mismatch")
+		}
+	}
+	raw, err := s.cipher.Decrypt(key.KeyCipher)
+	if err != nil {
+		return "", nil, err
+	}
+	return raw, publicGatewayKeyOutput(key), nil
 }
 
 func (s *Service) DeleteGatewayKey(id uint) error {
@@ -724,61 +836,123 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 	return result, nil
 }
 
-func (s *Service) TestAllGroupKeys(_ context.Context) (*HealthResult, error) {
+func (s *Service) TestAllGroupKeys(ctx context.Context, batchSizes ...int) (*HealthResult, error) {
 	list, err := s.groupKeys.List()
 	if err != nil {
 		return nil, err
 	}
 
-	// 关键：测活用独立的、够长的 context，绝不复用调用方（HTTP 请求）的 ctx。
-	// 之前直接用 c.Request.Context()，渠道一多、串行探测耗时超过浏览器/网关的请求超时，
-	// 整个 ctx 被取消，导致"正在测的 + 还没测的"全部 context canceled 被误判为死亡。
-	// 全量测活应当同时发起，而不是按上游数量串行拉长。单个分组最坏为
-	// 两次 8 秒探测加最多 15 秒抖动重试，给整批 45 秒的独立预算即可。
+	batchSize := normalizeHealthProbeBatchSize(0)
+	if len(batchSizes) > 0 {
+		batchSize = normalizeHealthProbeBatchSize(batchSizes[0])
+	}
+	observer := progress.FromContext(ctx)
 	probeCtx := context.Background()
 
-	result := &HealthResult{Items: make([]HealthResultItem, len(list))}
+	result := &HealthResult{
+		BatchSize: batchSize,
+		Items:     make([]HealthResultItem, len(list)),
+	}
 
-	// 所有启用分组同时测活。每个请求都只有 1 token 的流式 "hi"，
-	// 不会因为分组数量多而让后面的分组排队、继承前面的超时。
+	enabled := make([]int, 0, len(list))
+	for i := range list {
+		if !list[i].Enabled {
+			result.Items[i] = healthResultItemFromGroup(&list[i], "disabled")
+			continue
+		}
+		enabled = append(enabled, i)
+	}
+	result.Total = len(enabled)
+	for pos, idx := range enabled {
+		item := healthResultItemFromGroup(&list[idx], "queued")
+		observer.Emit(progress.Event{
+			Stage: progress.StageGatewayHealth,
+			Message: fmt.Sprintf("等待测活：%s / %s", list[idx].ChannelName, list[idx].GroupName),
+			Data: healthProgressPayload("queued", item, 0, batchSize, 0, result.Total),
+			Time: time.Now(),
+			Index: pos + 1,
+			Total: result.Total,
+		})
+	}
+	if len(enabled) > 0 {
+		result.Batches = (len(enabled) + batchSize - 1) / batchSize
+	}
+
+	var completed int64
+	if len(enabled) > 0 {
+		observer.Emit(progress.Event{
+			Stage:   progress.StageGatewayHealth,
+			Message: fmt.Sprintf("开始并发测活：并发 %d 个，共 %d 个分组", minInt(batchSize, len(enabled)), result.Total),
+			Data: map[string]any{
+				"status":     "batch_start",
+				"batch":      1,
+				"batches":    result.Batches,
+				"batch_size": batchSize,
+				"completed":  0,
+				"total":      result.Total,
+			},
+			Time:  time.Now(),
+			Index: 0,
+			Total: result.Total,
+		})
+	}
+
+	type healthJob struct {
+		pos int
+		idx int
+	}
+	workerCount := minInt(batchSize, len(enabled))
+	jobs := make(chan healthJob)
 	var wg sync.WaitGroup
-	jobs := make(chan int)
-	workers := healthProbeConcurrency
-	if workers > len(list) {
-		workers = len(list)
-	}
-	if workers < 1 {
-		workers = 1
-	}
-	for worker := 0; worker < workers; worker++ {
+	for worker := 0; worker < workerCount; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for idx := range jobs {
-				result.Items[idx] = s.testGroupKey(probeCtx, &list[idx])
+			for job := range jobs {
+				batchNo := job.pos/batchSize + 1
+				idx := job.idx
+				checking := healthResultItemFromGroup(&list[idx], "checking")
+				checking.Batch = batchNo
+				observer.Emit(progress.Event{
+					Stage: progress.StageGatewayHealth,
+					Message: fmt.Sprintf("正在测活：%s / %s", list[idx].ChannelName, list[idx].GroupName),
+					Data: healthProgressPayload("checking", checking, batchNo, batchSize, int(atomic.LoadInt64(&completed)), result.Total),
+					Time: time.Now(),
+					Index: int(atomic.LoadInt64(&completed)),
+					Total: result.Total,
+				})
+
+				// Timeout starts here, after this item leaves the queue.
+				// Queued groups must never inherit earlier probes' elapsed time.
+				itemCtx, cancel := context.WithTimeout(probeCtx, 70*time.Second)
+				item := s.testGroupKey(itemCtx, &list[idx])
+				cancel()
+				item.Batch = batchNo
+				result.Items[idx] = item
+				done := int(atomic.AddInt64(&completed, 1))
+				ok := item.Status == "alive"
+				observer.Emit(progress.Event{
+					Stage: progress.StageGatewayHealth,
+					Message: fmt.Sprintf("测活完成：%s / %s %s", item.ChannelName, item.GroupName, statusTextForHealth(item.Status)),
+					OK: &ok,
+					Data: healthProgressPayload(item.Status, item, batchNo, batchSize, done, result.Total),
+					Time: time.Now(),
+					Index: done,
+					Total: result.Total,
+				})
 			}
 		}()
 	}
-	for i := range list {
-		if !list[i].Enabled {
-			result.Items[i] = HealthResultItem{
-				ID:          list[i].ID,
-				ChannelID:   list[i].ChannelID,
-				ChannelName: list[i].ChannelName,
-				GroupRef:    list[i].GroupRef,
-				GroupName:   list[i].GroupName,
-				Ratio:       list[i].Ratio,
-				Status:      "disabled",
-			}
-			continue
-		}
-		jobs <- i
+	for pos, idx := range enabled {
+		jobs <- healthJob{pos: pos, idx: idx}
 	}
 	close(jobs)
 	wg.Wait()
 
-	// 汇总计数（并发写入各自的 slot，这里统一统计，避免竞态）。
 	for i := range result.Items {
+		if result.Items[i].ID == 0 && i < len(list) {
+			result.Items[i] = healthResultItemFromGroup(&list[i], "unknown")
+		}
 		switch result.Items[i].Status {
 		case "alive":
 			result.Checked++
@@ -787,12 +961,80 @@ func (s *Service) TestAllGroupKeys(_ context.Context) (*HealthResult, error) {
 			result.Checked++
 			result.Dead++
 		case "disabled":
-			// 不计入 checked
 		default:
 			result.Checked++
 		}
 	}
+	observer.Emit(progress.Event{
+		Stage: progress.StageDone,
+		Message: fmt.Sprintf("测活完成：%d/%d 存活", result.Alive, result.Checked),
+		OK: ptrBool(true),
+		Data: result,
+		Time: time.Now(),
+		Index: result.Checked,
+		Total: result.Total,
+	})
 	return result, nil
+}
+
+func normalizeHealthProbeBatchSize(size int) int {
+	if size <= 0 {
+		return defaultHealthProbeBatchSize
+	}
+	if size > 100 {
+		return 100
+	}
+	return size
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func healthResultItemFromGroup(key *storage.UpstreamGroupKey, status string) HealthResultItem {
+	if key == nil {
+		return HealthResultItem{Status: status}
+	}
+	return HealthResultItem{
+		ID:          key.ID,
+		ChannelID:   key.ChannelID,
+		ChannelName: key.ChannelName,
+		GroupRef:    key.GroupRef,
+		GroupName:   key.GroupName,
+		Ratio:       key.Ratio,
+		Status:      status,
+	}
+}
+
+func healthProgressPayload(status string, item HealthResultItem, batch, batchSize, completed, total int) map[string]any {
+	return map[string]any{
+		"status": status,
+		"item": item,
+		"batch": batch,
+		"batch_size": batchSize,
+		"completed": completed,
+		"total": total,
+	}
+}
+
+func statusTextForHealth(status string) string {
+	switch status {
+	case "alive":
+		return "存活"
+	case "dead":
+		return "死亡"
+	case "disabled":
+		return "停用"
+	default:
+		return status
+	}
+}
+
+func ptrBool(v bool) *bool {
+	return &v
 }
 
 // TestGroupKey immediately tests one upstream group. It deliberately owns its
@@ -3706,14 +3948,46 @@ func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 		TotalLimit:      key.TotalLimit,
 		TodayTokens:     todayTokens,
 		TotalTokens:     key.TotalTokens,
+		CostPerMillion:  key.CostPerMillion,
+		TodayCost:       key.TodayCost,
+		TotalCost:       key.TotalCost,
 		UsageDate:       key.UsageDate,
 		ExpiresAt:       key.ExpiresAt,
+		IsPublic:        key.IsPublic,
+		PublicName:      key.PublicName,
+		PublicPasswordHint: key.PublicPasswordHint,
 		LastUsedAt:      key.LastUsedAt,
 		LastUsedIP:      key.LastUsedIP,
 		ClientFormat:    normalizeClientFormat(key.ClientFormat),
 		AllowedGroupIDs: decodeUintList(key.AllowedGroupIDs),
 		CreatedAt:       key.CreatedAt,
 		UpdatedAt:       key.UpdatedAt,
+	}
+}
+
+func publicGatewayKeyOutput(key *storage.GatewayKey) *PublicGatewayKeyOutput {
+	if key == nil {
+		return nil
+	}
+	todayTokens := key.TodayTokens
+	if key.UsageDate != "" && key.UsageDate != time.Now().Format("2006-01-02") {
+		todayTokens = 0
+	}
+	name := strings.TrimSpace(key.PublicName)
+	if name == "" {
+		name = key.Name
+	}
+	return &PublicGatewayKeyOutput{
+		ID:               key.ID,
+		Enabled:          key.IsPublic && key.Enabled,
+		Name:             name,
+		KeyPrefix:        key.KeyPrefix,
+		PasswordRequired: key.PublicPasswordCipher != "",
+		PasswordHint:     key.PublicPasswordHint,
+		ExpiresAt:        key.ExpiresAt,
+		TodayTokens:      todayTokens,
+		TotalTokens:      key.TotalTokens,
+		LastUsedAt:       key.LastUsedAt,
 	}
 }
 
@@ -4384,9 +4658,19 @@ func clientIP(r *http.Request) string {
 }
 
 func joinUpstreamURL(siteURL, path string) (string, error) {
+	siteURL = strings.TrimSpace(siteURL)
+	if siteURL == "" {
+		return "", errors.New("upstream base URL is empty")
+	}
 	base, err := url.Parse(strings.TrimRight(siteURL, "/"))
 	if err != nil {
 		return "", err
+	}
+	if base.Scheme != "http" && base.Scheme != "https" {
+		return "", fmt.Errorf("upstream base URL must start with http:// or https://: %s", siteURL)
+	}
+	if base.Host == "" {
+		return "", fmt.Errorf("upstream base URL host is empty: %s", siteURL)
 	}
 	rawQuery := ""
 	if idx := strings.Index(path, "?"); idx >= 0 {
@@ -4396,7 +4680,14 @@ func joinUpstreamURL(siteURL, path string) (string, error) {
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
 	}
-	base.Path = strings.TrimRight(base.Path, "/") + path
+	basePath := strings.TrimRight(base.Path, "/")
+	if strings.HasSuffix(strings.ToLower(basePath), "/v1") && (path == "/v1" || strings.HasPrefix(path, "/v1/")) {
+		path = strings.TrimPrefix(path, "/v1")
+		if path == "" {
+			path = "/"
+		}
+	}
+	base.Path = basePath + path
 	base.RawQuery = rawQuery
 	return base.String(), nil
 }

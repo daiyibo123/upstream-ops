@@ -327,8 +327,15 @@ type GatewayKey struct {
 	TotalLimit      int64      `gorm:"not null;default:0" json:"total_limit"`
 	TodayTokens     int64      `gorm:"not null;default:0" json:"today_tokens"`
 	TotalTokens     int64      `gorm:"not null;default:0" json:"total_tokens"`
+	CostPerMillion  float64    `gorm:"not null;default:0" json:"cost_per_million"`
+	TodayCost       float64    `gorm:"not null;default:0" json:"today_cost"`
+	TotalCost       float64    `gorm:"not null;default:0" json:"total_cost"`
 	UsageDate       string     `gorm:"size:10;index" json:"usage_date,omitempty"`
 	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	IsPublic        bool       `gorm:"not null;default:false;index" json:"is_public"`
+	PublicName      string     `gorm:"size:128" json:"public_name,omitempty"`
+	PublicPasswordCipher string `gorm:"type:text" json:"-"`
+	PublicPasswordHint string   `gorm:"size:256" json:"public_password_hint,omitempty"`
 	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
 	LastUsedIP      string     `gorm:"size:128" json:"last_used_ip,omitempty"`
 	CreatedAt       time.Time  `json:"created_at"`

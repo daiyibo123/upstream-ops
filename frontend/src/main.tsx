@@ -1,6 +1,6 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import { BrowserRouter, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import '@fontsource-variable/geist'
 import '@fontsource-variable/geist-mono'
 import { ThemeProvider } from '@/components/theme-provider'
@@ -17,7 +17,6 @@ import ChannelsPage from '@/app/channels-page'
 import KeysPage from '@/app/keys-page'
 import GatewayPage from '@/app/gateway-page'
 import UsagePage from '@/app/usage-page'
-import NotificationsPage from '@/app/notifications-page'
 import SettingsPage from '@/app/settings-page'
 import '@/app/globals.css'
 
@@ -37,7 +36,7 @@ createRoot(document.getElementById('root')!).render(
                   <Route path="keys" element={<KeysPage />} />
                   <Route path="gateway" element={<GatewayPage />} />
                   <Route path="usage" element={<UsagePage />} />
-                  <Route path="notifications" element={<NotificationsPage />} />
+                  <Route path="notifications" element={<Navigate to="/settings?tab=notifications" replace />} />
                   <Route path="settings" element={<SettingsPage />} />
                 </Route>
               </Routes>

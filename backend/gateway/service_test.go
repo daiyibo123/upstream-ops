@@ -745,7 +745,7 @@ func TestHealthProbeUsesStreamingClaudeRequest(t *testing.T) {
 	}
 }
 
-func TestTestAllGroupKeysStartsAllEnabledGroupsConcurrently(t *testing.T) {
+func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
 	var inFlight int64
 	var maxInFlight int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -779,7 +779,9 @@ func TestTestAllGroupKeysStartsAllEnabledGroupsConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encrypt key: %v", err)
 	}
-	for i := 0; i < 7; i++ {
+	// More than three batches. Queued groups must not inherit timeout from
+	// earlier batches, and each batch should run with controlled parallelism.
+	for i := 0; i < 35; i++ {
 		ref := "group-" + strconv.Itoa(i)
 		if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
 			ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
@@ -793,11 +795,47 @@ func TestTestAllGroupKeysStartsAllEnabledGroupsConcurrently(t *testing.T) {
 	if err != nil {
 		t.Fatalf("test all groups: %v", err)
 	}
-	if result.Alive != 7 {
-		t.Fatalf("alive = %d, want 7; result=%#v", result.Alive, result)
+	if result.Alive != 35 {
+		t.Fatalf("alive = %d, want 35; result=%#v", result.Alive, result)
 	}
-	if got := atomic.LoadInt64(&maxInFlight); got < 7 {
-		t.Fatalf("maximum concurrent upstream requests = %d, want all 7 groups to start together", got)
+	if result.BatchSize != 10 || result.Batches != 4 {
+		t.Fatalf("batch metadata = size %d batches %d, want 10/4", result.BatchSize, result.Batches)
+	}
+	if got := atomic.LoadInt64(&maxInFlight); got > 10 {
+		t.Fatalf("maximum concurrent upstream requests = %d, want at most 10", got)
+	}
+	if got := atomic.LoadInt64(&maxInFlight); got < 10 {
+		t.Fatalf("maximum concurrent upstream requests = %d, want first batch to fill 10 slots", got)
+	}
+	for _, item := range result.Items {
+		if item.Status != "alive" {
+			t.Fatalf("group %d status = %s: %s", item.ID, item.Status, item.Error)
+		}
+		if item.Batch < 1 || item.Batch > 4 {
+			t.Fatalf("group %d batch = %d, want 1..4", item.ID, item.Batch)
+		}
+	}
+}
+
+func TestJoinUpstreamURLNormalizesDirectBaseURL(t *testing.T) {
+	got, err := joinUpstreamURL("https://relay.example.com/v1", "/v1/responses?stream=1")
+	if err != nil {
+		t.Fatalf("join upstream URL: %v", err)
+	}
+	if got != "https://relay.example.com/v1/responses?stream=1" {
+		t.Fatalf("joined URL = %q", got)
+	}
+
+	got, err = joinUpstreamURL("https://relay.example.com/api/v1/", "/v1/chat/completions")
+	if err != nil {
+		t.Fatalf("join upstream URL with nested v1: %v", err)
+	}
+	if got != "https://relay.example.com/api/v1/chat/completions" {
+		t.Fatalf("joined nested URL = %q", got)
+	}
+
+	if _, err := joinUpstreamURL("relay.example.com", "/v1/responses"); err == nil {
+		t.Fatal("expected missing scheme to be rejected")
 	}
 }
 

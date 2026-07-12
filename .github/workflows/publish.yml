@@ -80,7 +80,11 @@ jobs:
           elif [[ -n "${{ inputs.tag }}" ]]; then
             echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           else
-            echo "value=0.0.0-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            APP_VERSION="$(grep -E 'VERSION = ' backend/global/version.go | sed -E 's/.*"([^"]+)".*/\1/')"
+            if [[ -z "${APP_VERSION}" ]]; then
+              APP_VERSION="0.0.0-${GITHUB_SHA::7}"
+            fi
+            echo "value=${APP_VERSION#v}" >> "$GITHUB_OUTPUT"
           fi
 
       # 多架构构建 + 推送。GitHub Actions 内置 cache (type=gha) 把

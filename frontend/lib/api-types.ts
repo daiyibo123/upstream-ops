@@ -205,6 +205,9 @@ export interface DashboardGatewayKey {
   total_limit: number
   today_tokens: number
   total_tokens: number
+  cost_per_million: number
+  today_cost: number
+  total_cost: number
   expires_at?: string | null
   last_used_at?: string | null
 }
@@ -511,6 +514,9 @@ export interface GatewayKey {
   total_limit: number
   today_tokens: number
   total_tokens: number
+  cost_per_million: number
+  today_cost: number
+  total_cost: number
   usage_date?: string
   expires_at?: string | null
   last_used_at?: string | null
@@ -521,6 +527,19 @@ export interface GatewayKey {
 
 export interface GatewayKeyReveal {
   key: string
+}
+
+export interface PublicGatewayKey {
+  id: number
+  enabled: boolean
+  name: string
+  key_prefix: string
+  password_required: boolean
+  password_hint?: string
+  expires_at?: string | null
+  today_tokens: number
+  total_tokens: number
+  last_used_at?: string | null
 }
 
 export interface UpstreamGroupKey {
@@ -603,9 +622,12 @@ export interface GatewayBootstrapResult {
 }
 
 export interface GatewayHealthResult {
+  total: number
   checked: number
   alive: number
   dead: number
+  batch_size: number
+  batches: number
   items: Array<{
     id: number
     channel_id: number
@@ -617,5 +639,6 @@ export interface GatewayHealthResult {
     latency_ms: number
     error?: string
     checked_at?: string | null
+    batch?: number
   }>
 }

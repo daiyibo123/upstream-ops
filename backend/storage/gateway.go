@@ -31,6 +31,32 @@ func (r *GatewayKeys) FindByID(id uint) (*GatewayKey, error) {
 	return &key, nil
 }
 
+func (r *GatewayKeys) FindPublic() (*GatewayKey, error) {
+	var key GatewayKey
+	err := r.db.Where("is_public = ?", true).Order("updated_at DESC").First(&key).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &key, nil
+}
+
+func (r *GatewayKeys) SetPublic(key *GatewayKey) error {
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(&GatewayKey{}).Where("is_public = ?", true).Updates(map[string]any{
+			"is_public":              false,
+			"public_name":            "",
+			"public_password_cipher": "",
+			"public_password_hint":   "",
+		}).Error; err != nil {
+			return err
+		}
+		return tx.Save(key).Error
+	})
+}
+
 func (r *GatewayKeys) FindEnabledByHash(hash string) (*GatewayKey, error) {
 	var key GatewayKey
 	err := r.db.Where("key_hash = ? AND enabled = ?", hash, true).First(&key).Error
@@ -68,6 +94,7 @@ func (r *GatewayKeys) AddUsage(id uint, promptTokens, completionTokens, totalTok
 			if err := tx.Model(&GatewayKey{}).Where("id = ?", id).Updates(map[string]any{
 				"usage_date":   day,
 				"today_tokens": 0,
+				"today_cost":   0,
 			}).Error; err != nil {
 				return err
 			}
@@ -75,9 +102,12 @@ func (r *GatewayKeys) AddUsage(id uint, promptTokens, completionTokens, totalTok
 		if totalTokens <= 0 {
 			totalTokens = promptTokens + completionTokens
 		}
+		cost := float64(totalTokens) * key.CostPerMillion / 1_000_000
 		return tx.Model(&GatewayKey{}).Where("id = ?", id).Updates(map[string]any{
 			"today_tokens": gorm.Expr("today_tokens + ?", totalTokens),
 			"total_tokens": gorm.Expr("total_tokens + ?", totalTokens),
+			"today_cost":   gorm.Expr("today_cost + ?", cost),
+			"total_cost":   gorm.Expr("total_cost + ?", cost),
 			"last_used_at": &now,
 		}).Error
 	})

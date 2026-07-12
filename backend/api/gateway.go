@@ -1,11 +1,14 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	gatewaySvc "github.com/bejix/upstream-ops/backend/gateway"
+	"github.com/bejix/upstream-ops/backend/progress"
 	"github.com/gin-gonic/gin"
 )
 
@@ -21,6 +24,27 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"data": list})
+	})
+	gp.GET("/public-key", func(c *gin.Context) {
+		key, err := d.Gateway.GetPublicGatewayKey()
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": key})
+	})
+	gp.PUT("/public-key", func(c *gin.Context) {
+		var in gatewaySvc.ConfigurePublicGatewayKeyInput
+		if err := c.ShouldBindJSON(&in); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		key, err := d.Gateway.ConfigurePublicGatewayKey(in)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": key})
 	})
 	gp.POST("/keys", func(c *gin.Context) {
 		var in gatewaySvc.CreateGatewayKeyInput
@@ -196,7 +220,18 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		c.JSON(http.StatusOK, gin.H{"data": item})
 	})
 	gp.POST("/group-keys/test", func(c *gin.Context) {
-		result, err := d.Gateway.TestAllGroupKeys(c.Request.Context())
+		batchSize := atoiDefault(c.Query("batch_size"), 0)
+		if wantsSSE(c) {
+			obs := setupSSE(c)
+			ctx := progress.WithObserver(context.Background(), obs)
+			_, err := d.Gateway.TestAllGroupKeys(ctx, batchSize)
+			if err != nil {
+				progress.Fail(ctx, progress.StageError, err.Error())
+				return
+			}
+			return
+		}
+		result, err := d.Gateway.TestAllGroupKeys(context.Background(), batchSize)
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
@@ -224,6 +259,10 @@ func atoiDefault(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+func wantsSSE(c *gin.Context) bool {
+	return c.Query("stream") == "1" || strings.Contains(strings.ToLower(c.GetHeader("Accept")), "text/event-stream")
 }
 
 func registerGatewayProxy(r *gin.Engine, d *Deps) {

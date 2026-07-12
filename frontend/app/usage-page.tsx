@@ -15,18 +15,10 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { apiFetch } from "@/lib/api"
-import { formatRatio, relativeTime } from "@/lib/format"
+import { formatRatio, formatTokens, relativeTime } from "@/lib/format"
 import type { UsageLogsResponse } from "@/lib/api-types"
 
 const PAGE_SIZE = 50
-
-function formatTokens(value?: number | null) {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return "0"
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
-}
 
 export default function UsagePage() {
   const [data, setData] = useState<UsageLogsResponse | null>(null)

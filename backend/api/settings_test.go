@@ -58,9 +58,6 @@ func TestSaveSettingsKeepsAppVersion(t *testing.T) {
 	if got.App.NotificationPrefix != "[New] " {
 		t.Fatalf("notification prefix = %q", got.App.NotificationPrefix)
 	}
-	if !got.App.PublicKey.Enabled || got.App.PublicKey.Name != "公益 Key" || got.App.PublicKey.Key != "sk-public" || got.App.PublicKey.Password != "secret" || got.App.PublicKey.PasswordHint != "hint" || got.App.PublicKey.ExpiresAt != "2099-01-01" {
-		t.Fatalf("public key = %#v", got.App.PublicKey)
-	}
 	if !got.Proxy.Enabled || !got.Proxy.VersionCheckEnabled || got.Proxy.Protocol != "socks5" || got.Proxy.Host != "127.0.0.1" || got.Proxy.Port != 1080 || got.Proxy.Username != "u" || got.Proxy.Password != "p" {
 		t.Fatalf("proxy = %#v", got.Proxy)
 	}

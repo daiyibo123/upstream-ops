@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react"
 import { useNavigate } from "react-router-dom"
-import { useTheme } from "next-themes"
-import { Activity, Github, Home, LogIn, LogOut, RefreshCw, Sun, Moon, Settings } from "lucide-react"
+import { Activity, Github, Home, LogIn, LogOut, RefreshCw, Settings } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { ThemeToggle } from "@/components/theme-toggle"
 import {
   Tooltip,
   TooltipContent,
@@ -19,12 +19,10 @@ import { toast } from "sonner"
 
 export function MonitorHeader() {
   const navigate = useNavigate()
-  const { theme, setTheme } = useTheme()
   const { username, authDisabled, logout } = useAuth()
   const refresh = useTriggerRefresh()
   const channels = useChannels()
   const appVersion = useAppVersion()
-  const [mounted, setMounted] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [checkingVersion, setCheckingVersion] = useState(false)
 
@@ -33,8 +31,6 @@ export function MonitorHeader() {
   const latestVersion = appVersion.data?.latest_version?.trim()
   const updateAvailable = Boolean(appVersion.data?.update_available && latestVersion)
   const updateURL = appVersion.data?.release_url?.trim() || appVersion.data?.repo_url?.trim()
-
-  useEffect(() => setMounted(true), [])
 
   useEffect(() => {
     document.title = appTitle
@@ -231,22 +227,10 @@ export function MonitorHeader() {
           {/* theme toggle */}
           <Tooltip delayDuration={200}>
             <TooltipTrigger asChild>
-              <Button
-                variant="outline"
-                size="icon"
-                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-                className="size-8 border-border bg-background text-foreground hover:bg-muted"
-                aria-label="切换主题"
-              >
-                {mounted && theme === "dark" ? (
-                  <Moon className="size-3.5" />
-                ) : (
-                  <Sun className="size-3.5" />
-                )}
-              </Button>
+              <ThemeToggle className="border-border bg-background text-foreground hover:bg-muted" />
             </TooltipTrigger>
             <TooltipContent side="bottom" className="text-xs">
-              {mounted && theme === "dark" ? "深色模式 · 点击切换浅色" : "浅色模式 · 点击切换深色"}
+              切换主题
             </TooltipContent>
           </Tooltip>
 

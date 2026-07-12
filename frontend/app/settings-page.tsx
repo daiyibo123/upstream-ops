@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
   Bell,
   Clock3,
+  HeartHandshake,
   MonitorCog,
-  KeyRound,
   Network,
   PencilLine,
   Plus,
@@ -32,6 +33,7 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { NotificationFormDialog } from "@/components/monitor/notification-form-dialog";
+import { PublicKeyConfigCard } from "@/components/monitor/public-key-config-card";
 import { apiFetch } from "@/lib/api";
 import { useTriggerRefresh } from "@/lib/refresh-context";
 import type {
@@ -90,6 +92,7 @@ interface ProxyTestResult {
 }
 
 export default function SettingsPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const query = useSystemConfig();
   const notifications = useNotificationChannels();
   const summary = useDashboardSummary();
@@ -111,7 +114,9 @@ export default function SettingsPage() {
   const [busyNotificationID, setBusyNotificationID] = useState<number | null>(
     null,
   );
-  const [activeTab, setActiveTab] = useState("system");
+  const [activeTab, setActiveTab] = useState(
+    searchParams.get("tab") === "notifications" ? "notifications" : "system",
+  );
   const [versionInfo, setVersionInfo] = useState<AppVersion | null>(null);
 
   useEffect(() => {
@@ -125,6 +130,19 @@ export default function SettingsPage() {
       setVersionInfo(appVersion.data);
     }
   }, [appVersion.data]);
+
+  useEffect(() => {
+    const next = searchParams.get("tab") === "notifications" ? "notifications" : "system";
+    setActiveTab(next);
+  }, [searchParams]);
+
+  function handleTabChange(value: string) {
+    const next = value === "notifications" ? "notifications" : "system";
+    setActiveTab(next);
+    setSearchParams(next === "notifications" ? { tab: "notifications" } : {}, {
+      replace: true,
+    });
+  }
 
   if (query.loading && !form) {
     return (
@@ -398,7 +416,7 @@ export default function SettingsPage() {
         </p>
       </header>
 
-      <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">
+      <Tabs value={activeTab} onValueChange={handleTabChange} className="space-y-4">
         <TabsList className="h-auto w-full justify-start rounded-2xl border border-border bg-muted/40 p-1">
           <TabsTrigger value="system" className="px-4 py-2">
             系统设置
@@ -522,149 +540,13 @@ export default function SettingsPage() {
               </SectionCard>
 
               <SectionCard
-                icon={<KeyRound className="size-4 text-cyan-600" />}
+                icon={<HeartHandshake className="size-4 text-emerald-600" />}
                 title="首页公益 Key"
-                description="在公开首页展示一个可复制的公益 Key，可设置复制密码、提示词和到期时间。"
+                description="从已创建的调用 Key 中选择一个展示到首页，可设置复制密码和展示名称。"
+                action={<PublicKeyConfigCard />}
               >
-                <div className="grid gap-4 md:grid-cols-2">
-                  <InlineSwitch
-                    id="public-key-enabled"
-                    label="启用首页公益 Key"
-                    description="开启后公开首页会显示公益 Key 入口，但不会直接暴露明文。"
-                    checked={form.app.publicKey.enabled}
-                    onCheckedChange={(checked) =>
-                      setForm((prev) =>
-                        prev
-                          ? {
-                              ...prev,
-                              app: {
-                                ...prev.app,
-                                publicKey: {
-                                  ...prev.app.publicKey,
-                                  enabled: checked,
-                                },
-                              },
-                            }
-                          : prev,
-                      )
-                    }
-                  />
-                  <NoteBox title="推荐做法">
-                    先在“创建 Key”页面创建一个只绑定低价分组的 Key，再把完整 Key 填到这里。
-                  </NoteBox>
-                </div>
-                <div className="mt-4 grid gap-4 md:grid-cols-2">
-                  <Field label="展示名称" description="公开首页按钮和卡片展示的名称。">
-                    <Input
-                      value={form.app.publicKey.name}
-                      placeholder="公益 OpenAI Key"
-                      onChange={(e) =>
-                        setForm((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                app: {
-                                  ...prev.app,
-                                  publicKey: {
-                                    ...prev.app.publicKey,
-                                    name: e.target.value,
-                                  },
-                                },
-                              }
-                            : prev,
-                        )
-                      }
-                    />
-                  </Field>
-                  <Field label="到期时间" description="留空表示不过期；可填 2026-08-01 或 RFC3339。">
-                    <Input
-                      value={form.app.publicKey.expiresAt}
-                      placeholder="2026-08-01"
-                      onChange={(e) =>
-                        setForm((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                app: {
-                                  ...prev.app,
-                                  publicKey: {
-                                    ...prev.app.publicKey,
-                                    expiresAt: e.target.value,
-                                  },
-                                },
-                              }
-                            : prev,
-                        )
-                      }
-                    />
-                  </Field>
-                  <Field label="公益 Key" description="填写完整网关 Key；公开摘要不会返回明文。">
-                    <Input
-                      type="password"
-                      value={form.app.publicKey.key}
-                      placeholder="sk-..."
-                      onChange={(e) =>
-                        setForm((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                app: {
-                                  ...prev.app,
-                                  publicKey: {
-                                    ...prev.app.publicKey,
-                                    key: e.target.value,
-                                  },
-                                },
-                              }
-                            : prev,
-                        )
-                      }
-                    />
-                  </Field>
-                  <Field label="复制密码" description="留空表示公开页无需密码即可复制。">
-                    <Input
-                      type="password"
-                      value={form.app.publicKey.password}
-                      onChange={(e) =>
-                        setForm((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                app: {
-                                  ...prev.app,
-                                  publicKey: {
-                                    ...prev.app.publicKey,
-                                    password: e.target.value,
-                                  },
-                                },
-                              }
-                            : prev,
-                        )
-                      }
-                    />
-                  </Field>
-                  <Field label="密码提示词" description="公开页密码输入框上方展示。">
-                    <Input
-                      value={form.app.publicKey.passwordHint}
-                      placeholder="例如：关注公告获取复制密码"
-                      onChange={(e) =>
-                        setForm((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                app: {
-                                  ...prev.app,
-                                  publicKey: {
-                                    ...prev.app.publicKey,
-                                    passwordHint: e.target.value,
-                                  },
-                                },
-                              }
-                            : prev,
-                        )
-                      }
-                    />
-                  </Field>
+                <div className="rounded-2xl border border-border bg-background/90 px-4 py-3 text-sm text-muted-foreground">
+                  公益 Key 使用数据库中的调用 Key 配置，首页会读取这里选择的 Key；不会再读取旧的 config.yaml app.publicKey 字段，避免配置入口不一致。
                 </div>
               </SectionCard>
 

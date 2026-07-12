@@ -34,7 +34,8 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { apiFetch } from "@/lib/api"
-import { channelTypeLabel, formatRatio, relativeTime } from "@/lib/format"
+import { channelTypeLabel, formatRatio, formatTokens, relativeTime } from "@/lib/format"
+import { testGatewayHealthStream, type ProgressEvent } from "@/lib/sync-stream"
 import { cn } from "@/lib/utils"
 import type {
   Channel,
@@ -61,6 +62,7 @@ interface KeyDraft {
   selectedGroupIds: number[]
   dailyLimitM: string
   totalLimitM: string
+  costPerMillion: string
   expiresInDays: string
 }
 
@@ -73,6 +75,7 @@ function createDefaultDraft(): KeyDraft {
     selectedGroupIds: [],
     dailyLimitM: "",
     totalLimitM: "",
+    costPerMillion: "",
     expiresInDays: "0",
   }
 }
@@ -86,10 +89,20 @@ interface ManualDraft {
   groupDescription: string
   key: string
   ratio: string
-  clientFormat: "openai" | "claude"
+  clientFormat: "openai" | "claude" | "grok"
   requestMode: UpstreamRequestMode
   charity: boolean
   priority: string
+}
+
+interface HealthProgress {
+  running: boolean
+  completed: number
+  total: number
+  batch: number
+  batches: number
+  batchSize: number
+  message: string
 }
 
 function createDefaultManualDraft(): ManualDraft {
@@ -115,6 +128,10 @@ function statusTone(status: string) {
       return "bg-success/10 text-success border-success/20"
     case "dead":
       return "bg-danger/10 text-danger border-danger/20"
+    case "checking":
+      return "bg-brand/10 text-brand border-brand/20"
+    case "queued":
+      return "bg-warning/10 text-warning border-warning/20"
     case "disabled":
       return "bg-muted text-muted-foreground border-border"
     default:
@@ -132,6 +149,10 @@ function statusText(status: string) {
       return "存活"
     case "dead":
       return "死亡"
+    case "checking":
+      return "测活中"
+    case "queued":
+      return "排队中"
     case "disabled":
       return "停用"
     default:
@@ -212,14 +233,6 @@ function cleanGroupIDs(ids: number[], groups: UpstreamGroupKey[], format: Client
   return Array.from(new Set(ids.filter((id) => allowed.has(id)))).sort((a, b) => a - b)
 }
 
-function formatTokens(value?: number | null) {
-  const n = Number(value ?? 0)
-  if (!Number.isFinite(n) || n <= 0) return "0"
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-  return String(n)
-}
-
 function tokensToMInput(value?: number | null) {
   const n = Number(value ?? 0)
   if (!Number.isFinite(n) || n <= 0) return ""
@@ -252,6 +265,32 @@ async function copyText(text: string) {
   toast.success("已复制")
 }
 
+type HealthItem = GatewayHealthResult["items"][number]
+
+function healthItemFromProgress(ev: ProgressEvent): HealthItem | null {
+  const data = ev.data as { item?: HealthItem } | undefined
+  return data?.item?.id ? data.item : null
+}
+
+function healthProgressFromEvent(ev: ProgressEvent, fallback: HealthProgress): HealthProgress {
+  const data = (ev.data ?? {}) as {
+    completed?: number
+    total?: number
+    batch?: number
+    batches?: number
+    batch_size?: number
+  }
+  return {
+    running: true,
+    completed: Number(data.completed ?? ev.index ?? fallback.completed ?? 0),
+    total: Number(data.total ?? ev.total ?? fallback.total ?? 0),
+    batch: Number(data.batch ?? fallback.batch ?? 0),
+    batches: Number(data.batches ?? fallback.batches ?? 0),
+    batchSize: Number(data.batch_size ?? fallback.batchSize ?? 10),
+    message: ev.message || fallback.message,
+  }
+}
+
 function draftFromKey(key: GatewayKey): KeyDraft {
   const ids = key.allowed_group_ids ?? []
   return {
@@ -262,6 +301,7 @@ function draftFromKey(key: GatewayKey): KeyDraft {
     selectedGroupIds: ids,
     dailyLimitM: tokensToMInput(key.daily_limit),
     totalLimitM: tokensToMInput(key.total_limit),
+    costPerMillion: key.cost_per_million > 0 ? String(key.cost_per_million) : "",
     expiresInDays: "keep",
   }
 }
@@ -273,6 +313,7 @@ function buildGatewayKeyPayload(draft: KeyDraft, includeEnabled: boolean, includ
     allowed_group_ids: draft.scope === "selected" ? draft.selectedGroupIds : [],
     daily_limit: mInputToTokens(draft.dailyLimitM),
     total_limit: mInputToTokens(draft.totalLimitM),
+    cost_per_million: Math.max(0, Number(draft.costPerMillion) || 0),
   }
   if (includeEnabled) {
     payload.enabled = draft.enabled
@@ -382,6 +423,16 @@ function KeyDraftFields({
             inputMode="decimal"
             onChange={(event) => onChange({ ...draft, totalLimitM: sanitizeMInput(event.target.value) })}
             placeholder="留空不限"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="gateway-key-cost">每百万 Token 费用</Label>
+          <Input
+            id="gateway-key-cost"
+            value={draft.costPerMillion}
+            inputMode="decimal"
+            onChange={(event) => onChange({ ...draft, costPerMillion: sanitizeMInput(event.target.value) })}
+            placeholder="留空不计费"
           />
         </div>
         <div className="space-y-1.5">
@@ -512,6 +563,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
   const [createDraft, setCreateDraft] = useState<KeyDraft>(() => createDefaultDraft())
+  const [createOpen, setCreateOpen] = useState(false)
   const [editingKey, setEditingKey] = useState<GatewayKey | null>(null)
   const [editDraft, setEditDraft] = useState<KeyDraft>(() => createDefaultDraft())
   const [editOpen, setEditOpen] = useState(false)
@@ -520,11 +572,23 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [concurrencyDrafts, setConcurrencyDrafts] = useState<Record<number, string>>({})
   const [priorityDrafts, setPriorityDrafts] = useState<Record<number, string>>({})
   const [healthResults, setHealthResults] = useState<Record<number, GatewayHealthResult["items"][number]>>({})
+  const [healthProgress, setHealthProgress] = useState<HealthProgress | null>(null)
   const [manualOpen, setManualOpen] = useState(false)
   const [manualDraft, setManualDraft] = useState<ManualDraft>(() => createDefaultManualDraft())
   const [pageSize, setPageSize] = useState(10)
   const [page, setPage] = useState(1)
   const [groupSearch, setGroupSearch] = useState("")
+  const [keySearch, setKeySearch] = useState("")
+
+  const filteredKeys = useMemo(() => {
+    const query = keySearch.trim().toLowerCase()
+    if (!query) return keys
+    return keys.filter((key) =>
+      [key.name, key.key_prefix, key.client_format]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(query)),
+    )
+  }, [keySearch, keys])
 
   const aliveCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "alive").length, [groups])
   const deadCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "dead").length, [groups])
@@ -628,6 +692,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       }
       toast.success("网关 Key 已创建")
       setCreateDraft(createDefaultDraft())
+      setCreateOpen(false)
       await load()
     } catch (e) {
       const err = e as Error
@@ -728,16 +793,69 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
 
   async function testGroups() {
     setBusy("test")
+    setHealthResults((prev) => {
+      const next = { ...prev }
+      for (const group of groups) {
+        if (group.enabled !== false) {
+          next[group.id] = {
+            id: group.id,
+            channel_id: group.channel_id,
+            channel_name: group.channel_name || "",
+            group_ref: group.group_ref,
+            group_name: group.group_name,
+            ratio: group.ratio,
+            status: "queued",
+            latency_ms: 0,
+          }
+        }
+      }
+      return next
+    })
+    setHealthProgress({
+      running: true,
+      completed: 0,
+      total: displayEnabledCount || totalGroups,
+      batch: 0,
+      batches: 0,
+      batchSize: 30,
+      message: "测活排队中...",
+    })
     try {
-      const res = await apiFetch<GatewayHealthResult>("/gateway/group-keys/test", { method: "POST" })
-      setHealthResults(Object.fromEntries((res.items ?? []).map((item) => [item.id, item])))
-      toast.success(`测活完成：存活 ${res.alive}，死亡 ${res.dead}`)
+      let finalResult: GatewayHealthResult | undefined
+      await testGatewayHealthStream({
+        onEvent: (ev) => {
+          const item = healthItemFromProgress(ev)
+          if (item) {
+            setHealthResults((prev) => ({ ...prev, [item.id]: item }))
+          }
+          setHealthProgress((prev) => healthProgressFromEvent(ev, prev ?? {
+            running: true,
+            completed: 0,
+            total: displayEnabledCount || totalGroups,
+            batch: 0,
+            batches: 0,
+            batchSize: 30,
+            message: "测活中...",
+          }))
+          if (ev.stage === "done" && ev.data && typeof ev.data === "object" && "items" in ev.data) {
+            finalResult = ev.data as GatewayHealthResult
+          }
+        },
+      })
+      const completedResult = finalResult as GatewayHealthResult | undefined
+      if (completedResult) {
+        setHealthResults(Object.fromEntries((completedResult.items ?? []).map((item) => [item.id, item])))
+        toast.success(`测活完成：存活 ${completedResult.alive}，死亡 ${completedResult.dead}`)
+      } else {
+        toast.success("测活完成")
+      }
       await load()
     } catch (e) {
       const err = e as Error
       toast.error(err.message || "一键测活失败")
     } finally {
       setBusy(null)
+      setHealthProgress((prev) => prev ? { ...prev, running: false } : null)
     }
   }
 
@@ -958,35 +1076,49 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               {busy === "test" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
               一键分组测活
             </Button>
+            {healthProgress ? (
+              <div className="w-full rounded-md border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground sm:w-auto">
+                <span className="font-medium text-foreground">
+                  {healthProgress.completed}/{healthProgress.total || totalGroups}
+                </span>
+                <span className="mx-1">·</span>
+                <span>
+                  {healthProgress.batch > 0 && healthProgress.batches > 0
+                    ? `第 ${healthProgress.batch}/${healthProgress.batches} 批，每批 ${healthProgress.batchSize} 个`
+                    : "等待批次开始"}
+                </span>
+                <span className="mx-1">·</span>
+                <span>{healthProgress.running ? healthProgress.message : "测活已结束"}</span>
+              </div>
+            ) : null}
           </div>
         ) : null}
       </CardHeader>
       <CardContent className="space-y-4">
         {showKeys ? (
-        <div className="grid gap-4 rounded-md border border-border bg-muted/10 p-3 xl:grid-cols-[0.95fr_1.35fr]">
-          <div className="space-y-3">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <p className="text-xs font-medium text-foreground">创建调用 Key</p>
-                <p className="mt-1 text-[11px] text-muted-foreground">额度按 M token 设置，留空就是不限量</p>
-              </div>
-              <KeyRound className="size-4 text-brand" />
-            </div>
-            <KeyDraftFields draft={createDraft} groups={groups} onChange={setCreateDraft} />
-            <Button size="sm" className="h-8 w-full gap-1.5 text-xs" disabled={!!busy} onClick={createGatewayKey}>
-              {busy === "create-key" ? <Loader2 className="size-3 animate-spin" /> : <KeyRound className="size-3" />}
-              创建并复制 Key
-            </Button>
-          </div>
-
+        <div className="rounded-md border border-border bg-muted/10 p-3">
           <div className="min-w-0">
             <div className="mb-2 flex items-center justify-between gap-2">
-              <p className="text-xs font-medium text-foreground">已有调用 Key</p>
-              <span className="text-[11px] text-muted-foreground">Bearer Key · {keys.length} 个</span>
+              <div>
+                <p className="text-xs font-medium text-foreground">已有调用 Key</p>
+                <span className="text-[11px] text-muted-foreground">Bearer Key · {filteredKeys.length}/{keys.length} 个</span>
+              </div>
+              <Button size="sm" className="h-8 gap-1.5 text-xs" disabled={!!busy} onClick={() => setCreateOpen(true)}>
+                <KeyRound className="size-3.5" />
+                创建调用 Key
+              </Button>
             </div>
-            {keys.length === 0 ? (
+            <div className="mb-3 max-w-sm">
+              <Input
+                value={keySearch}
+                onChange={(event) => setKeySearch(event.target.value)}
+                placeholder="搜索 Key 名称、前缀或格式"
+                aria-label="搜索调用 Key"
+              />
+            </div>
+            {filteredKeys.length === 0 ? (
               <div className="rounded-md border border-dashed border-border bg-background px-3 py-8 text-center text-xs text-muted-foreground">
-                还没有网关 Key
+                {keys.length === 0 ? "还没有网关 Key" : "没有匹配的调用 Key"}
               </div>
             ) : (
               <div className="overflow-x-auto rounded-md border border-border bg-background">
@@ -1004,7 +1136,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {keys.map((key) => (
+                    {filteredKeys.map((key) => (
                       <TableRow key={key.id}>
                         <TableCell>
                           <div className="min-w-0">
@@ -1027,10 +1159,12 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                         <TableCell className="hidden text-right text-xs md:table-cell">
                           <span className="font-medium text-foreground">{formatTokens(key.today_tokens)}</span>
                           <span className="text-muted-foreground"> / {key.daily_limit > 0 ? formatTokens(key.daily_limit) : "不限"}</span>
+                          <span className="mt-0.5 block text-[10px] text-muted-foreground">费用 {key.today_cost > 0 ? key.today_cost.toFixed(4) : "0"}</span>
                         </TableCell>
                         <TableCell className="hidden text-right text-xs xl:table-cell">
                           <span className="font-medium text-foreground">{formatTokens(key.total_tokens)}</span>
                           <span className="text-muted-foreground"> / {key.total_limit > 0 ? formatTokens(key.total_limit) : "不限"}</span>
+                          <span className="mt-0.5 block text-[10px] text-muted-foreground">累计费用 {key.total_cost > 0 ? key.total_cost.toFixed(4) : "0"}</span>
                         </TableCell>
                         <TableCell className="hidden text-xs text-muted-foreground lg:table-cell">
                           {formatExpiry(key.expires_at)}
@@ -1144,15 +1278,15 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 </TableRow>
               ) : (
                 pagedGroups.map((group) => {
-                  const status = effectiveStatus(group)
-                  const Icon = status === "alive" ? CheckCircle2 : status === "dead" ? XCircle : RefreshCw
                   const latestHealth = healthResults[group.id]
+                  const status = latestHealth?.status ?? effectiveStatus(group)
+                  const Icon = status === "alive" ? CheckCircle2 : status === "dead" ? XCircle : RefreshCw
                   const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
                   return (
                     <TableRow key={group.id} className={cn(group.charity && "bg-success/5")}>
                       <TableCell>
                         <Badge variant="outline" className={cn("gap-1.5", statusTone(status))}>
-                          <Icon className="size-3" />
+                          <Icon className={cn("size-3", status === "checking" && "animate-spin")} />
                           {statusText(status)}
                         </Badge>
                       </TableCell>
@@ -1485,6 +1619,25 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 placeholder="1"
               />
             </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="manual-priority">调度优先级</Label>
+              <Input
+                id="manual-priority"
+                value={manualDraft.priority}
+                inputMode="numeric"
+                onChange={(event) => setManualDraft((prev) => ({ ...prev, priority: event.target.value.replace(/[^\d]/g, "") }))}
+                placeholder="0"
+              />
+            </div>
+            <div className="space-y-1.5 sm:col-span-2">
+              <Label htmlFor="manual-group-desc">分组说明</Label>
+              <Input
+                id="manual-group-desc"
+                value={manualDraft.groupDescription}
+                onChange={(event) => setManualDraft((prev) => ({ ...prev, groupDescription: event.target.value }))}
+                placeholder="可选，例如：手动粘贴的公益线路"
+              />
+            </div>
             <div className="space-y-1.5 sm:col-span-2">
               <Label htmlFor="manual-key">Key *</Label>
               <Input
@@ -1498,7 +1651,13 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               <Label>类型</Label>
               <Select
                 value={manualDraft.clientFormat}
-                onValueChange={(value) => setManualDraft((prev) => ({ ...prev, clientFormat: value === "claude" ? "claude" : "openai" }))}
+                onValueChange={(value) => {
+                  const format = normalizeClientFormat(value)
+                  setManualDraft((prev) => ({
+                    ...prev,
+                    clientFormat: format === "claude" || format === "grok" ? format : "openai",
+                  }))
+                }}
               >
                 <SelectTrigger>
                   <SelectValue />
@@ -1543,6 +1702,33 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             <Button onClick={() => void submitManualGroup()} disabled={!!busy}>
               {busy === "manual-add" ? <Loader2 className="mr-1.5 size-3.5 animate-spin" /> : null}
               添加
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={createOpen}
+        onOpenChange={(open) => {
+          setCreateOpen(open)
+          if (!open) setCreateDraft(createDefaultDraft())
+        }}
+      >
+        <DialogContent className="sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>创建调用 Key</DialogTitle>
+            <DialogDescription>
+              设置调用额度、请求格式，并绑定允许使用的上游分组。创建后只显示一次完整 Key。
+            </DialogDescription>
+          </DialogHeader>
+          <KeyDraftFields draft={createDraft} groups={groups} onChange={setCreateDraft} />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={!!busy}>
+              取消
+            </Button>
+            <Button onClick={() => void createGatewayKey()} disabled={!!busy}>
+              {busy === "create-key" ? <Loader2 className="mr-1.5 size-3.5 animate-spin" /> : <KeyRound className="mr-1.5 size-3.5" />}
+              创建并复制 Key
             </Button>
           </DialogFooter>
         </DialogContent>

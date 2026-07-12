@@ -6,6 +6,7 @@ import { Activity, ArrowRight, Eye, EyeOff, KeyRound, LockKeyhole, ShieldCheck, 
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
+import { ThemeToggle } from "@/components/theme-toggle"
 import { useAuth } from "@/lib/auth-context"
 import { useAppVersion } from "@/lib/queries"
 import type { ApiError } from "@/lib/api"
@@ -66,12 +67,15 @@ export function LoginPage() {
               <span className="block text-xs text-slate-400">AI 调度网关</span>
             </span>
           </Link>
-          <Button asChild variant="ghost" className="text-slate-300 hover:bg-white/10 hover:text-white">
-            <Link to="/">
-              返回首页
-              <ArrowRight className="size-4" />
-            </Link>
-          </Button>
+          <div className="flex items-center gap-2">
+            <ThemeToggle className="border-white/15 bg-white/5 text-white hover:bg-white/10 hover:text-white" />
+            <Button asChild variant="ghost" className="text-slate-300 hover:bg-white/10 hover:text-white">
+              <Link to="/">
+                返回首页
+                <ArrowRight className="size-4" />
+              </Link>
+            </Button>
+          </div>
         </header>
 
         <section className="grid flex-1 items-center gap-10 py-4 lg:grid-cols-[1.1fr_0.9fr] lg:gap-16">
