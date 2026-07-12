@@ -85,7 +85,7 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 				fail(c, http.StatusBadRequest, err)
 				return
 			}
-			items, total, err := d.Gateway.ListGroupKeysPage(pageSize, (page-1)*pageSize)
+			items, total, err := d.Gateway.ListGroupKeysPage(pageSize, (page-1)*pageSize, c.Query("search"))
 			if err != nil {
 				fail(c, http.StatusInternalServerError, err)
 				return

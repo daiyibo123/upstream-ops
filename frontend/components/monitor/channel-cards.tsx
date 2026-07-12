@@ -13,6 +13,7 @@ import {
   MoreHorizontal,
   Pause,
   Pencil,
+  Pin,
   Play,
   Plus,
   RefreshCw,
@@ -518,7 +519,8 @@ export function ChannelCards() {
   const { data: channels, loading: channelsLoading } = useChannels()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState<ChannelPageSize>(9)
-  const pageQuery = useChannelsPage(page, pageSize === "all" ? -1 : pageSize)
+  const [channelSearch, setChannelSearch] = useState("")
+  const pageQuery = useChannelsPage(page, pageSize === "all" ? -1 : pageSize, channelSearch)
   const refresh = useTriggerRefresh()
   const { confirm, dialog: confirmDialog } = useConfirm()
   const [editing, setEditing] = useState<Channel | null>(null)
@@ -556,6 +558,10 @@ export function ChannelCards() {
   useEffect(() => {
     setPage((prev) => Math.min(prev, totalPages))
   }, [totalPages])
+
+  useEffect(() => {
+    setPage(1)
+  }, [channelSearch])
 
   function clearHideTimer(id: number) {
     const t = hideTimers.current.get(id)
@@ -772,6 +778,20 @@ export function ChannelCards() {
         </div>
       </div>
 
+      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="relative min-w-0 flex-1">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={channelSearch}
+            onChange={(event) => setChannelSearch(event.target.value)}
+            className="h-9 pl-8 text-xs"
+            placeholder="搜索渠道、地址、账号或对应上游分组"
+            aria-label="搜索渠道或上游分组"
+          />
+        </div>
+        <p className="text-xs text-muted-foreground">置顶仅影响渠道列表展示，不影响调度成本排序</p>
+      </div>
+
       {pageQuery.loading && !channelPage ? (
         <p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">
           {"加载中…"}
@@ -802,6 +822,12 @@ export function ChannelCards() {
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex min-w-0 flex-wrap items-center gap-2">
                       <span className="truncate text-sm font-semibold text-foreground">{c.name}</span>
+                      {c.pinned ? (
+                        <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-300">
+                          <Pin className="size-2.5 fill-current" />
+                          置顶
+                        </span>
+                      ) : null}
                       <span
                         className={cn(
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset",
@@ -950,6 +976,23 @@ export function ChannelCards() {
                   <SyncProgressStrip state={syncState[c.id] ?? emptySyncState()} />
 
                   <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-2.5">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="gap-1 text-xs text-muted-foreground"
+                      disabled={busyAction === `pin-${c.id}`}
+                      onClick={() =>
+                        withBusy(`pin-${c.id}`, () =>
+                          apiFetch(`/channels/${c.id}`, {
+                            method: "PUT",
+                            body: JSON.stringify({ pinned: !c.pinned }),
+                          }),
+                        )
+                      }
+                    >
+                      <Pin className={cn("size-3", c.pinned && "fill-current text-amber-500")} />
+                      {c.pinned ? "取消置顶" : "置顶"}
+                    </Button>
                     <Button
                       variant="ghost"
                       size="sm"

@@ -208,13 +208,20 @@ func (r *UpstreamGroupKeys) List() ([]UpstreamGroupKey, error) {
 	return list, nil
 }
 
-func (r *UpstreamGroupKeys) ListPage(limit, offset int) ([]UpstreamGroupKey, int64, error) {
+// ListPage filters before pagination so an operator can locate a group even
+// when it belongs to a channel on a later page.
+func (r *UpstreamGroupKeys) ListPage(limit, offset int, search string) ([]UpstreamGroupKey, int64, error) {
+	q := r.db.Model(&UpstreamGroupKey{})
+	if search = strings.TrimSpace(search); search != "" {
+		like := "%" + strings.ToLower(search) + "%"
+		q = q.Where(`LOWER(channel_name) LIKE ? OR LOWER(group_name) LIKE ? OR LOWER(group_desc) LIKE ? OR LOWER(group_ref) LIKE ?`, like, like, like, like)
+	}
 	var total int64
-	if err := r.db.Model(&UpstreamGroupKey{}).Count(&total).Error; err != nil {
+	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var list []UpstreamGroupKey
-	err := orderUpstreamGroupKeys(r.db, "").Limit(limit).Offset(offset).Find(&list).Error
+	err := orderUpstreamGroupKeys(q, "").Limit(limit).Offset(offset).Find(&list).Error
 	if err != nil {
 		return nil, 0, err
 	}
@@ -313,16 +320,17 @@ func (r *UpstreamGroupKeys) ClearCooldown(id uint) error {
 
 func (r *UpstreamGroupKeys) MarkHealthSuccess(id uint, latencyMS int64) error {
 	now := time.Now()
-	if latencyMS < 0 {		latencyMS = 0
+	if latencyMS < 0 {
+		latencyMS = 0
 	}
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
-		"status":           "alive",
-		"failure_count":    0,
-		"last_checked_at":  &now,
-		"last_success_at":  &now,
-		"last_latency_ms":  latencyMS,
-		"disabled_until":   nil,
-		"last_error":       "",
+		"status":          "alive",
+		"failure_count":   0,
+		"last_checked_at": &now,
+		"last_success_at": &now,
+		"last_latency_ms": latencyMS,
+		"disabled_until":  nil,
+		"last_error":      "",
 	}).Error
 }
 

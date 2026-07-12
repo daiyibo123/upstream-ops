@@ -83,7 +83,7 @@ export default function UsagePage() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="overflow-x-auto rounded-md border border-border">
-            <Table className="min-w-[880px]">
+            <Table className="min-w-[980px]">
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-36">时间</TableHead>
@@ -91,6 +91,7 @@ export default function UsagePage() {
                   <TableHead>渠道</TableHead>
                   <TableHead>分组</TableHead>
                   <TableHead>模型</TableHead>
+                  <TableHead>格式</TableHead>
                   <TableHead className="text-right">Token</TableHead>
                   <TableHead className="text-right">倍率</TableHead>
                 </TableRow>
@@ -98,14 +99,14 @@ export default function UsagePage() {
               <TableBody>
                 {loading && !data ? (
                   <TableRow>
-                    <TableCell colSpan={7} className="h-24 text-center text-xs text-muted-foreground">
+                    <TableCell colSpan={8} className="h-24 text-center text-xs text-muted-foreground">
                       <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
                       加载中...
                     </TableCell>
                   </TableRow>
                 ) : rows.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={7} className="h-24 text-center text-xs text-muted-foreground">
+                    <TableCell colSpan={8} className="h-24 text-center text-xs text-muted-foreground">
                       还没有使用记录
                     </TableCell>
                   </TableRow>
@@ -125,8 +126,16 @@ export default function UsagePage() {
                       <TableCell className="max-w-56 truncate text-xs text-foreground" title={log.model || ""}>
                         {log.model || "—"}
                       </TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
+                          {(log.client_format || "openai").toUpperCase()}
+                        </Badge>
+                      </TableCell>
                       <TableCell className="text-right text-xs">
                         <span className="font-medium text-foreground">{formatTokens(log.total_tokens)}</span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                          {formatTokens(log.prompt_tokens)} in / {formatTokens(log.completion_tokens)} out
+                        </span>
                       </TableCell>
                       <TableCell className="text-right font-mono text-xs text-foreground">
                         {log.ratio != null ? formatRatio(log.ratio) : "—"}

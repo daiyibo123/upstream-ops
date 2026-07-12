@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { CheckCircle2, ChevronLeft, ChevronRight, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Trash2, XCircle } from "lucide-react"
+import { CheckCircle2, ChevronLeft, ChevronRight, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, XCircle } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -524,6 +524,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [manualDraft, setManualDraft] = useState<ManualDraft>(() => createDefaultManualDraft())
   const [pageSize, setPageSize] = useState(10)
   const [page, setPage] = useState(1)
+  const [groupSearch, setGroupSearch] = useState("")
 
   const aliveCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "alive").length, [groups])
   const deadCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "dead").length, [groups])
@@ -547,11 +548,17 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     if (page > totalPages) setPage(totalPages)
   }, [page, totalPages])
 
+  useEffect(() => {
+    setPage(1)
+  }, [groupSearch])
+
   async function load() {
     setLoading(true)
     try {
+      const groupQuery = new URLSearchParams({ page: String(currentPage), page_size: String(pageSize) })
+      if (groupSearch.trim()) groupQuery.set("search", groupSearch.trim())
       const groupRequest = serverGroupPaging
-        ? apiFetch<UpstreamGroupKeyPage>(`/gateway/group-keys?page=${currentPage}&page_size=${pageSize}`)
+        ? apiFetch<UpstreamGroupKeyPage>(`/gateway/group-keys?${groupQuery.toString()}`)
         : apiFetch<UpstreamGroupKey[]>("/gateway/group-keys")
       const [keyList, groupResult, channelPage] = await Promise.all([
         apiFetch<GatewayKey[]>("/gateway/keys"),
@@ -592,7 +599,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
 
   useEffect(() => {
     void load()
-  }, [currentPage, pageSize, serverGroupPaging])
+  }, [currentPage, pageSize, serverGroupPaging, groupSearch])
 
   function validateDraft(draft: KeyDraft) {
     if (draft.scope === "selected" && draft.selectedGroupIds.length === 0) {
@@ -875,7 +882,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
     setBusy("manual-add")
     try {
-      await apiFetch<UpstreamGroupKey>("/gateway/group-keys/manual", {
+      const created = await apiFetch<UpstreamGroupKey>("/gateway/group-keys/manual", {
         method: "POST",
         body: JSON.stringify({
           ...(manualDraft.sourceMode === "existing"
@@ -894,7 +901,18 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           priority: Math.max(0, Math.floor(Number(manualDraft.priority) || 0)),
         }),
       })
-      toast.success("手动添加分组成功")
+      try {
+        const health = await apiFetch<GatewayHealthResult["items"][number]>(`/gateway/group-keys/${created.id}/test`, { method: "POST" })
+        setHealthResults((prev) => ({ ...prev, [created.id]: health }))
+        if (health.status === "alive") {
+          toast.success("手动渠道已添加，并已通过 Responses 测活")
+        } else {
+          toast.warning(`手动渠道已保存，但测活未通过：${health.error || "上游无有效响应"}`)
+        }
+      } catch (e) {
+        const err = e as Error
+        toast.warning(`手动渠道已保存，但自动测活失败：${err.message || "请稍后单独测活"}`)
+      }
       setManualOpen(false)
       setManualDraft(createDefaultManualDraft())
       await load()
@@ -1081,6 +1099,17 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
         ) : null}
 
         {showGroups ? (
+        <>
+        <div className="relative max-w-xl">
+          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            value={groupSearch}
+            onChange={(event) => setGroupSearch(event.target.value)}
+            className="h-9 pl-8 text-xs"
+            placeholder="搜索渠道、上游分组、分组说明或分组标识"
+            aria-label="搜索可用渠道对应的上游分组"
+          />
+        </div>
         <div className="overflow-x-auto rounded-md border border-border">
           <Table className="min-w-[1360px]">
             <TableHeader>
@@ -1305,7 +1334,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             </TableBody>
           </Table>
         </div>
-        ) : null}
 
         {showGroups && totalGroups > 0 ? (
           <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/10 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
@@ -1357,6 +1385,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               </Button>
             </div>
           </div>
+        ) : null}
+        </>
         ) : null}
       </CardContent>
 

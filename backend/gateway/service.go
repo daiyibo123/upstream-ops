@@ -34,8 +34,8 @@ const (
 	healthPath       = "/v1/models"
 	responsesPath    = "/v1/responses"
 
-	proxyAttemptTimeout      = 60 * time.Second
-	healthProbeTimeout       = 8 * time.Second
+	proxyAttemptTimeout       = 60 * time.Second
+	healthProbeTimeout        = 8 * time.Second
 	healthProbeRetryJitterMax = 15 * time.Second
 	// streamFirstEventTimeout 是"等上游吐出第一个 SSE 事件"的最长等待。
 	// 这里必须给足：Codex / o1 / o3 这类带 reasoning 的请求，首个可见事件
@@ -43,14 +43,15 @@ const (
 	// 思考时就把上游连接 Close 掉，客户端随即报
 	// "stream closed before response.completed"。放宽到 90s 覆盖绝大多数推理场景；
 	// 真卡死的连接由 preflight 的字节/事件上限和上游自身超时兜底。
-	streamFirstEventTimeout  = 90 * time.Second
+	streamFirstEventTimeout = 90 * time.Second
 	// streamIdleTimeout 是正式转发阶段"两个事件之间"的最长间隔。给得比首事件更宽，
 	// 因为推理模型 token 之间可能有较长停顿；超过则判上游卡死，主动断开让客户端收到错误。
 	streamIdleTimeout        = 120 * time.Second
 	streamPreflightMaxEvents = 16
 	streamPreflightMaxBytes  = 64 << 10
 	// proxyFailureCooldown 是"请求失败后该候选临时不可调度"的固定时长。
-	proxyFailureCooldown = 5 * time.Minute
+	proxyFailureCooldown   = 5 * time.Minute
+	healthProbeConcurrency = 8
 )
 
 type Service struct {
@@ -89,23 +90,23 @@ type UpdateGatewayKeyInput struct {
 }
 
 type GatewayKeyOutput struct {
-	ID          uint       `json:"id"`
-	Name        string     `json:"name"`
-	KeyPrefix   string     `json:"key_prefix"`
-	Key         string     `json:"key,omitempty"`
-	Enabled     bool       `json:"enabled"`
-	ClientFormat string    `json:"client_format"`
-	AllowedGroupIDs []uint `json:"allowed_group_ids,omitempty"`
-	DailyLimit  int64      `json:"daily_limit"`
-	TotalLimit  int64      `json:"total_limit"`
-	TodayTokens int64      `json:"today_tokens"`
-	TotalTokens int64      `json:"total_tokens"`
-	UsageDate   string     `json:"usage_date,omitempty"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
-	LastUsedIP  string     `json:"last_used_ip,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID              uint       `json:"id"`
+	Name            string     `json:"name"`
+	KeyPrefix       string     `json:"key_prefix"`
+	Key             string     `json:"key,omitempty"`
+	Enabled         bool       `json:"enabled"`
+	ClientFormat    string     `json:"client_format"`
+	AllowedGroupIDs []uint     `json:"allowed_group_ids,omitempty"`
+	DailyLimit      int64      `json:"daily_limit"`
+	TotalLimit      int64      `json:"total_limit"`
+	TodayTokens     int64      `json:"today_tokens"`
+	TotalTokens     int64      `json:"total_tokens"`
+	UsageDate       string     `json:"usage_date,omitempty"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+	LastUsedIP      string     `json:"last_used_ip,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type BootstrapResult struct {
@@ -172,10 +173,10 @@ type normalizedRequest struct {
 }
 
 type usageTokens struct {
-	Prompt     int64
-	Completion int64
-	Total      int64
-	ResponseID string
+	Prompt      int64
+	Completion  int64
+	Total       int64
+	ResponseID  string
 	SoftFailure string
 }
 
@@ -290,7 +291,8 @@ func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *stor
 	}
 }
 
-func (s *Service) UpdateUpstreamConfig(cfg config.UpstreamConfig) {	s.configMu.Lock()
+func (s *Service) UpdateUpstreamConfig(cfg config.UpstreamConfig) {
+	s.configMu.Lock()
 	defer s.configMu.Unlock()
 	s.upstream = cfg.WithDefaults()
 }
@@ -321,15 +323,15 @@ func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutp
 		return nil, err
 	}
 	rec := &storage.GatewayKey{
-		Name:       name,
-		KeyPrefix:  visiblePrefix(key),
-		KeyHash:    HashKey(key),
-		KeyCipher:  ciphertext,
-		Enabled:    true,
-		ClientFormat: normalizeClientFormat(input.ClientFormat),
+		Name:            name,
+		KeyPrefix:       visiblePrefix(key),
+		KeyHash:         HashKey(key),
+		KeyCipher:       ciphertext,
+		Enabled:         true,
+		ClientFormat:    normalizeClientFormat(input.ClientFormat),
 		AllowedGroupIDs: encodeUintList(input.AllowedGroupIDs),
-		DailyLimit: maxInt64(0, input.DailyLimit),
-		TotalLimit: maxInt64(0, input.TotalLimit),
+		DailyLimit:      maxInt64(0, input.DailyLimit),
+		TotalLimit:      maxInt64(0, input.TotalLimit),
 	}
 	if input.ExpiresInDays > 0 {
 		expiresAt := time.Now().AddDate(0, 0, input.ExpiresInDays)
@@ -452,8 +454,8 @@ func (s *Service) ListGroupKeys() ([]storage.UpstreamGroupKey, error) {
 	return s.groupKeys.List()
 }
 
-func (s *Service) ListGroupKeysPage(limit, offset int) ([]storage.UpstreamGroupKey, int64, error) {
-	return s.groupKeys.ListPage(limit, offset)
+func (s *Service) ListGroupKeysPage(limit, offset int, search string) ([]storage.UpstreamGroupKey, int64, error) {
+	return s.groupKeys.ListPage(limit, offset, search)
 }
 
 func (s *Service) GroupKeyCounts() (storage.UpstreamGroupKeyCounts, error) {
@@ -506,10 +508,10 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 // ManualGroupKeyInput 是"手动添加渠道分组"的入参：不登录上游，直接填分组名 + key。
 // 用于那些无法登录、只能拿到 key 的上游。
 type ManualGroupKeyInput struct {
-	ChannelID    uint    `json:"channel_id"`    // 绑定到已有渠道（可选，二选一）
-	SiteURL      string  `json:"site_url"`      // 或直接给上游地址，自动建一个 manual 渠道
-	ChannelName  string  `json:"channel_name"`  // manual 渠道名
-	GroupName    string  `json:"group_name"`    // 分组名（必填）
+	ChannelID    uint    `json:"channel_id"`   // 绑定到已有渠道（可选，二选一）
+	SiteURL      string  `json:"site_url"`     // 或直接给上游地址，自动建一个 manual 渠道
+	ChannelName  string  `json:"channel_name"` // manual 渠道名
+	GroupName    string  `json:"group_name"`   // 分组名（必填）
 	GroupDesc    string  `json:"group_description"`
 	Key          string  `json:"key"`           // 上游 key 明文（必填，存库前加密）
 	Ratio        float64 `json:"ratio"`         // 倍率
@@ -733,15 +735,30 @@ func (s *Service) TestAllGroupKeys(_ context.Context) (*HealthResult, error) {
 	// 整个 ctx 被取消，导致"正在测的 + 还没测的"全部 context canceled 被误判为死亡。
 	// 全量测活应当同时发起，而不是按上游数量串行拉长。单个分组最坏为
 	// 两次 8 秒探测加最多 15 秒抖动重试，给整批 45 秒的独立预算即可。
-	budget := 45 * time.Second
-	probeCtx, cancel := context.WithTimeout(context.Background(), budget)
-	defer cancel()
+	probeCtx := context.Background()
 
 	result := &HealthResult{Items: make([]HealthResultItem, len(list))}
 
 	// 所有启用分组同时测活。每个请求都只有 1 token 的流式 "hi"，
 	// 不会因为分组数量多而让后面的分组排队、继承前面的超时。
 	var wg sync.WaitGroup
+	jobs := make(chan int)
+	workers := healthProbeConcurrency
+	if workers > len(list) {
+		workers = len(list)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				result.Items[idx] = s.testGroupKey(probeCtx, &list[idx])
+			}
+		}()
+	}
 	for i := range list {
 		if !list[i].Enabled {
 			result.Items[i] = HealthResultItem{
@@ -755,12 +772,9 @@ func (s *Service) TestAllGroupKeys(_ context.Context) (*HealthResult, error) {
 			}
 			continue
 		}
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			result.Items[idx] = s.testGroupKey(probeCtx, &list[idx])
-		}(i)
+		jobs <- i
 	}
+	close(jobs)
 	wg.Wait()
 
 	// 汇总计数（并发写入各自的 slot，这里统一统计，避免竞态）。
@@ -932,6 +946,13 @@ func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamG
 	if candidate == nil || !request.hasAlt() {
 		return request
 	}
+	// A native Anthropic Messages request is normalized internally so the
+	// gateway can keep one scheduling path.  It must, however, be restored
+	// before it reaches a Claude upstream.  Sending /v1/responses to such an
+	// upstream made health checks pass while real requests failed.
+	if normalizeClientFormat(candidate.ClientFormat) == "claude" && request.ResponseMode == "claude" {
+		return request.alt()
+	}
 	switch normalizeUpstreamRequestMode(candidate.RequestMode) {
 	case "chat":
 		return request.alt()
@@ -943,6 +964,18 @@ func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamG
 // applyUpstreamAuthHeaders sets the common API headers and the headers xAI
 // expects for Grok's OpenAI-compatible endpoints.
 func applyUpstreamAuthHeaders(header http.Header, key *storage.UpstreamGroupKey, upstreamKey string) {
+	if key != nil && normalizeClientFormat(key.ClientFormat) == "claude" {
+		// Anthropic-compatible upstreams require x-api-key rather than the
+		// OpenAI Bearer header.  Keep the protocol version explicit so relays
+		// do not silently select an incompatible default.
+		header.Del("Authorization")
+		header.Set("X-Api-Key", strings.TrimSpace(upstreamKey))
+		if header.Get("Anthropic-Version") == "" {
+			header.Set("Anthropic-Version", "2023-06-01")
+		}
+		header.Set("Content-Type", "application/json")
+		return
+	}
 	header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
 	header.Set("Content-Type", "application/json")
 	if key != nil {
@@ -994,6 +1027,12 @@ func (s *Service) attemptStream(
 		return candOutcome{kind: candSuccess}
 	}
 	errMsg := err.Error()
+	// The downstream client may close a long-running stream at any time.  That
+	// cancels this request context and is not evidence that the upstream is
+	// unhealthy, so it must not trigger the five-minute scheduler cooldown.
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return candOutcome{kind: candFatal, err: err, errMsg: errMsg, markFailure: false}
+	}
 	if fallback, reason, ok := fallbackRequestAfterFailure(normalized, errMsg); ok {
 		start = time.Now()
 		retry, usage, err = s.streamProxyCandidate(ctx, fallback, candidate, w)
@@ -1321,9 +1360,12 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 	}
 	start := time.Now()
 	model, status, body, err := s.discoverHealthProbeModel(ctx, key)
-	if err != nil && !shouldFallbackHealthModelDiscovery(status) {
-		return status, body, time.Since(start).Milliseconds(), err
-	}
+	// /v1/models is only a model-selection hint. Some manual/API-key upstreams
+	// deliberately block it while accepting Responses, so always perform the
+	// real minimal Responses probe instead of marking the channel dead early.
+	_ = status
+	_ = body
+	_ = err
 	if strings.TrimSpace(model) == "" {
 		model = defaultHealthProbeModel(key.ClientFormat)
 	}
@@ -1909,6 +1951,13 @@ func normalizeProxyRequest(r *http.Request, path string, body []byte) (normalize
 		req.Body = converted
 		req.ResponseMode = "claude"
 		req.Stream = stream
+		// Preserve the native request.  It is selected for Claude upstreams by
+		// requestForCandidate; the normalized Responses representation remains
+		// useful for the rest of the gateway pipeline.
+		req.AltPath = path
+		req.AltBody = append([]byte(nil), body...)
+		req.AltMode = "raw"
+		req.AltStream = stream
 	default:
 		req.Stream = requestStream(body)
 	}
@@ -2934,9 +2983,9 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			}
 			textBuf.WriteString(delta)
 			payload, _ := json.Marshal(map[string]any{
-				"type":     "response.output_text.delta",
-				"delta":    delta,
-				"item_id":  id,
+				"type":        "response.output_text.delta",
+				"delta":       delta,
+				"item_id":     id,
 				"response_id": id,
 			})
 			if err := writeSSEEvent(w, sseEvent{Event: "response.output_text.delta", Data: string(payload)}); err != nil {
@@ -3379,7 +3428,6 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 	var best usageTokens
 	needsResponsesCompleted := responseMode == "responses"
 	completedSeen := false
-	sawAnyData := false
 	model := ""
 	respID := ""
 	err := readSSEEvents(buffered, reader, func(event, data string) error {
@@ -3390,7 +3438,6 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 			best = usage
 		}
 		if strings.TrimSpace(data) != "" && data != "[DONE]" {
-			sawAnyData = true
 			if id, m := sseResponseIDAndModel(data); id != "" || m != "" {
 				if id != "" {
 					respID = id
@@ -3407,8 +3454,7 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 		}
 		return writeSSEEvent(w, sseEvent{Event: event, Data: data})
 	})
-	// 关键容错：只要我们已经向客户端转发过内容（sawAnyData）且上游始终没发
-	// response.completed，就补一个合成的终止事件——无论上游是"正常 EOF"还是
+	// 关键容错：上游始终没发 response.completed 时补一个合成终止事件——无论上游是"正常 EOF"还是
 	// "中途断开/超时（err != nil）"。
 	//
 	// 走 Responses 协议的客户端（Codex 直连）必须收到 response.completed 才认为流结束，
@@ -3416,7 +3462,7 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 	// 触发我们主动 Close，都会让 readSSEEvents 返回 err；这些情况下客户端其实已经拿到了
 	// 大部分内容，补一个 completed 让它平滑收尾，远好过把断流错误透传出去。
 	// 这正是 ccswitch 走 chat 路径时靠 [DONE] 达到的效果。
-	if needsResponsesCompleted && sawAnyData && !completedSeen {
+	if needsResponsesCompleted && !completedSeen {
 		if writeErr := writeSyntheticResponseCompleted(w, respID, model, best); writeErr != nil {
 			return best, writeErr
 		}
@@ -3652,22 +3698,22 @@ func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 		todayTokens = 0
 	}
 	return GatewayKeyOutput{
-		ID:          key.ID,
-		Name:        key.Name,
-		KeyPrefix:   key.KeyPrefix,
-		Enabled:     key.Enabled,
-		DailyLimit:  key.DailyLimit,
-		TotalLimit:  key.TotalLimit,
-		TodayTokens: todayTokens,
-		TotalTokens: key.TotalTokens,
-		UsageDate:   key.UsageDate,
-		ExpiresAt:   key.ExpiresAt,
-		LastUsedAt:  key.LastUsedAt,
-		LastUsedIP:  key.LastUsedIP,
-		ClientFormat: normalizeClientFormat(key.ClientFormat),
+		ID:              key.ID,
+		Name:            key.Name,
+		KeyPrefix:       key.KeyPrefix,
+		Enabled:         key.Enabled,
+		DailyLimit:      key.DailyLimit,
+		TotalLimit:      key.TotalLimit,
+		TodayTokens:     todayTokens,
+		TotalTokens:     key.TotalTokens,
+		UsageDate:       key.UsageDate,
+		ExpiresAt:       key.ExpiresAt,
+		LastUsedAt:      key.LastUsedAt,
+		LastUsedIP:      key.LastUsedIP,
+		ClientFormat:    normalizeClientFormat(key.ClientFormat),
 		AllowedGroupIDs: decodeUintList(key.AllowedGroupIDs),
-		CreatedAt:   key.CreatedAt,
-		UpdatedAt:   key.UpdatedAt,
+		CreatedAt:       key.CreatedAt,
+		UpdatedAt:       key.UpdatedAt,
 	}
 }
 

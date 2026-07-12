@@ -600,9 +600,9 @@ func TestOrderCandidatesRespectsManualPriorityBeforeRatio(t *testing.T) {
 func TestOrderCandidatesPrefersCharityBeforePaid(t *testing.T) {
 	// 公益渠道即便倍率更高，也应排在付费渠道前面。
 	candidates := []storage.UpstreamGroupKey{
-		{ID: 1, Status: "alive", Ratio: 0.01, Charity: false},        // 便宜的付费
-		{ID: 2, Status: "alive", Ratio: 0.5, Charity: true},          // 贵一点的公益
-		{ID: 3, Status: "alive", Ratio: 0.2, Charity: true},          // 更便宜的公益
+		{ID: 1, Status: "alive", Ratio: 0.01, Charity: false}, // 便宜的付费
+		{ID: 2, Status: "alive", Ratio: 0.5, Charity: true},   // 贵一点的公益
+		{ID: 3, Status: "alive", Ratio: 0.2, Charity: true},   // 更便宜的公益
 	}
 	ordered := orderCandidates(candidates)
 	// 公益先行：ID3(0.2公益) → ID2(0.5公益) → ID1(付费)

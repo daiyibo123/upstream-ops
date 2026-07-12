@@ -59,27 +59,40 @@ func (r *Channels) FindByID(id uint) (*Channel, error) {
 }
 func (r *Channels) List() ([]Channel, error) {
 	var list []Channel
-	if err := r.db.Order("sort_order DESC").Order("id ASC").Find(&list).Error; err != nil {
+	if err := r.db.Order("pinned DESC").Order("sort_order DESC").Order("id ASC").Find(&list).Error; err != nil {
 		return nil, err
 	}
 	return list, nil
 }
-func (r *Channels) ListPage(page, pageSize int) ([]Channel, int64, error) {
+
+// ListPage returns channels in the operator-friendly order: pinned first,
+// then by the lowest upstream group ratio.  Search is intentionally done in
+// SQL so pagination never hides a matching channel on another page.
+func (r *Channels) ListPage(page, pageSize int, search string) ([]Channel, int64, error) {
 	if page < 1 {
 		page = 1
 	}
 	if pageSize <= 0 && pageSize != -1 {
 		pageSize = 20
 	}
+	q := r.db.Model(&Channel{})
+	if search = strings.TrimSpace(search); search != "" {
+		like := "%" + strings.ToLower(search) + "%"
+		q = q.Where(`
+			LOWER(channels.name) LIKE ? OR LOWER(channels.site_url) LIKE ? OR LOWER(channels.username) LIKE ?
+			OR EXISTS (SELECT 1 FROM upstream_group_keys g WHERE g.channel_id = channels.id AND (LOWER(g.group_name) LIKE ? OR LOWER(g.group_desc) LIKE ?))
+		`, like, like, like, like, like)
+	}
 	var total int64
-	if err := r.db.Model(&Channel{}).Count(&total).Error; err != nil {
+	if err := q.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var list []Channel
 	// 按"该渠道下最低倍率的分组"从低到高排序：越便宜的渠道越靠前。
 	// 没有可用分组（min 为 NULL）的渠道排最后；同价再按 sort_order / id。
 	minRatioSub := "(SELECT MIN(ratio) FROM upstream_group_keys g WHERE g.channel_id = channels.id AND g.key_cipher <> '')"
-	q := r.db.
+	q = q.
+		Order("pinned DESC").
 		Order("CASE WHEN " + minRatioSub + " IS NULL THEN 1 ELSE 0 END ASC").
 		Order(minRatioSub + " ASC").
 		Order("sort_order DESC").

@@ -150,8 +150,10 @@ export function useChannels() {
   return useApi<Channel[]>("/channels")
 }
 
-export function useChannelsPage(page = 1, pageSize = 9) {
-  return useApi<ChannelPage>(`/channels?page=${page}&page_size=${pageSize}`)
+export function useChannelsPage(page = 1, pageSize = 9, search = "") {
+  const q = new URLSearchParams({ page: String(page), page_size: String(pageSize) })
+  if (search.trim()) q.set("search", search.trim())
+  return useApi<ChannelPage>(`/channels?${q.toString()}`)
 }
 
 export function useChannelRates(channelID: number | null) {

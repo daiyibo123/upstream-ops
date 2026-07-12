@@ -37,6 +37,7 @@ export interface Channel {
   site_url: string
   username: string
   sort_order: number
+  pinned: boolean
   user_id?: string
   credential_mode: CredentialMode
   login_extra_params: string
@@ -379,6 +380,11 @@ export interface SystemUpdateResponse {
   status: string
   message: string
   source?: string
+}
+
+export interface SystemUpdateStatus extends SystemUpdateResponse {
+  started_at?: string
+  finished_at?: string
 }
 
 export interface ApplyConfigResult {

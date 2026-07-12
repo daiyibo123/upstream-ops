@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bejix/upstream-ops/backend/config"
@@ -29,7 +30,53 @@ var (
 	githubLatestReleaseURL = defaultGitHubLatestRelease
 	githubTagsURL          = defaultGitHubTagsURL
 	githubReleaseClient    = &http.Client{Timeout: 2 * time.Second}
+	systemUpdateState      = &updateState{Status: "idle"}
 )
+
+type updateState struct {
+	mu         sync.RWMutex
+	Status     string
+	Message    string
+	Source     string
+	StartedAt  time.Time
+	FinishedAt time.Time
+}
+
+type systemUpdateStatus struct {
+	Status     string    `json:"status"`
+	Message    string    `json:"message"`
+	Source     string    `json:"source,omitempty"`
+	StartedAt  time.Time `json:"started_at,omitempty"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+}
+
+func (s *updateState) snapshot() systemUpdateStatus {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return systemUpdateStatus{Status: s.Status, Message: s.Message, Source: s.Source, StartedAt: s.StartedAt, FinishedAt: s.FinishedAt}
+}
+
+func (s *updateState) start(source string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.Status == "updating" {
+		return false
+	}
+	s.Status = "updating"
+	s.Message = "正在下载并验证新版本，完成前不会替换当前容器"
+	s.Source = source
+	s.StartedAt = time.Now()
+	s.FinishedAt = time.Time{}
+	return true
+}
+
+func (s *updateState) finish(status, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Status = status
+	s.Message = message
+	s.FinishedAt = time.Now()
+}
 
 type versionResponse struct {
 	Name            string `json:"name"`
@@ -60,6 +107,7 @@ func registerVersion(api *gin.RouterGroup, d *Deps) {
 	system := api.Group("/system")
 	system.POST("/restart", func(c *gin.Context) { handleSystemRestart(c) })
 	system.POST("/update", func(c *gin.Context) { handleSystemUpdate(c) })
+	system.GET("/update/status", func(c *gin.Context) { c.JSON(http.StatusOK, systemUpdateState.snapshot()) })
 	system.GET("/upgrade-command", func(c *gin.Context) { handleUpgradeCommand(c) })
 }
 
@@ -104,6 +152,10 @@ func handleSystemUpdate(c *gin.Context) {
 		return
 	}
 
+	if !systemUpdateState.start(runner.Source) {
+		c.JSON(http.StatusConflict, gin.H{"status": "updating", "message": "已有更新任务正在执行，请等待完成"})
+		return
+	}
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":  "updating",
 		"message": "已开始拉取更新并重建应用容器，完成后服务会短暂重启。数据目录 ./data 不会被覆盖。",
@@ -113,8 +165,11 @@ func handleSystemUpdate(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
 		if err := runSystemUpdate(ctx, runner); err != nil {
+			systemUpdateState.finish("failed", "更新失败，当前版本未替换："+err.Error())
 			_, _ = fmt.Fprintf(os.Stderr, "system update failed: %v\n", err)
+			return
 		}
+		systemUpdateState.finish("restarting", "新版本已下载并交由更新器重建应用，服务将短暂重启")
 	}()
 }
 

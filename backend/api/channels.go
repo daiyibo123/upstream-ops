@@ -52,6 +52,7 @@ type channelInput struct {
 	SiteURL                string                 `json:"site_url" binding:"required"`
 	Username               string                 `json:"username"`
 	SortOrder              int                    `json:"sort_order"`
+	Pinned                 bool                   `json:"pinned"`
 	Password               string                 `json:"password"`
 	CredentialMode         storage.CredentialMode `json:"credential_mode"`
 	TokenCredential        string                 `json:"token_credential"` // JSON：token 模式时填写
@@ -72,6 +73,7 @@ type channelUpdateInput struct {
 	SiteURL                *string                 `json:"site_url"`
 	Username               *string                 `json:"username"`
 	SortOrder              *int                    `json:"sort_order"`
+	Pinned                 *bool                   `json:"pinned"`
 	Password               *string                 `json:"password"`
 	CredentialMode         *storage.CredentialMode `json:"credential_mode"`
 	TokenCredential        *string                 `json:"token_credential"`
@@ -112,7 +114,7 @@ func listChannels(c *gin.Context, d *Deps) {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		list, total, err := d.Channels.ListPage(page, pageSize)
+		list, total, err := d.Channels.ListPage(page, pageSize, c.Query("search"))
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
@@ -151,6 +153,7 @@ func createChannel(c *gin.Context, d *Deps) {
 		SiteURL:                in.SiteURL,
 		Username:               in.Username,
 		SortOrder:              in.SortOrder,
+		Pinned:                 in.Pinned,
 		Password:               in.Password,
 		CredentialMode:         in.CredentialMode,
 		TokenCredential:        in.TokenCredential,
@@ -250,6 +253,7 @@ func updateChannel(c *gin.Context, d *Deps) {
 		SiteURL:                in.SiteURL,
 		Username:               in.Username,
 		SortOrder:              in.SortOrder,
+		Pinned:                 in.Pinned,
 		Password:               in.Password,
 		CredentialMode:         in.CredentialMode,
 		TokenCredential:        in.TokenCredential,

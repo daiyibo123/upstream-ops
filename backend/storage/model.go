@@ -34,12 +34,15 @@ const (
 //
 // 复用 PasswordCipher 而不新增 TokenCipher 是为了让现有的 GORM 行 / 加密路径 / 迁移流程零变动。
 type Channel struct {
-	ID                     uint           `gorm:"primaryKey" json:"id"`
-	Name                   string         `gorm:"size:128;not null;uniqueIndex" json:"name"`
-	Type                   ChannelType    `gorm:"size:32;not null;index" json:"type"`
-	SiteURL                string         `gorm:"size:512;not null" json:"site_url"`
-	Username               string         `gorm:"size:256;not null" json:"username"`
-	SortOrder              int            `gorm:"not null;default:1" json:"sort_order"`
+	ID        uint        `gorm:"primaryKey" json:"id"`
+	Name      string      `gorm:"size:128;not null;uniqueIndex" json:"name"`
+	Type      ChannelType `gorm:"size:32;not null;index" json:"type"`
+	SiteURL   string      `gorm:"size:512;not null" json:"site_url"`
+	Username  string      `gorm:"size:256;not null" json:"username"`
+	SortOrder int         `gorm:"not null;default:1" json:"sort_order"`
+	// Pinned channels are shown before the normal cost ordering.  This is an
+	// operator-facing preference only; it must never alter gateway scheduling.
+	Pinned                 bool           `gorm:"not null;default:false;index" json:"pinned"`
 	PasswordCipher         string         `gorm:"size:4096;not null" json:"-"`
 	CredentialMode         CredentialMode `gorm:"size:16;not null;default:'password'" json:"credential_mode"`
 	LoginExtraParams       string         `gorm:"type:text" json:"login_extra_params"`
@@ -312,24 +315,24 @@ func (UsageLog) TableName() string { return "usage_logs" }
 // OpenAI-compatible /v1/* gateway. The full key is encrypted for reveal/copy;
 // authentication uses KeyHash so request handling does not need to decrypt.
 type GatewayKey struct {
-	ID          uint       `gorm:"primaryKey" json:"id"`
-	Name        string     `gorm:"size:128;not null" json:"name"`
-	KeyPrefix   string     `gorm:"size:24;not null;index" json:"key_prefix"`
-	KeyHash     string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
-	KeyCipher   string     `gorm:"type:text;not null" json:"-"`
-	Enabled     bool       `gorm:"not null;default:true" json:"enabled"`
-	ClientFormat string    `gorm:"size:16;not null;default:'openai'" json:"client_format"`
-	AllowedGroupIDs string `gorm:"type:text" json:"allowed_group_ids,omitempty"`
-	DailyLimit  int64      `gorm:"not null;default:0" json:"daily_limit"`
-	TotalLimit  int64      `gorm:"not null;default:0" json:"total_limit"`
-	TodayTokens int64      `gorm:"not null;default:0" json:"today_tokens"`
-	TotalTokens int64      `gorm:"not null;default:0" json:"total_tokens"`
-	UsageDate   string     `gorm:"size:10;index" json:"usage_date,omitempty"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
-	LastUsedIP  string     `gorm:"size:128" json:"last_used_ip,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
+	ID              uint       `gorm:"primaryKey" json:"id"`
+	Name            string     `gorm:"size:128;not null" json:"name"`
+	KeyPrefix       string     `gorm:"size:24;not null;index" json:"key_prefix"`
+	KeyHash         string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
+	KeyCipher       string     `gorm:"type:text;not null" json:"-"`
+	Enabled         bool       `gorm:"not null;default:true" json:"enabled"`
+	ClientFormat    string     `gorm:"size:16;not null;default:'openai'" json:"client_format"`
+	AllowedGroupIDs string     `gorm:"type:text" json:"allowed_group_ids,omitempty"`
+	DailyLimit      int64      `gorm:"not null;default:0" json:"daily_limit"`
+	TotalLimit      int64      `gorm:"not null;default:0" json:"total_limit"`
+	TodayTokens     int64      `gorm:"not null;default:0" json:"today_tokens"`
+	TotalTokens     int64      `gorm:"not null;default:0" json:"total_tokens"`
+	UsageDate       string     `gorm:"size:10;index" json:"usage_date,omitempty"`
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+	LastUsedIP      string     `gorm:"size:128" json:"last_used_ip,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 func (GatewayKey) TableName() string { return "gateway_keys" }
@@ -352,37 +355,37 @@ func (GatewayAffinity) TableName() string { return "gateway_affinities" }
 // UpstreamGroupKey stores one upstream API key bound to a channel group. The
 // gateway scheduler chooses among these records by live status and ratio.
 type UpstreamGroupKey struct {
-	ID               uint        `gorm:"primaryKey" json:"id"`
-	ChannelID        uint        `gorm:"not null;uniqueIndex:idx_upstream_group_key;index" json:"channel_id"`
-	ChannelName      string      `gorm:"size:128" json:"channel_name,omitempty"`
-	ChannelType      ChannelType `gorm:"size:32;not null" json:"channel_type"`
-	ClientFormat     string      `gorm:"size:16;not null;default:'openai';index" json:"client_format"`
-	RequestMode      string      `gorm:"size:16;not null;default:'responses';index" json:"request_mode"`
-	GroupRef         string      `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
-	GroupName        string      `gorm:"size:256;not null" json:"group_name"`
-	GroupDesc        string      `gorm:"size:512" json:"group_description,omitempty"`
-	Ratio            float64     `gorm:"not null;default:1" json:"ratio"`
-	Priority         int         `gorm:"not null;default:0;index" json:"priority"`
+	ID           uint        `gorm:"primaryKey" json:"id"`
+	ChannelID    uint        `gorm:"not null;uniqueIndex:idx_upstream_group_key;index" json:"channel_id"`
+	ChannelName  string      `gorm:"size:128" json:"channel_name,omitempty"`
+	ChannelType  ChannelType `gorm:"size:32;not null" json:"channel_type"`
+	ClientFormat string      `gorm:"size:16;not null;default:'openai';index" json:"client_format"`
+	RequestMode  string      `gorm:"size:16;not null;default:'responses';index" json:"request_mode"`
+	GroupRef     string      `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
+	GroupName    string      `gorm:"size:256;not null" json:"group_name"`
+	GroupDesc    string      `gorm:"size:512" json:"group_description,omitempty"`
+	Ratio        float64     `gorm:"not null;default:1" json:"ratio"`
+	Priority     int         `gorm:"not null;default:0;index" json:"priority"`
 	// Charity 标记这个分组是"公益/免费"渠道。调度时公益永远优先于付费，
 	// 公益内部再按倍率高低（这里沿用 ratio 低者优先）排序，公益全挂了才轮到付费。
-	Charity          bool        `gorm:"not null;default:false;index" json:"charity"`
-	UpstreamKeyID    int64       `gorm:"not null;default:0" json:"upstream_key_id"`
-	KeyCipher        string      `gorm:"type:text;not null" json:"-"`
-	Enabled          bool        `gorm:"not null;default:true;index" json:"enabled"`
-	Status           string      `gorm:"size:16;not null;default:'unknown';index" json:"status"`
-	ConcurrencyLimit int         `gorm:"not null;default:0" json:"concurrency_limit"`
-	FailureCount     int         `gorm:"not null;default:0" json:"failure_count"`
-	PromptTokens     int64       `gorm:"not null;default:0" json:"prompt_tokens"`
-	CompletionTokens int64       `gorm:"not null;default:0" json:"completion_tokens"`
-	TotalTokens      int64       `gorm:"not null;default:0" json:"total_tokens"`
-	LastCheckedAt    *time.Time  `json:"last_checked_at,omitempty"`
-	LastLatencyMS    int64       `gorm:"not null;default:0" json:"last_latency_ms"`
-	LastSuccessAt    *time.Time  `json:"last_success_at,omitempty"`
-	LastUsedAt       *time.Time  `json:"last_used_at,omitempty"`
-	DisabledUntil    *time.Time  `json:"disabled_until,omitempty"`
-	LastError        string      `gorm:"type:text" json:"last_error,omitempty"`
-	CreatedAt        time.Time   `json:"created_at"`
-	UpdatedAt        time.Time   `json:"updated_at"`
+	Charity          bool       `gorm:"not null;default:false;index" json:"charity"`
+	UpstreamKeyID    int64      `gorm:"not null;default:0" json:"upstream_key_id"`
+	KeyCipher        string     `gorm:"type:text;not null" json:"-"`
+	Enabled          bool       `gorm:"not null;default:true;index" json:"enabled"`
+	Status           string     `gorm:"size:16;not null;default:'unknown';index" json:"status"`
+	ConcurrencyLimit int        `gorm:"not null;default:0" json:"concurrency_limit"`
+	FailureCount     int        `gorm:"not null;default:0" json:"failure_count"`
+	PromptTokens     int64      `gorm:"not null;default:0" json:"prompt_tokens"`
+	CompletionTokens int64      `gorm:"not null;default:0" json:"completion_tokens"`
+	TotalTokens      int64      `gorm:"not null;default:0" json:"total_tokens"`
+	LastCheckedAt    *time.Time `json:"last_checked_at,omitempty"`
+	LastLatencyMS    int64      `gorm:"not null;default:0" json:"last_latency_ms"`
+	LastSuccessAt    *time.Time `json:"last_success_at,omitempty"`
+	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
+	DisabledUntil    *time.Time `json:"disabled_until,omitempty"`
+	LastError        string     `gorm:"type:text" json:"last_error,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 func (UpstreamGroupKey) TableName() string { return "upstream_group_keys" }

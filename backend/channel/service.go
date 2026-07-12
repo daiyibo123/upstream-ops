@@ -145,6 +145,7 @@ type CreateInput struct {
 	SiteURL                string
 	Username               string
 	SortOrder              int
+	Pinned                 bool
 	Password               string
 	CredentialMode         storage.CredentialMode
 	TokenCredential        string // JSON：password 模式时为空
@@ -187,6 +188,7 @@ func (s *Service) Create(in CreateInput) (*storage.Channel, error) {
 		SiteURL:                in.SiteURL,
 		Username:               in.Username,
 		SortOrder:              normalizeSortOrder(in.SortOrder),
+		Pinned:                 in.Pinned,
 		PasswordCipher:         enc,
 		CredentialMode:         mode,
 		LoginExtraParams:       loginExtraParams,
@@ -216,6 +218,7 @@ type UpdateInput struct {
 	SiteURL                *string
 	Username               *string
 	SortOrder              *int
+	Pinned                 *bool
 	Password               *string
 	CredentialMode         *storage.CredentialMode
 	TokenCredential        *string // JSON
@@ -247,6 +250,9 @@ func (s *Service) Update(id uint, in UpdateInput) (*storage.Channel, error) {
 	}
 	if in.SortOrder != nil {
 		c.SortOrder = normalizeSortOrder(*in.SortOrder)
+	}
+	if in.Pinned != nil {
+		c.Pinned = *in.Pinned
 	}
 
 	// 决定本次更新后的最终凭据模式。

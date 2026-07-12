@@ -3,7 +3,6 @@ import { toast } from "sonner";
 import {
   Bell,
   Clock3,
-  Copy,
   MonitorCog,
   KeyRound,
   Network,
@@ -43,7 +42,7 @@ import type {
   SystemConfig,
   SystemRestartResponse,
   SystemUpdateResponse,
-  UpgradeCommand,
+  SystemUpdateStatus,
 } from "@/lib/api-types";
 import { relativeTime } from "@/lib/format";
 import {
@@ -106,7 +105,6 @@ export default function SettingsPage() {
   const [checkingVersion, setCheckingVersion] = useState(false);
   const [updatingSystem, setUpdatingSystem] = useState(false);
   const [restarting, setRestarting] = useState(false);
-  const [copyingUpgrade, setCopyingUpgrade] = useState(false);
   const [editingNotification, setEditingNotification] =
     useState<NotificationChannel | null>(null);
   const [notificationOpen, setNotificationOpen] = useState(false);
@@ -282,6 +280,7 @@ export default function SettingsPage() {
       const result = await apiFetch<SystemUpdateResponse>("/system/update", {
         method: "POST",
       });
+      void watchSystemUpdate();
       toast.success(result.message || "已开始更新，服务稍后会自动重启");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "触发系统更新失败");
@@ -291,6 +290,7 @@ export default function SettingsPage() {
   }
 
   // 复制服务器上的备用升级命令，方便 updater 侧车不可用时 SSH 执行。
+  /* Legacy SSH upgrade fallback intentionally kept out of the UI.
   async function handleCopyUpgrade() {
     setCopyingUpgrade(true);
     try {
@@ -315,6 +315,27 @@ export default function SettingsPage() {
   }
 
   // 仅重启：进程主动退出，靠 docker compose 的 restart 策略拉起。
+  */
+
+  async function watchSystemUpdate() {
+    for (let attempt = 0; attempt < 150; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      try {
+        const status = await apiFetch<SystemUpdateStatus>("/system/update/status");
+        if (status.status === "failed") {
+          toast.error(status.message || "更新失败，当前版本未替换");
+          return;
+        }
+        if (status.status === "restarting") {
+          toast.success(status.message || "新版本已下载，服务正在重启");
+          return;
+        }
+      } catch {
+        // Successful container replacement temporarily interrupts this request.
+      }
+    }
+  }
+
   async function handleRestart() {
     const ok = await confirm({
       title: "仅重启服务？",
@@ -443,16 +464,6 @@ export default function SettingsPage() {
                       )}
                     />
                     {updatingSystem ? "更新中..." : "立即更新并重启"}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 border-border bg-background px-2 text-xs"
-                    onClick={handleCopyUpgrade}
-                    disabled={copyingUpgrade}
-                  >
-                    <Copy className="size-3.5" />
-                    {copyingUpgrade ? "获取中..." : "复制升级命令"}
                   </Button>
                   <Button
                     size="sm"
