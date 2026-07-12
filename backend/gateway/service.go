@@ -824,7 +824,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		return err
 	}
 	candidates = filterCandidatesForGatewayKey(gatewayKey, candidates)
-	candidates = filterCandidatesForClientFormat(normalized.ResponseMode, candidates)
+	candidates = filterCandidatesForClientFormat(gatewayKey.ClientFormat, normalized.ResponseMode, candidates)
 	if len(candidates) == 0 {
 		return &GatewayError{Status: http.StatusServiceUnavailable, Body: jsonError("no alive upstream group keys available")}
 	}
@@ -937,6 +937,24 @@ func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamG
 		return request.alt()
 	default:
 		return request
+	}
+}
+
+// applyUpstreamAuthHeaders sets the common API headers and the headers xAI
+// expects for Grok's OpenAI-compatible endpoints.
+func applyUpstreamAuthHeaders(header http.Header, key *storage.UpstreamGroupKey, upstreamKey string) {
+	header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
+	header.Set("Content-Type", "application/json")
+	if key != nil {
+		header.Set("X-UpstreamOps-Group", key.GroupName)
+	}
+	if key != nil && normalizeClientFormat(key.ClientFormat) == "grok" {
+		header.Set("Accept", "application/json, text/event-stream")
+		header.Set("User-Agent", "upstream-ops-grok/1.0")
+		return
+	}
+	if header.Get("User-Agent") == "" {
+		header.Set("User-Agent", "codex-cli/0.1 upstream-ops")
 	}
 }
 
@@ -1100,11 +1118,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		return true, usageTokens{}, err
 	}
 	copyRequestHeaders(req.Header, request.Header)
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
-	req.Header.Set("X-UpstreamOps-Group", key.GroupName)
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "codex-cli/0.1 upstream-ops")
-	}
+	applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
 
 	client := s.httpClientFor(ctx, ch)
 	resp, err := client.Do(req)
@@ -1547,10 +1561,14 @@ func selectHealthProbeModel(models []string, format string) string {
 }
 
 func defaultHealthProbeModel(format string) string {
-	if normalizeClientFormat(format) == "claude" {
+	switch normalizeClientFormat(format) {
+	case "claude":
 		return "claude-3-haiku-20240307"
+	case "grok":
+		return "grok-3-mini"
+	default:
+		return "gpt-4o-mini"
 	}
-	return "gpt-4o-mini"
 }
 
 func looksLikeNonGenerativeModel(model string) bool {
@@ -1679,11 +1697,7 @@ func (s *Service) requestCandidate(ctx context.Context, request normalizedReques
 		return 0, nil, nil, err
 	}
 	copyRequestHeaders(req.Header, request.Header)
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
-	req.Header.Set("X-UpstreamOps-Group", key.GroupName)
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "codex-cli/0.1 upstream-ops")
-	}
+	applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
 
 	client := s.httpClientFor(ctx, ch)
 	resp, err := client.Do(req)
@@ -1727,11 +1741,7 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 		return 0, nil, nil, err
 	}
 	copyRequestHeaders(req.Header, request.Header)
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
-	req.Header.Set("X-UpstreamOps-Group", key.GroupName)
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "codex-cli/0.1 upstream-ops")
-	}
+	applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
 
 	client := s.httpClientFor(ctx, ch)
 	resp, err := client.Do(req)
@@ -3675,8 +3685,11 @@ func filterCandidatesForGatewayKey(key *storage.GatewayKey, candidates []storage
 	return out
 }
 
-func filterCandidatesForClientFormat(responseMode string, candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
-	format := normalizeClientFormat(responseMode)
+func filterCandidatesForClientFormat(keyFormat, responseMode string, candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
+	format := normalizeClientFormat(keyFormat)
+	if format == "any" {
+		format = normalizeClientFormat(responseMode)
+	}
 	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
 	for _, candidate := range candidates {
 		candidateFormat := normalizeClientFormat(candidate.ClientFormat)
@@ -3696,6 +3709,10 @@ func validateClientFormat(format string, responseMode string) error {
 		if responseMode != "claude" {
 			return errors.New("this gateway key only accepts Claude Messages requests")
 		}
+	case "grok":
+		if responseMode == "claude" {
+			return errors.New("this gateway key only accepts Grok OpenAI-compatible requests")
+		}
 	default:
 		if responseMode == "claude" {
 			return errors.New("this gateway key only accepts OpenAI-compatible requests")
@@ -3711,6 +3728,11 @@ func inferGroupClientFormat(name, description string) string {
 			return "claude"
 		}
 	}
+	for _, marker := range []string{"grok", "xai", "x.ai"} {
+		if strings.Contains(text, marker) {
+			return "grok"
+		}
+	}
 	return "openai"
 }
 
@@ -3718,6 +3740,8 @@ func normalizeClientFormat(format string) string {
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "claude":
 		return "claude"
+	case "grok", "xai", "x.ai":
+		return "grok"
 	case "any":
 		return "any"
 	default:

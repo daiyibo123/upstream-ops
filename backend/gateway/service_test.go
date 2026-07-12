@@ -801,6 +801,39 @@ func TestTestAllGroupKeysStartsAllEnabledGroupsConcurrently(t *testing.T) {
 	}
 }
 
+func TestGrokFormatIsIsolatedAndUsesXAIHeaders(t *testing.T) {
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, ClientFormat: "openai"},
+		{ID: 2, ClientFormat: "grok"},
+		{ID: 3, ClientFormat: "claude"},
+	}
+	filtered := filterCandidatesForClientFormat("grok", "responses", candidates)
+	if len(filtered) != 1 || filtered[0].ID != 2 {
+		t.Fatalf("Grok key candidates = %#v, want only Grok", filtered)
+	}
+	if err := validateClientFormat("grok", "claude"); err == nil {
+		t.Fatal("Grok key must reject Claude Messages requests")
+	}
+	if got := defaultHealthProbeModel("grok"); got != "grok-3-mini" {
+		t.Fatalf("Grok fallback probe model = %q", got)
+	}
+
+	header := http.Header{}
+	applyUpstreamAuthHeaders(header, &storage.UpstreamGroupKey{GroupName: "grok", ClientFormat: "grok"}, "xai-key")
+	if got := header.Get("Authorization"); got != "Bearer xai-key" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	if got := header.Get("Accept"); got != "application/json, text/event-stream" {
+		t.Fatalf("Accept = %q", got)
+	}
+	if got := header.Get("User-Agent"); got != "upstream-ops-grok/1.0" {
+		t.Fatalf("User-Agent = %q", got)
+	}
+}
+
 func TestProxySkipsCandidateAtConcurrencyLimit(t *testing.T) {
 	var limitedHits int64
 	limitedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

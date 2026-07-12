@@ -57,6 +57,7 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 		}
 		openaiCount := 0
 		claudeCount := 0
+		grokCount := 0
 		for _, group := range gateway.Groups {
 			if !group.Enabled {
 				continue
@@ -64,6 +65,8 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			switch group.ClientFormat {
 			case "claude":
 				claudeCount++
+			case "grok":
+				grokCount++
 			default:
 				openaiCount++
 			}
@@ -76,6 +79,7 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			"available_groups":   gateway.AliveGroups + gateway.UnknownGroups,
 			"openai_groups":      openaiCount,
 			"claude_groups":      claudeCount,
+			"grok_groups":        grokCount,
 			"today_tokens":       gateway.TodayTokens,
 			"total_tokens":       gateway.TotalTokens,
 			"cheapest":           gateway.Cheapest,

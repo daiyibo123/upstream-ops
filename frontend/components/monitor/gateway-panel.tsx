@@ -49,7 +49,7 @@ import type {
 
 const TOKEN_M = 1_000_000
 
-type ClientFormat = "openai" | "claude" | "any"
+type ClientFormat = "openai" | "claude" | "grok" | "any"
 type GroupScope = "all" | "selected"
 type UpstreamRequestMode = "responses" | "chat"
 
@@ -143,6 +143,9 @@ function normalizeClientFormat(value?: string | null): ClientFormat {
   switch ((value ?? "").toLowerCase()) {
     case "claude":
       return "claude"
+    case "grok":
+    case "xai":
+      return "grok"
     case "any":
       return "any"
     default:
@@ -154,6 +157,8 @@ function clientFormatLabel(value?: string | null) {
   switch (normalizeClientFormat(value)) {
     case "claude":
       return "Claude"
+    case "grok":
+      return "Grok"
     case "any":
       return "不限"
     default:
@@ -341,6 +346,7 @@ function KeyDraftFields({
             <SelectContent>
               <SelectItem value="openai">OpenAI</SelectItem>
               <SelectItem value="claude">Claude</SelectItem>
+              <SelectItem value="grok">Grok (xAI)</SelectItem>
               <SelectItem value="any">不限</SelectItem>
             </SelectContent>
           </Select>
@@ -1165,6 +1171,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                           <SelectContent>
                             <SelectItem value="openai">ChatGPT</SelectItem>
                             <SelectItem value="claude">Claude</SelectItem>
+                            <SelectItem value="grok">Grok</SelectItem>
                           </SelectContent>
                         </Select>
                       </TableCell>
@@ -1469,6 +1476,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 <SelectContent>
                   <SelectItem value="openai">OpenAI</SelectItem>
                   <SelectItem value="claude">Claude</SelectItem>
+                  <SelectItem value="grok">Grok (xAI)</SelectItem>
                 </SelectContent>
               </Select>
             </div>

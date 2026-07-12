@@ -41,6 +41,7 @@ interface PublicSummary {
   available_groups: number
   openai_groups: number
   claude_groups: number
+  grok_groups: number
   today_tokens: number
   total_tokens: number
   cheapest?: DashboardGatewayGroup | null
@@ -312,7 +313,7 @@ export default function HomePage() {
                 </div>
               ) : null}
             </div>
-            <div className="mt-4 grid grid-cols-2 gap-2 text-xs text-slate-300">
+            <div className="mt-4 grid grid-cols-3 gap-2 text-xs text-slate-300">
               <div className="rounded-md bg-white/[0.05] p-3">
                 OpenAI 分组
                 <span className="mt-1 block text-lg font-semibold text-white">{summary?.openai_groups ?? 0}</span>
@@ -320,6 +321,10 @@ export default function HomePage() {
               <div className="rounded-md bg-white/[0.05] p-3">
                 Claude 分组
                 <span className="mt-1 block text-lg font-semibold text-white">{summary?.claude_groups ?? 0}</span>
+              </div>
+              <div className="rounded-md bg-white/[0.05] p-3">
+                Grok 分组
+                <span className="mt-1 block text-lg font-semibold text-white">{summary?.grok_groups ?? 0}</span>
               </div>
             </div>
           </Card>

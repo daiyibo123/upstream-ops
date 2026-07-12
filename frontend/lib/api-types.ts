@@ -181,7 +181,7 @@ export interface DashboardGatewayGroup {
   channel_id: number
   channel_name: string
   site_domain?: string
-  client_format?: "openai" | "claude" | "any" | string
+  client_format?: "openai" | "claude" | "grok" | "any" | string
   group_name: string
   ratio: number
   priority: number
@@ -499,7 +499,7 @@ export interface GatewayKey {
   key_prefix: string
   key?: string
   enabled: boolean
-  client_format: "openai" | "claude" | "any" | string
+  client_format: "openai" | "claude" | "grok" | "any" | string
   allowed_group_ids?: number[]
   daily_limit: number
   total_limit: number
@@ -522,7 +522,7 @@ export interface UpstreamGroupKey {
   channel_id: number
   channel_name?: string
   channel_type: ChannelType
-  client_format?: "openai" | "claude" | "any" | string
+  client_format?: "openai" | "claude" | "grok" | "any" | string
   request_mode?: "responses" | "chat" | string
   group_ref: string
   group_name: string
