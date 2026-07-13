@@ -103,8 +103,29 @@ func Register(r *gin.Engine, d *Deps) {
 	registerGatewayProxy(r, d)
 
 	if d.Frontend != nil {
-		registerFrontend(r, d.Frontend)
+		registerFrontend(r, d.Frontend, d)
 	}
+}
+
+func gatewayResponsesAliasPath(method, path string) (string, bool) {
+	if method != http.MethodPost {
+		return "", false
+	}
+	clean := "/" + strings.Trim(strings.TrimSpace(path), "/")
+	switch clean {
+	case "/responses", "/v1/responses":
+		return "/v1/responses", true
+	}
+	parts := strings.Split(strings.Trim(clean, "/"), "/")
+	if len(parts) == 2 && parts[1] == "responses" {
+		switch strings.ToLower(parts[0]) {
+		case "", "api", "assets", "healthz":
+			return "", false
+		default:
+			return "/v1/responses", true
+		}
+	}
+	return "", false
 }
 
 // registerFrontend 把嵌入的前端 dist 挂在根路径，并处理 SPA fallback：
@@ -115,11 +136,15 @@ func Register(r *gin.Engine, d *Deps) {
 //
 // /api/*、/healthz 都已被前面的具体路由占了，不会走到这里。
 // 安全起见仍然做一次前缀拦截，避免任何意外情况下"未鉴权读 index.html"压到 /api 上。
-func registerFrontend(r *gin.Engine, dist fs.FS) {
+func registerFrontend(r *gin.Engine, dist fs.FS, d *Deps) {
 	fileServer := http.FileServer(http.FS(dist))
 
 	r.NoRoute(func(c *gin.Context) {
 		path := c.Request.URL.Path
+		if proxyPath, ok := gatewayResponsesAliasPath(c.Request.Method, path); ok {
+			handleGatewayProxy(c, d, gatewayProxyPathWithQuery(c, proxyPath))
+			return
+		}
 
 		// 永远不让 SPA fallback 覆盖 API / 健康检查路径。
 		if strings.HasPrefix(path, "/api/") || path == "/healthz" {

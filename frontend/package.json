@@ -1,6 +1,6 @@
 {
   "name": "upstream-ops-web",
-  "version": "0.22.1",
+  "version": "0.22.3",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.4.0",

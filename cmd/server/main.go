@@ -125,6 +125,7 @@ func main() {
 	gatewaySvc.UpdateUpstreamConfig(cfg.Upstream)
 	usageLogs := storage.NewUsageLogs(db)
 	gatewaySvc.SetUsageLogs(usageLogs)
+	gatewaySvc.SetIPPolicies(storage.NewIPPolicies(db))
 
 	schedulerFactory := func(scfg config.SchedulerConfig, pcfg config.ProxyConfig) *scheduler.Scheduler {
 		return scheduler.New(scfg, monitorSvc, monLogs, rates, notifies, announcements, usageLogs, captchas, cipher, pcfg, gatewaySvc, log)

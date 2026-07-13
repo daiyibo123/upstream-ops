@@ -223,6 +223,7 @@ export default function HomePage() {
   const [revealedPublicKey, setRevealedPublicKey] = useState("")
   const [publicKeyVisible, setPublicKeyVisible] = useState(false)
   const [publicKeyIntent, setPublicKeyIntent] = useState<"view" | "copy">("view")
+  const [publicPasswordVisible, setPublicPasswordVisible] = useState(false)
   const appTitle = summary?.title?.trim() || "UpstreamOps"
 
   useEffect(() => {
@@ -245,11 +246,11 @@ export default function HomePage() {
       : revealedPublicKey
         ? maskPublicKey(revealedPublicKey)
         : publicKey?.password_required
-          ? "输入密码后显示或复制"
+          ? publicKeyMaskedText || "******"
           : publicKeyMaskedText || "******"
     : publicKeyExpired
       ? "Key 已过期"
-      : "暂无可用"
+      : "暂无可用的公益 Key"
 
   async function fetchPublicKey(password = "") {
     const res = await apiFetch<PublicKeyReveal>("/public/key/reveal", {
@@ -362,12 +363,18 @@ export default function HomePage() {
         <section className="grid flex-1 gap-6 py-6 sm:py-8 lg:grid-cols-[0.92fr_1.08fr] lg:items-start">
           <aside className="space-y-4 lg:sticky lg:top-5">
             <Card
-              className={cn("app-card p-4", publicKeyAvailable && "border-success/30", publicKeyExpired && "border-danger/30")}
+              className={cn(
+                "app-card p-4 shadow-lg shadow-success/5",
+                publicKeyAvailable && "border-success/40 bg-success/5 ring-1 ring-success/15",
+                publicKeyExpired && "border-danger/30",
+              )}
             >
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
-                    <HeartHandshake className="size-4 text-success" />
+                    <span className="flex size-9 shrink-0 items-center justify-center rounded-xl bg-success/15 text-success ring-1 ring-success/25">
+                      <HeartHandshake className="size-5" />
+                    </span>
                     <p className="truncate text-base font-semibold text-foreground">{publicKey?.name || "公益 Key"}</p>
                   </div>
                   <p className="mt-1 text-xs text-muted-foreground">
@@ -392,10 +399,10 @@ export default function HomePage() {
                 </Badge>
               </div>
 
-              <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row">
                 <div
                   className={cn(
-                    "flex min-w-0 flex-1 items-center gap-2 rounded-md border bg-background/80 px-3 py-2",
+                    "flex min-w-0 flex-1 items-center gap-2 rounded-xl border bg-background/90 px-4 py-3",
                     publicKeyExpired ? "border-danger/30" : "border-border",
                   )}
                 >
@@ -415,13 +422,12 @@ export default function HomePage() {
                   </Button>
                 </div>
                 <Button
-                  variant="outline"
-                  className="sm:w-24"
+                  className="h-14 gap-2 rounded-xl border border-success/40 bg-success px-6 text-base font-semibold text-success-foreground shadow-lg shadow-success/25 ring-2 ring-success/20 hover:bg-success/90 sm:w-48"
                   disabled={copyingPublicKey}
                   onClick={() => void handlePublicKeyCopy()}
                 >
-                  <Copy className="size-4" />
-                  复制
+                  <Copy className="size-6" />
+                  复制公益 Key
                 </Button>
               </div>
             </Card>
@@ -489,17 +495,29 @@ export default function HomePage() {
           </DialogHeader>
           <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-4">
             <Label htmlFor="public-key-password">复制密码</Label>
-            <Input
-              id="public-key-password"
-              type="password"
-              className="h-11 text-base sm:text-sm"
-              placeholder="请输入复制密码"
-              value={publicKeyPassword}
-              onChange={(event) => setPublicKeyPassword(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") void revealPublicKey(publicKeyPassword, publicKeyIntent === "copy")
-              }}
-            />
+            <div className="relative">
+              <Input
+                id="public-key-password"
+                type={publicPasswordVisible ? "text" : "password"}
+                className="h-11 pr-11 text-base sm:text-sm"
+                placeholder="请输入复制密码"
+                value={publicKeyPassword}
+                onChange={(event) => setPublicKeyPassword(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") void revealPublicKey(publicKeyPassword, publicKeyIntent === "copy")
+                }}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className="absolute right-1.5 top-1/2 size-8 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                onClick={() => setPublicPasswordVisible((value) => !value)}
+                title={publicPasswordVisible ? "隐藏" : "显示"}
+              >
+                {publicPasswordVisible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+              </Button>
+            </div>
             <p className="text-xs leading-5 text-muted-foreground">
               密码只用于本次{publicKeyIntent === "copy" ? "复制" : "查看"}，验证通过后会获取完整公益 Key。
             </p>

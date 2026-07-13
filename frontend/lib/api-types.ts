@@ -526,6 +526,7 @@ export interface GatewayKey {
   key?: string
   enabled: boolean
   client_format: "openai" | "claude" | "grok" | "any" | string
+  allowed_group_scope?: "all" | "selected" | "charity" | "normal" | string
   allowed_group_ids?: number[]
   daily_limit: number
   total_limit: number
@@ -660,6 +661,7 @@ export interface UsageLog {
   id: number
   gateway_key_id?: number
   gateway_key_name?: string
+  request_ip?: string
   channel_id?: number
   channel_name?: string
   group_name?: string
@@ -670,7 +672,20 @@ export interface UsageLog {
   total_tokens: number
   cached_tokens: number
   ratio?: number
+  status?: string
+  first_token_ms?: number
+  duration_ms?: number
   created_at: string
+}
+
+export interface IPPolicy {
+  id: number
+  ip: string
+  blocked: boolean
+  public_concurrency_exempt: boolean
+  note?: string
+  created_at: string
+  updated_at: string
 }
 
 export interface UsageLogsResponse {
@@ -684,6 +699,7 @@ export interface GatewayBootstrapResult {
   updated: number
   skipped: number
   failed: number
+  removed?: number
   items: Array<{
     channel_id: number
     channel_name: string
@@ -691,6 +707,7 @@ export interface GatewayBootstrapResult {
     group_name: string
     ratio: number
     created: boolean
+    removed?: boolean
     error?: string
   }>
 }

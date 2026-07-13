@@ -431,30 +431,33 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			LastUsedAt:        key.LastUsedAt,
 		})
 	}
-	stat.TotalGroups = len(groups)
 	for _, group := range groups {
 		status := group.Status
 		if !group.Enabled {
 			status = "disabled"
 		}
-		switch status {
-		case "disabled":
-		case "alive":
-			stat.AliveGroups++
-		case "dead":
-			stat.DeadGroups++
-		case "zero_balance":
-			stat.ZeroBalanceGroups++
-		case "rate_limited":
-			stat.RateLimitedGroups++
-		case "forbidden":
-			stat.ForbiddenGroups++
-		case "non_generation":
-			stat.NonGenerationGroups++
-		case "auth_failed", "timeout", "network_error", "upstream_error", "model_error", "invalid_request", "server_error":
-			stat.ErrorGroups++
-		default:
-			stat.UnknownGroups++
+		isOpenAI := dashboardGroupIsOpenAIResponses(group.ClientFormat, group.RequestMode)
+		if isOpenAI {
+			stat.TotalGroups++
+			switch status {
+			case "disabled":
+			case "alive":
+				stat.AliveGroups++
+			case "dead":
+				stat.DeadGroups++
+			case "zero_balance":
+				stat.ZeroBalanceGroups++
+			case "rate_limited":
+				stat.RateLimitedGroups++
+			case "forbidden":
+				stat.ForbiddenGroups++
+			case "non_generation":
+				stat.NonGenerationGroups++
+			case "auth_failed", "timeout", "network_error", "upstream_error", "model_error", "invalid_request", "server_error":
+				stat.ErrorGroups++
+			default:
+				stat.UnknownGroups++
+			}
 		}
 		stat.PromptTokens += group.PromptTokens
 		stat.CompletionTokens += group.CompletionTokens
@@ -479,7 +482,7 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			LastError:             group.LastError,
 		}
 		stat.Groups = append(stat.Groups, g)
-		if group.Enabled && (group.Status == "alive" || group.Status == "unknown") {
+		if isOpenAI && group.Enabled && (group.Status == "alive" || group.Status == "unknown") {
 			if stat.Cheapest == nil || group.Ratio < stat.Cheapest.Ratio {
 				copy := g
 				stat.Cheapest = &copy
@@ -490,6 +493,16 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 		return dashboardGroupLess(stat.Groups[i], stat.Groups[j])
 	})
 	return stat
+}
+
+func dashboardGroupIsOpenAIResponses(format, requestMode string) bool {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "", "openai", "any":
+		mode := strings.ToLower(strings.TrimSpace(requestMode))
+		return mode == "" || mode == "responses"
+	default:
+		return false
+	}
 }
 
 func channelSiteDomain(raw string) string {

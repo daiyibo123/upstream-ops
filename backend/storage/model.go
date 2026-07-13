@@ -297,20 +297,39 @@ type UsageLog struct {
 	ID               uint      `gorm:"primaryKey" json:"id"`
 	GatewayKeyID     uint      `gorm:"index" json:"gateway_key_id"`
 	GatewayKeyName   string    `gorm:"size:128" json:"gateway_key_name,omitempty"`
+	RequestIP        string    `gorm:"size:64;index" json:"request_ip,omitempty"`
 	ChannelID        uint      `gorm:"index" json:"channel_id"`
 	ChannelName      string    `gorm:"size:128" json:"channel_name,omitempty"`
 	GroupName        string    `gorm:"size:128" json:"group_name,omitempty"`
-	Model            string    `gorm:"size:128;index" json:"model,omitempty"`
+	Model            string    `gorm:"size:256;index" json:"model,omitempty"`
 	ClientFormat     string    `gorm:"size:16" json:"client_format,omitempty"`
 	PromptTokens     int64     `json:"prompt_tokens"`
 	CompletionTokens int64     `json:"completion_tokens"`
 	TotalTokens      int64     `json:"total_tokens"`
 	CachedTokens     int64     `gorm:"not null;default:0" json:"cached_tokens"`
 	Ratio            float64   `json:"ratio"`
+	Status           string    `gorm:"size:32;not null;default:'success';index" json:"status"`
+	FirstTokenMS     int64     `gorm:"not null;default:0" json:"first_token_ms"`
+	DurationMS       int64     `gorm:"not null;default:0" json:"duration_ms"`
 	CreatedAt        time.Time `gorm:"index" json:"created_at"`
 }
 
 func (UsageLog) TableName() string { return "usage_logs" }
+
+// IPPolicy is a global abuse-control rule for gateway callers. The exemption
+// only applies to the public-key per-IP concurrency guard; blacklisting always
+// takes precedence.
+type IPPolicy struct {
+	ID                      uint      `gorm:"primaryKey" json:"id"`
+	IP                      string    `gorm:"size:64;not null;uniqueIndex" json:"ip"`
+	Blocked                 bool      `gorm:"not null;default:false;index" json:"blocked"`
+	PublicConcurrencyExempt bool      `gorm:"not null;default:false" json:"public_concurrency_exempt"`
+	Note                    string    `gorm:"size:256" json:"note,omitempty"`
+	CreatedAt               time.Time `json:"created_at"`
+	UpdatedAt               time.Time `json:"updated_at"`
+}
+
+func (IPPolicy) TableName() string { return "ip_policies" }
 
 const (
 	DefaultInputPricePerMillion  = 5.0
@@ -328,6 +347,7 @@ type GatewayKey struct {
 	KeyCipher            string     `gorm:"type:text;not null" json:"-"`
 	Enabled              bool       `gorm:"not null;default:true" json:"enabled"`
 	ClientFormat         string     `gorm:"size:16;not null;default:'openai'" json:"client_format"`
+	AllowedGroupScope    string     `gorm:"size:16;not null;default:'all';index" json:"allowed_group_scope"`
 	AllowedGroupIDs      string     `gorm:"type:text" json:"allowed_group_ids,omitempty"`
 	DailyLimit           int64      `gorm:"not null;default:0" json:"daily_limit"`
 	TotalLimit           int64      `gorm:"not null;default:0" json:"total_limit"`

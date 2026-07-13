@@ -279,7 +279,7 @@ http://localhost:8080
 首次升级到带有更新侧车的版本时，请在服务器项目目录执行下面的命令。它会保留 `.env` 与 `data/`，并同时启动 `app` 和 `watchtower`；之后页面内的「立即更新并重启」即可使用。
 
 ```bash
-git fetch --tags && git checkout v0.22.1 && sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=latest/' .env && docker compose pull && docker compose up -d
+git fetch --tags && git checkout v0.22.3 && sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=latest/' .env && docker compose pull && docker compose up -d
 ```
 
 如果页面提示更新侧车未配置，请执行上面的命令后刷新页面；不要只执行 `docker compose up -d app`，否则旧的 Compose 配置不会创建 `watchtower` 服务。

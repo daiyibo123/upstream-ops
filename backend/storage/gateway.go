@@ -69,7 +69,26 @@ func (r *GatewayKeys) FindEnabledByHash(hash string) (*GatewayKey, error) {
 	return &key, nil
 }
 
+func (r *GatewayKeys) FindByHash(hash string) (*GatewayKey, error) {
+	var key GatewayKey
+	err := r.db.Where("key_hash = ?", hash).First(&key).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &key, nil
+}
+
 func (r *GatewayKeys) Update(key *GatewayKey) error { return r.db.Save(key).Error }
+
+func (r *GatewayKeys) ResetPublicVerification(id uint) error {
+	return r.db.Model(&GatewayKey{}).Where("id = ?", id).UpdateColumns(map[string]any{
+		"public_password_cipher": "",
+		"public_password_hint":   "",
+	}).Error
+}
 
 func (r *GatewayKeys) Disable(id uint) error {
 	return r.db.Model(&GatewayKey{}).Where("id = ?", id).Update("enabled", false).Error
@@ -335,19 +354,35 @@ func (r *UpstreamGroupKeys) ListByChannel(channelID uint) ([]UpstreamGroupKey, e
 }
 
 func (r *UpstreamGroupKeys) ListCandidates(now time.Time) ([]UpstreamGroupKey, error) {
+	if err := r.reactivateExpiredCooldowns(now); err != nil {
+		return nil, err
+	}
 	var list []UpstreamGroupKey
 	q := r.db.
 		Joins("JOIN channels ON channels.id = upstream_group_keys.channel_id").
 		Where("upstream_group_keys.key_cipher <> ''").
 		Where("upstream_group_keys.enabled = ?", true).
 		Where("channels.monitor_enabled = ?", true).
-		Where("(disabled_until IS NULL OR disabled_until <= ?)", now).
 		Where("upstream_group_keys.status <> ?", "disabled")
 	q = orderUpstreamGroupKeys(q, "upstream_group_keys")
 	if err := q.Find(&list).Error; err != nil {
 		return nil, err
 	}
 	return list, nil
+}
+
+func (r *UpstreamGroupKeys) reactivateExpiredCooldowns(now time.Time) error {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return r.db.Model(&UpstreamGroupKey{}).
+		Where("enabled = ?", true).
+		Where("status IN ?", []string{"rate_limited", "dead", "server_error", "timeout", "network_error", "upstream_error"}).
+		Where("disabled_until IS NOT NULL AND disabled_until <= ?", now).
+		Updates(map[string]any{
+			"status":         "unknown",
+			"disabled_until": nil,
+		}).Error
 }
 
 func (r *UpstreamGroupKeys) FindByID(id uint) (*UpstreamGroupKey, error) {
@@ -478,6 +513,20 @@ func (r *UpstreamGroupKeys) MarkFailure(id uint, errMsg string, disabledUntil ti
 	}).Error
 }
 
+func (r *UpstreamGroupKeys) MarkProxyFailureStatus(id uint, status string, errMsg string, disabledUntil *time.Time) error {
+	now := time.Now()
+	if strings.TrimSpace(status) == "" {
+		status = "dead"
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+		"status":          status,
+		"failure_count":   gorm.Expr("failure_count + ?", 1),
+		"last_checked_at": &now,
+		"disabled_until":  disabledUntil,
+		"last_error":      errMsg,
+	}).Error
+}
+
 func (r *UpstreamGroupKeys) MarkHealthFailure(id uint, errMsg string, disabledUntil time.Time, latencyMS int64) error {
 	return r.MarkHealthFailureStatus(id, "dead", errMsg, disabledUntil, latencyMS)
 }
@@ -506,6 +555,43 @@ func (r *UpstreamGroupKeys) Delete(id uint) error {
 
 // UsageLogs 存取网关请求使用记录。
 type UsageLogs struct{ db *gorm.DB }
+
+type IPPolicies struct{ db *gorm.DB }
+
+func NewIPPolicies(db *gorm.DB) *IPPolicies { return &IPPolicies{db: db} }
+
+func (r *IPPolicies) List() ([]IPPolicy, error) {
+	var items []IPPolicy
+	err := r.db.Order("blocked DESC").Order("updated_at DESC").Find(&items).Error
+	return items, err
+}
+
+func (r *IPPolicies) Find(ip string) (*IPPolicy, error) {
+	var item IPPolicy
+	err := r.db.Where("ip = ?", strings.TrimSpace(ip)).First(&item).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r *IPPolicies) Upsert(item *IPPolicy) error {
+	if item == nil || strings.TrimSpace(item.IP) == "" {
+		return errors.New("IP is required")
+	}
+	item.IP = strings.TrimSpace(item.IP)
+	return r.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "ip"}},
+		DoUpdates: clause.AssignmentColumns([]string{"blocked", "public_concurrency_exempt", "note", "updated_at"}),
+	}).Create(item).Error
+}
+
+func (r *IPPolicies) Delete(ip string) error {
+	return r.db.Where("ip = ?", strings.TrimSpace(ip)).Delete(&IPPolicy{}).Error
+}
 
 func NewUsageLogs(db *gorm.DB) *UsageLogs { return &UsageLogs{db: db} }
 

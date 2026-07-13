@@ -8,6 +8,24 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, and the Dockerfile version argument before its matching Git tag is pushed.
 
+## v0.22.3 - 2026-07-14
+
+### Changed
+
+- Reworked available-channel display into one compact row per upstream group, ordered by multiplier from low to high; removed the nested per-channel group cards and hidden verbose raw health errors from the channel list.
+- Added unified OR-based filtering for fuzzy search, format, multiplier band, public-key state, and the six status choices: all, alive, dead, zero balance, rate limited, and 403 forbidden.
+- One-click and per-group health checks now accept OpenAI-format groups only, use `gpt-5.5`, and enforce that restriction in the API as well as the interface.
+- Group-key bootstrap now excludes image/blocked groups containing `图`, `img`, `im2`, or `ban`; newly inferred `cc`, `cs`, `kiro`, `max`, and Claude aliases default to Claude format.
+- One-click group-key bootstrap is now a safe reconciliation: it updates existing upstream groups, removes upstream-deleted or newly excluded automatic groups, and preserves manually added `manual:` group keys.
+- Added usage-record request IP display and IP abuse controls: globally ban/unban callers, exempt a specific IP from the public-key limit, and queue public-key traffic to a maximum of five concurrent requests per IP by default.
+- Routing now recognizes `prompt_cache_key` as an affinity key so Codex/OpenAI requests in the same prompt-cache family stay on the same upstream and retain provider-side cache eligibility.
+
+### Fixed
+
+- Hardened direct Codex URL streaming by normalizing upstream `response.done` terminal events into `response.completed` plus `[DONE]`, matching strict Responses clients.
+- Responses stream intent is now detected from body `stream: true`, `?stream=1/true`, and `Accept: text/event-stream`; hinted stream requests also forward `stream: true` upstream and return SSE terminal failures instead of bare HTTP 503 JSON.
+- Public gateway keys that are expired or over balance now return Codex-readable streamed messages, avoiding protocol-level disconnect errors.
+
 ## v0.22.2 - 2026-07-13
 
 ### Fixed

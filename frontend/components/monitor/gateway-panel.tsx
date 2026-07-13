@@ -42,6 +42,7 @@ import type {
   GatewayHealthResult,
   GatewayKey,
   GatewayKeyReveal,
+  IPPolicy,
   UpstreamGroupKey,
 } from "@/lib/api-types"
 
@@ -49,19 +50,19 @@ const TOKEN_M = 1_000_000
 
 type ClientFormat = "openai" | "claude" | "grok" | "any"
 type ColumnClientFormat = "openai" | "claude" | "grok"
-type GroupScope = "all" | "selected"
+type GroupScope = "all" | "selected" | "charity" | "normal"
 type UpstreamRequestMode = "responses" | "chat"
 type GroupFormatFilter = "all" | ColumnClientFormat
 type RateFilter = "all" | "0-0.05" | "0.06-0.1" | "0.1-0.2" | "0.2+"
 type CharityFilter = "all" | "charity" | "normal"
-
-const FORMAT_ORDER: ClientFormat[] = ["openai", "claude", "grok", "any"]
+type GroupStatusFilter = "all" | "alive" | "dead" | "zero_balance" | "rate_limited" | "forbidden"
 
 interface GroupFilters {
   search: string
   format: GroupFormatFilter
   rateBand: RateFilter
   charity: CharityFilter
+  status: GroupStatusFilter
 }
 
 function createDefaultGroupFilters(): GroupFilters {
@@ -70,6 +71,7 @@ function createDefaultGroupFilters(): GroupFilters {
     format: "all",
     rateBand: "all",
     charity: "all",
+    status: "all",
   }
 }
 
@@ -109,6 +111,22 @@ interface HealthProgress {
   batches: number
   batchSize: number
   message: string
+}
+
+interface IPPolicyDraft {
+  ip: string
+  blocked: boolean
+  publicConcurrencyExempt: boolean
+  note: string
+}
+
+function createDefaultIPPolicyDraft(): IPPolicyDraft {
+  return {
+    ip: "",
+    blocked: false,
+    publicConcurrencyExempt: true,
+    note: "",
+  }
 }
 
 function statusTone(status: string) {
@@ -212,6 +230,36 @@ function clientFormatLabel(value?: string | null) {
   }
 }
 
+function normalizeGroupScope(value?: string | null, ids: number[] = []): GroupScope {
+  switch ((value ?? "").toLowerCase()) {
+    case "selected":
+      return "selected"
+    case "charity":
+      return "charity"
+    case "normal":
+    case "non_charity":
+    case "non-charity":
+      return "normal"
+    case "all":
+      return "all"
+    default:
+      return ids.length > 0 ? "selected" : "all"
+  }
+}
+
+function groupScopeLabel(value: GroupScope) {
+  switch (value) {
+    case "selected":
+      return "指定分组"
+    case "charity":
+      return "仅公益分组"
+    case "normal":
+      return "仅非公益分组"
+    default:
+      return "全部分组"
+  }
+}
+
 function normalizeRequestMode(value?: string | null): UpstreamRequestMode {
   switch ((value ?? "").toLowerCase()) {
     case "chat":
@@ -240,13 +288,12 @@ function groupMatchesFormatFilter(group: UpstreamGroupKey, format: GroupFormatFi
   return format === "all" || groupClientFormat(group) === format
 }
 
-function formatRank(value?: string | null) {
-  const idx = FORMAT_ORDER.indexOf(normalizeClientFormat(value))
-  return idx >= 0 ? idx : FORMAT_ORDER.length
-}
-
 function isOpenAIHealthGroup(group: UpstreamGroupKey) {
   return groupClientFormat(group) === "openai"
+}
+
+function isOpenAIResponsesGroup(group: UpstreamGroupKey) {
+  return isOpenAIHealthGroup(group) && normalizeRequestMode(group.request_mode) === "responses"
 }
 
 function rateFilterLabel(value: RateFilter) {
@@ -298,6 +345,10 @@ function groupMatchesCharity(group: UpstreamGroupKey, charity: CharityFilter) {
   return charity === "charity" ? group.charity === true : group.charity !== true
 }
 
+function groupMatchesStatus(group: UpstreamGroupKey, status: GroupStatusFilter) {
+  return status === "all" || effectiveStatus(group) === status
+}
+
 function upstreamKeyLabel(group: UpstreamGroupKey) {
   const id = Number(group.upstream_key_id ?? 0)
   return id > 0 ? `上游 Key #${id}` : "手动/本地 Key"
@@ -340,6 +391,7 @@ function groupMatchesFilters(group: UpstreamGroupKey, filters: GroupFilters) {
   if (!groupMatchesFormatFilter(group, filters.format)) return false
   if (!groupMatchesRateBand(group, filters.rateBand)) return false
   if (!groupMatchesCharity(group, filters.charity)) return false
+  if (!groupMatchesStatus(group, filters.status)) return false
   return true
 }
 
@@ -348,7 +400,8 @@ function activeGroupFilterCount(filters: GroupFilters) {
     (filters.search.trim() ? 1 : 0) +
     (filters.format !== "all" ? 1 : 0) +
     (filters.rateBand !== "all" ? 1 : 0) +
-    (filters.charity !== "all" ? 1 : 0)
+    (filters.charity !== "all" ? 1 : 0) +
+    (filters.status !== "all" ? 1 : 0)
   )
 }
 
@@ -364,10 +417,6 @@ function groupStatusRank(status: string) {
           : ["zero_balance", "forbidden", "auth_failed", "model_error", "invalid_request", "non_generation"].includes(status)
             ? 4
             : 5
-}
-
-function isWarningHealthStatus(status: string) {
-  return ["zero_balance", "rate_limited", "non_generation", "timeout", "server_error"].includes(status)
 }
 
 function isFailureHealthStatus(status: string) {
@@ -398,10 +447,9 @@ function healthResultSummaryText(result: GatewayHealthResult) {
 function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
   return groups.slice().sort((a, b) => {
     return (
-      groupStatusRank(effectiveStatus(a)) - groupStatusRank(effectiveStatus(b)) ||
-      Number(Boolean(b.charity)) - Number(Boolean(a.charity)) ||
-      (b.priority || 0) - (a.priority || 0) ||
       a.ratio - b.ratio ||
+      groupStatusRank(effectiveStatus(a)) - groupStatusRank(effectiveStatus(b)) ||
+      (b.priority || 0) - (a.priority || 0) ||
       a.failure_count - b.failure_count ||
       a.id - b.id
     )
@@ -487,11 +535,12 @@ function healthProgressFromEvent(ev: ProgressEvent, fallback: HealthProgress): H
 
 function draftFromKey(key: GatewayKey): KeyDraft {
   const ids = key.allowed_group_ids ?? []
+  const scope = normalizeGroupScope(key.allowed_group_scope, ids)
   return {
     name: key.name || "default",
     enabled: key.enabled !== false,
     clientFormat: normalizeClientFormat(key.client_format),
-    scope: ids.length > 0 ? "selected" : "all",
+    scope,
     selectedGroupIds: ids,
     dailyLimitM: tokensToMInput(key.daily_limit),
     totalLimitM: tokensToMInput(key.total_limit),
@@ -505,6 +554,7 @@ function buildGatewayKeyPayload(draft: KeyDraft, includeEnabled: boolean, includ
   const payload: Record<string, unknown> = {
     name: draft.name.trim() || "default",
     client_format: draft.clientFormat,
+    allowed_group_scope: draft.scope,
     allowed_group_ids: draft.scope === "selected" ? draft.selectedGroupIds : [],
     daily_limit: mInputToTokens(draft.dailyLimitM),
     total_limit: mInputToTokens(draft.totalLimitM),
@@ -522,7 +572,16 @@ function buildGatewayKeyPayload(draft: KeyDraft, includeEnabled: boolean, includ
 
 function selectedGroupSummary(key: GatewayKey, groups: UpstreamGroupKey[]) {
   const ids = key.allowed_group_ids ?? []
-  if (ids.length === 0) return "全部分组，按优先级和低倍率顺序调度"
+  const scope = normalizeGroupScope(key.allowed_group_scope, ids)
+  if (scope === "all") return "全部分组，按优先级和低倍率顺序调度"
+  if (scope === "charity") {
+    const count = groups.filter((group) => group.charity === true && groupMatchesFormat(group, normalizeClientFormat(key.client_format))).length
+    return `仅公益分组${count ? `（${count} 个可匹配）` : ""}`
+  }
+  if (scope === "normal") {
+    const count = groups.filter((group) => group.charity !== true && groupMatchesFormat(group, normalizeClientFormat(key.client_format))).length
+    return `仅非公益分组${count ? `（${count} 个可匹配）` : ""}`
+  }
   const names = ids
     .slice(0, 3)
     .map((id) => groups.find((group) => group.id === id))
@@ -544,6 +603,11 @@ function keyUsageStatusText(key: GatewayKey) {
   return "启用中"
 }
 
+function isOpenAIGatewayKey(key: GatewayKey) {
+  const format = normalizeClientFormat(key.client_format)
+  return format === "openai"
+}
+
 function KeyDraftFields({
   draft,
   groups,
@@ -557,7 +621,20 @@ function KeyDraftFields({
   showEnabled?: boolean
   showKeepExpiry?: boolean
 }) {
-  const eligibleGroups = groups.filter((group) => groupMatchesFormat(group, draft.clientFormat))
+  const eligibleGroups = useMemo(
+    () => groups.filter((group) => groupMatchesFormat(group, draft.clientFormat)),
+    [draft.clientFormat, groups],
+  )
+  const scopedEligibleGroups = useMemo(() => {
+    switch (draft.scope) {
+      case "charity":
+        return eligibleGroups.filter((group) => group.charity === true)
+      case "normal":
+        return eligibleGroups.filter((group) => group.charity !== true)
+      default:
+        return eligibleGroups
+    }
+  }, [draft.scope, eligibleGroups])
   const [bindingSearch, setBindingSearch] = useState("")
   const [bindingChannel, setBindingChannel] = useState("all")
   const [bindingRateBand, setBindingRateBand] = useState<RateFilter>("all")
@@ -565,24 +642,30 @@ function KeyDraftFields({
   const selected = new Set(draft.selectedGroupIds)
   const channelOptions = useMemo(() => {
     const map = new Map<number, string>()
-    for (const group of eligibleGroups) {
+    for (const group of scopedEligibleGroups) {
       map.set(group.channel_id, group.channel_name || `#${group.channel_id}`)
     }
     return [...map.entries()]
       .map(([id, name]) => ({ id, name }))
       .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
-  }, [eligibleGroups])
+  }, [scopedEligibleGroups])
   const visibleGroups = useMemo(() => {
     const query = normalizeSearchText(bindingSearch)
     const keyQuery = normalizeSearchText(bindingKeySearch)
-    return eligibleGroups.filter((group) => {
+    return scopedEligibleGroups.filter((group) => {
       const channelOK = bindingChannel === "all" || String(group.channel_id) === bindingChannel
       const rateOK = groupMatchesRateBand(group, bindingRateBand)
       const queryOK = !query || groupSearchText(group).includes(query)
       const keyOK = !keyQuery || upstreamKeyLabel(group).toLowerCase().includes(keyQuery)
       return channelOK && rateOK && queryOK && keyOK
     })
-  }, [bindingChannel, bindingKeySearch, bindingRateBand, bindingSearch, eligibleGroups])
+  }, [bindingChannel, bindingKeySearch, bindingRateBand, bindingSearch, scopedEligibleGroups])
+  const bindingSummary =
+    draft.scope === "all"
+      ? `将按优先级和低倍率顺序使用 ${eligibleGroups.length} 个匹配分组，当前筛选显示 ${visibleGroups.length} 个`
+      : draft.scope === "selected"
+        ? `已选择 ${draft.selectedGroupIds.length}/${eligibleGroups.length} 个匹配分组，当前筛选显示 ${visibleGroups.length} 个`
+        : `将使用 ${scopedEligibleGroups.length} 个${draft.scope === "charity" ? "公益" : "非公益"}匹配分组，当前筛选显示 ${visibleGroups.length} 个`
 
   function updateFormat(format: ClientFormat) {
     onChange({
@@ -619,9 +702,6 @@ function KeyDraftFields({
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="openai">OpenAI</SelectItem>
-              <SelectItem value="claude">Claude</SelectItem>
-              <SelectItem value="grok">Grok (xAI)</SelectItem>
-              <SelectItem value="any">不限</SelectItem>
             </SelectContent>
           </Select>
         </div>
@@ -703,22 +783,20 @@ function KeyDraftFields({
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Label>绑定上游分组</Label>
           <Select value={draft.scope} onValueChange={(value) => onChange({ ...draft, scope: value as GroupScope })}>
-            <SelectTrigger className="h-8 w-32 text-xs">
+            <SelectTrigger className="h-8 w-40 text-xs">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">全部</SelectItem>
-              <SelectItem value="selected">指定</SelectItem>
+              <SelectItem value="all">全部分组</SelectItem>
+              <SelectItem value="charity">仅公益分组</SelectItem>
+              <SelectItem value="normal">仅非公益分组</SelectItem>
+              <SelectItem value="selected">指定分组</SelectItem>
             </SelectContent>
           </Select>
         </div>
         <div className="rounded-md border border-border bg-background">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2 text-xs">
-            <span className="text-muted-foreground">
-              {draft.scope === "all"
-                ? `将按优先级和低倍率顺序使用 ${eligibleGroups.length} 个匹配分组，当前筛选显示 ${visibleGroups.length} 个`
-                : `已选择 ${draft.selectedGroupIds.length}/${eligibleGroups.length} 个匹配分组，当前筛选显示 ${visibleGroups.length} 个`}
-            </span>
+            <span className="text-muted-foreground">{bindingSummary}</span>
             {draft.scope === "selected" ? (
               <div className="flex items-center gap-1">
                 <Button
@@ -807,9 +885,13 @@ function KeyDraftFields({
               <div className="px-2 py-6 text-center text-xs text-muted-foreground">
                 没有匹配 {clientFormatLabel(draft.clientFormat)} 的分组，先同步或切换格式
               </div>
+            ) : scopedEligibleGroups.length === 0 ? (
+              <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+                当前没有匹配 {groupScopeLabel(draft.scope)} 的 {clientFormatLabel(draft.clientFormat)} 分组
+              </div>
             ) : visibleGroups.length === 0 ? (
               <div className="px-2 py-6 text-center text-xs text-muted-foreground">
-                没有符合当前渠道、倍率或对应 Key 筛选的分组
+                没有符合当前渠道、倍率或对应 Key 筛选的 {groupScopeLabel(draft.scope)}
               </div>
             ) : (
               <div className="space-y-1">
@@ -820,7 +902,7 @@ function KeyDraftFields({
                       key={group.id}
                       className={cn(
                         "flex cursor-pointer items-start gap-2 rounded-md px-2 py-2 text-xs hover:bg-muted/60",
-                        draft.scope === "all" && "cursor-default opacity-80",
+                        draft.scope !== "selected" && "cursor-default opacity-80",
                       )}
                     >
                       {draft.scope === "selected" ? (
@@ -839,6 +921,12 @@ function KeyDraftFields({
                           <Badge variant="outline" className="h-5 px-1.5 text-[10px]">
                             {clientFormatLabel(group.client_format)}
                           </Badge>
+                          {group.charity ? (
+                            <Badge variant="outline" className="h-5 gap-1 border-success/20 bg-success/10 px-1.5 text-[10px] text-success">
+                              <HeartHandshake className="size-3" />
+                              公益
+                            </Badge>
+                          ) : null}
                           <Badge variant="outline" className={cn("h-5 px-1.5 text-[10px]", statusTone(status))}>
                             {statusText(status)}
                           </Badge>
@@ -878,87 +966,37 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [visible, setVisible] = useState<Record<number, boolean>>({})
   const [concurrencyDrafts, setConcurrencyDrafts] = useState<Record<number, string>>({})
   const [priorityDrafts, setPriorityDrafts] = useState<Record<number, string>>({})
+  const [ipPolicies, setIPPolicies] = useState<IPPolicy[]>([])
+  const [ipPolicyDraft, setIPPolicyDraft] = useState<IPPolicyDraft>(() => createDefaultIPPolicyDraft())
   const [healthResults, setHealthResults] = useState<Record<number, GatewayHealthResult["items"][number]>>({})
   const [healthProgress, setHealthProgress] = useState<HealthProgress | null>(null)
   const [groupFilterDraft, setGroupFilterDraft] = useState<GroupFilters>(() => createDefaultGroupFilters())
   const [groupFilters, setGroupFilters] = useState<GroupFilters>(() => createDefaultGroupFilters())
   const [keySearch, setKeySearch] = useState("")
 
+  const displayKeys = useMemo(
+    () => keys.filter(isOpenAIGatewayKey),
+    [keys],
+  )
+  const displayGroups = useMemo(
+    () => groups.filter(isOpenAIResponsesGroup),
+    [groups],
+  )
   const filteredKeys = useMemo(() => {
     const query = keySearch.trim().toLowerCase()
-    if (!query) return keys
-    return keys.filter((key) =>
+    if (!query) return displayKeys
+    return displayKeys.filter((key) =>
       [key.name, key.key_prefix, key.client_format]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(query)),
     )
-  }, [keySearch, keys])
+  }, [displayKeys, keySearch])
 
-  const totalGroups = groups.length
+  const totalGroups = displayGroups.length
   const filteredGroups = useMemo(
-    () => sortGroupsForDisplay(groups.filter((group) => groupMatchesFilters(group, groupFilters))),
-    [groups, groupFilters],
+    () => sortGroupsForDisplay(displayGroups.filter((group) => groupMatchesFilters(group, groupFilters))),
+    [displayGroups, groupFilters],
   )
-  const openAIPriceByChannel = useMemo(() => {
-    const prices = new Map<number, number>()
-    for (const group of groups) {
-      if (!isOpenAIHealthGroup(group)) continue
-      const ratio = Number(group.ratio ?? 0)
-      if (!Number.isFinite(ratio)) continue
-      prices.set(group.channel_id, Math.min(prices.get(group.channel_id) ?? Number.POSITIVE_INFINITY, ratio))
-    }
-    return prices
-  }, [groups])
-  const channelRows = useMemo(() => {
-    const rows = new Map<number, {
-      channelID: number
-      channelName: string
-      channelType: UpstreamGroupKey["channel_type"]
-      items: UpstreamGroupKey[]
-      openAIPrice: number
-      cheapestPrice: number
-    }>()
-    for (const group of filteredGroups) {
-      const channelID = group.channel_id
-      const row = rows.get(channelID) ?? {
-        channelID,
-        channelName: group.channel_name || `#${channelID}`,
-        channelType: group.channel_type,
-        items: [],
-        openAIPrice: openAIPriceByChannel.get(channelID) ?? Number.POSITIVE_INFINITY,
-        cheapestPrice: Number.POSITIVE_INFINITY,
-      }
-      row.items.push(group)
-      const ratio = Number(group.ratio ?? 0)
-      if (Number.isFinite(ratio)) {
-        row.cheapestPrice = Math.min(row.cheapestPrice, ratio)
-        if (groupClientFormat(group) === "openai") {
-          row.openAIPrice = Math.min(row.openAIPrice, ratio)
-        }
-      }
-      rows.set(channelID, row)
-    }
-    return Array.from(rows.values())
-      .map((row) => ({
-        ...row,
-        items: row.items.slice().sort((a, b) =>
-          formatRank(a.client_format) - formatRank(b.client_format) ||
-          a.ratio - b.ratio ||
-          (b.priority || 0) - (a.priority || 0) ||
-          a.id - b.id,
-        ),
-      }))
-      .sort((a, b) => {
-        const aHasOpenAI = Number.isFinite(a.openAIPrice)
-        const bHasOpenAI = Number.isFinite(b.openAIPrice)
-        if (aHasOpenAI !== bHasOpenAI) return aHasOpenAI ? -1 : 1
-        const rawAPrice = aHasOpenAI ? a.openAIPrice : a.cheapestPrice
-        const rawBPrice = bHasOpenAI ? b.openAIPrice : b.cheapestPrice
-        const aPrice = Number.isFinite(rawAPrice) ? rawAPrice : Number.MAX_VALUE
-        const bPrice = Number.isFinite(rawBPrice) ? rawBPrice : Number.MAX_VALUE
-        return aPrice - bPrice || a.channelName.localeCompare(b.channelName, "zh-CN") || a.channelID - b.channelID
-      })
-  }, [filteredGroups, openAIPriceByChannel])
   const displayAliveCount = useMemo(
     () => filteredGroups.filter((group) => effectiveStatus(group) === "alive").length,
     [filteredGroups],
@@ -979,18 +1017,18 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     () => filteredGroups.filter((group) => effectiveStatus(group) === "forbidden").length,
     [filteredGroups],
   )
-  const displayNonGenerationCount = useMemo(
-    () => filteredGroups.filter((group) => effectiveStatus(group) === "non_generation").length,
-    [filteredGroups],
-  )
   const displayEnabledCount = useMemo(
     () => filteredGroups.filter((group) => group.enabled !== false).length,
     [filteredGroups],
   )
   const activeFilters = activeGroupFilterCount(groupFilters)
+  const sortedIPPolicies = useMemo(
+    () => [...ipPolicies].sort((a, b) => a.ip.localeCompare(b.ip)),
+    [ipPolicies],
+  )
   const openAIHealthGroups = useMemo(
-    () => groups.filter(isOpenAIHealthGroup),
-    [groups],
+    () => displayGroups,
+    [displayGroups],
   )
   const enabledOpenAIHealthGroups = useMemo(
     () => openAIHealthGroups.filter((group) => group.enabled !== false),
@@ -1000,11 +1038,13 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   async function load() {
     setLoading(true)
     try {
-      const [keyList, groupResult] = await Promise.all([
+      const [keyList, groupResult, policyResult] = await Promise.all([
         apiFetch<GatewayKey[]>("/gateway/keys"),
         apiFetch<UpstreamGroupKey[]>("/gateway/group-keys"),
+        apiFetch<IPPolicy[]>("/gateway/ip-policies"),
       ])
       setKeys(Array.isArray(keyList) ? keyList : [])
+      setIPPolicies(Array.isArray(policyResult) ? policyResult : [])
       const nextGroups = sortGroupsForDisplay(Array.isArray(groupResult) ? groupResult : [])
       setGroups(nextGroups)
       setConcurrencyDrafts(
@@ -1142,11 +1182,83 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
+  function upsertIPPolicyState(policy: IPPolicy) {
+    setIPPolicies((prev) => {
+      const exists = prev.some((item) => item.ip === policy.ip)
+      return exists ? prev.map((item) => (item.ip === policy.ip ? policy : item)) : [policy, ...prev]
+    })
+  }
+
+  async function saveIPPolicyDraft() {
+    const ip = ipPolicyDraft.ip.trim()
+    if (!ip) {
+      toast.error("请填写 IP")
+      return
+    }
+    setBusy("ip-policy-create")
+    try {
+      const saved = await apiFetch<IPPolicy>("/gateway/ip-policies", {
+        method: "PUT",
+        body: JSON.stringify({
+          ip,
+          blocked: ipPolicyDraft.blocked,
+          public_concurrency_exempt: ipPolicyDraft.publicConcurrencyExempt,
+          note: ipPolicyDraft.note.trim(),
+        }),
+      })
+      upsertIPPolicyState(saved)
+      setIPPolicyDraft(createDefaultIPPolicyDraft())
+      toast.success(saved.blocked ? "IP 已加入黑名单" : "IP 规则已保存")
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "保存 IP 规则失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function updateIPPolicy(policy: IPPolicy, patch: Partial<Pick<IPPolicy, "blocked" | "public_concurrency_exempt" | "note">>) {
+    setBusy(`ip-policy-${policy.id || policy.ip}`)
+    try {
+      const saved = await apiFetch<IPPolicy>("/gateway/ip-policies", {
+        method: "PUT",
+        body: JSON.stringify({
+          ip: policy.ip,
+          blocked: patch.blocked ?? policy.blocked,
+          public_concurrency_exempt: patch.public_concurrency_exempt ?? policy.public_concurrency_exempt,
+          note: patch.note ?? policy.note ?? "",
+        }),
+      })
+      upsertIPPolicyState(saved)
+      toast.success("IP 规则已更新")
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "更新 IP 规则失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function deleteIPPolicy(policy: IPPolicy) {
+    if (!window.confirm(`删除 ${policy.ip} 的 IP 规则？`)) return
+    setBusy(`ip-policy-delete-${policy.id || policy.ip}`)
+    try {
+      await apiFetch(`/gateway/ip-policies/${encodeURIComponent(policy.ip)}`, { method: "DELETE" })
+      setIPPolicies((prev) => prev.filter((item) => item.ip !== policy.ip))
+      toast.success("IP 规则已删除")
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "删除 IP 规则失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
   async function bootstrapGroups() {
     setBusy("bootstrap")
     try {
       const res = await apiFetch<GatewayBootstrapResult>("/gateway/group-keys/bootstrap", { method: "POST" })
-      toast.success(`分组 Key 完成：新建 ${res.created}，更新 ${res.updated}，失败 ${res.failed}`)
+      toast.success(`分组 Key 已同步：新建 ${res.created}，更新 ${res.updated}，删除 ${res.removed || 0}，失败 ${res.failed}`)
       await load()
     } catch (e) {
       const err = e as Error
@@ -1359,7 +1471,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     const status = latestHealth?.status ?? effectiveStatus(group)
     const Icon = status === "alive" ? CheckCircle2 : isFailureHealthStatus(status) ? XCircle : RefreshCw
     const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
-    const healthError = latestHealth?.error || group.last_error
     const format = groupClientFormat(group)
     const canTest = isOpenAIHealthGroup(group) && group.enabled !== false
 
@@ -1367,7 +1478,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       <div
         key={group.id}
         className={cn(
-          "grid gap-2 border-t border-border p-3 text-xs lg:grid-cols-[minmax(260px,1.6fr)_110px_120px_120px_90px_90px_145px_110px] lg:items-center",
+          "grid gap-2 border-t border-border p-3 text-xs lg:grid-cols-[minmax(260px,1.6fr)_110px_132px_96px_145px_110px] lg:items-center",
           group.charity && "bg-success/5",
         )}
       >
@@ -1398,76 +1509,80 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           {statusText(status)}
         </Badge>
 
-        <Select
-          value={format}
-          disabled={!!busy}
-          onValueChange={(value) => void changeGroupClientFormat(group, value)}
-        >
-          <SelectTrigger className="h-8 w-full text-xs" aria-label="渠道格式">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="openai">OpenAI</SelectItem>
-            <SelectItem value="claude">Claude</SelectItem>
-            <SelectItem value="grok">Grok</SelectItem>
-          </SelectContent>
-        </Select>
+        <div className="grid gap-1.5">
+          <Select
+            value={format}
+            disabled={!!busy}
+            onValueChange={(value) => void changeGroupClientFormat(group, value)}
+          >
+            <SelectTrigger className="h-8 w-full text-xs" aria-label="渠道格式">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="openai">OpenAI</SelectItem>
+              <SelectItem value="claude">Claude</SelectItem>
+              <SelectItem value="grok">Grok</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select
+            value={normalizeRequestMode(group.request_mode)}
+            disabled={!!busy}
+            onValueChange={(value) => void changeGroupRequestMode(group, normalizeRequestMode(value))}
+          >
+            <SelectTrigger className="h-8 w-full text-xs" aria-label="上游接口">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="responses">Responses</SelectItem>
+              <SelectItem value="chat">Chat</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
 
-        <Select
-          value={normalizeRequestMode(group.request_mode)}
-          disabled={!!busy}
-          onValueChange={(value) => void changeGroupRequestMode(group, normalizeRequestMode(value))}
-        >
-          <SelectTrigger className="h-8 w-full text-xs" aria-label="上游接口">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="responses">Responses</SelectItem>
-            <SelectItem value="chat">Chat</SelectItem>
-          </SelectContent>
-        </Select>
-
-        <Input
-          value={priorityDrafts[group.id] ?? String(group.priority || 0)}
-          inputMode="numeric"
-          className="h-8 px-2 text-xs"
-          disabled={!!busy}
-          title="优先级：数值越大越优先；同优先级再按低倍率调度"
-          onChange={(event) =>
-            setPriorityDrafts((prev) => ({
-              ...prev,
-              [group.id]: event.target.value.replace(/[^\d]/g, ""),
-            }))
-          }
-          onKeyDown={(event) => {
-            if (event.key === "Enter") event.currentTarget.blur()
-          }}
-          onBlur={() => {
-            const draft = priorityDrafts[group.id] ?? String(group.priority || 0)
-            if (Number(draft) !== (group.priority || 0)) void savePriority(group)
-          }}
-        />
-
-        <Input
-          value={concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)}
-          inputMode="numeric"
-          className="h-8 px-2 text-xs"
-          disabled={!!busy}
-          title="并发上限，0 表示不限"
-          onChange={(event) =>
-            setConcurrencyDrafts((prev) => ({
-              ...prev,
-              [group.id]: event.target.value.replace(/[^\d]/g, ""),
-            }))
-          }
-          onKeyDown={(event) => {
-            if (event.key === "Enter") event.currentTarget.blur()
-          }}
-          onBlur={() => {
-            const draft = concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)
-            if (Number(draft) !== (group.concurrency_limit || 0)) void saveConcurrencyLimit(group)
-          }}
-        />
+        <div className="grid gap-1.5">
+          <Input
+            value={priorityDrafts[group.id] ?? String(group.priority || 0)}
+            inputMode="numeric"
+            className="h-8 px-2 text-xs"
+            disabled={!!busy}
+            title="优先级：数值越大越优先；同优先级再按低倍率调度"
+            onChange={(event) =>
+              setPriorityDrafts((prev) => ({
+                ...prev,
+                [group.id]: event.target.value.replace(/[^\d]/g, ""),
+              }))
+            }
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur()
+            }}
+            onBlur={() => {
+              const draft = priorityDrafts[group.id] ?? String(group.priority || 0)
+              if (Number(draft) !== (group.priority || 0)) void savePriority(group)
+            }}
+            placeholder="优先级"
+          />
+          <Input
+            value={concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)}
+            inputMode="numeric"
+            className="h-8 px-2 text-xs"
+            disabled={!!busy}
+            title="并发上限，0 表示不限"
+            onChange={(event) =>
+              setConcurrencyDrafts((prev) => ({
+                ...prev,
+                [group.id]: event.target.value.replace(/[^\d]/g, ""),
+              }))
+            }
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur()
+            }}
+            onBlur={() => {
+              const draft = concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)
+              if (Number(draft) !== (group.concurrency_limit || 0)) void saveConcurrencyLimit(group)
+            }}
+            placeholder="并发"
+          />
+        </div>
 
         <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
           <label className="flex items-center gap-1.5">
@@ -1526,23 +1641,12 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </Button>
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground lg:col-span-8">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground lg:col-span-6">
           <span>测活：{latestHealth?.checked_at ? relativeTime(latestHealth.checked_at) : group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}</span>
           <span>延迟：{latencyMS > 0 ? `${latencyMS}ms` : "—"}</span>
           <span>并发：{(group.concurrency_limit || 0) > 0 ? `${group.concurrency_limit} 路` : "不限"}</span>
           <span>优先级：{group.priority || 0}</span>
         </div>
-        {healthError ? (
-          <p
-            className={cn(
-              "truncate rounded-md px-2 py-1 text-[11px] lg:col-span-8",
-              isWarningHealthStatus(status) ? "bg-warning/10 text-warning" : "bg-danger/10 text-danger",
-            )}
-            title={healthError}
-          >
-            {healthError}
-          </p>
-        ) : null}
       </div>
     )
   }
@@ -1575,14 +1679,11 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             <Badge variant="outline" className="border-danger/20 bg-danger/10 text-danger">
               403 {displayForbiddenCount}
             </Badge>
-            <Badge variant="outline" className="border-warning/20 bg-warning/10 text-warning">
-              非生成 {displayNonGenerationCount}
-            </Badge>
             <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
               启用 {displayEnabledCount}/{totalGroups}
             </Badge>
             <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
-              OpenAI 可测 {enabledOpenAIHealthGroups.length}/{openAIHealthGroups.length}
+              OpenAI/Responses 可测 {enabledOpenAIHealthGroups.length}/{openAIHealthGroups.length}
             </Badge>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
               {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
@@ -1617,7 +1718,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             <div className="mb-2 flex items-center justify-between gap-2">
               <div>
                 <p className="text-xs font-medium text-foreground">已有调用 Key</p>
-                <span className="text-[11px] text-muted-foreground">Bearer Key · {filteredKeys.length}/{keys.length} 个</span>
+                <span className="text-[11px] text-muted-foreground">OpenAI Bearer Key · {filteredKeys.length}/{displayKeys.length} 个</span>
               </div>
               <Button size="sm" className="h-8 gap-1.5 text-xs" disabled={!!busy} onClick={() => setCreateOpen(true)}>
                 <KeyRound className="size-3.5" />
@@ -1670,7 +1771,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                           </code>
                         </TableCell>
                         <TableCell className="hidden max-w-60 truncate text-xs text-muted-foreground lg:table-cell">
-                          {selectedGroupSummary(key, groups)}
+                          {selectedGroupSummary(key, displayGroups)}
                         </TableCell>
                         <TableCell className="hidden text-right text-xs md:table-cell">
                           <span className="font-medium text-foreground">{formatTokens(key.today_tokens)}</span>
@@ -1750,6 +1851,143 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
         </div>
         ) : null}
 
+        {showKeys ? (
+          <div className="rounded-md border border-border bg-muted/10 p-3">
+            <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <p className="text-xs font-medium text-foreground">IP 黑名单 / 公网并发白名单</p>
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  黑名单会拒绝所有网关请求；白名单只豁免公网 Key 的单 IP 5 路并发限制。
+                </p>
+              </div>
+              <Badge variant="outline" className="border-border bg-background text-muted-foreground">
+                {ipPolicies.length} 条规则
+              </Badge>
+            </div>
+            <div className="grid gap-2 lg:grid-cols-[minmax(180px,0.9fr)_minmax(220px,1.2fr)_auto_auto_auto]">
+              <Input
+                value={ipPolicyDraft.ip}
+                onChange={(event) => setIPPolicyDraft((prev) => ({ ...prev, ip: event.target.value }))}
+                placeholder="IP，例如 203.0.113.8"
+                className="h-9 text-xs"
+                aria-label="IP 地址"
+              />
+              <Input
+                value={ipPolicyDraft.note}
+                onChange={(event) => setIPPolicyDraft((prev) => ({ ...prev, note: event.target.value }))}
+                placeholder="备注，可选"
+                className="h-9 text-xs"
+                aria-label="IP 规则备注"
+              />
+              <label className="flex h-9 items-center gap-2 rounded-md border border-border bg-background px-3 text-xs text-muted-foreground">
+                <Checkbox
+                  checked={ipPolicyDraft.blocked}
+                  onCheckedChange={(checked) => setIPPolicyDraft((prev) => ({ ...prev, blocked: checked === true }))}
+                />
+                封禁
+              </label>
+              <label className="flex h-9 items-center gap-2 rounded-md border border-border bg-background px-3 text-xs text-muted-foreground">
+                <Checkbox
+                  checked={ipPolicyDraft.publicConcurrencyExempt}
+                  onCheckedChange={(checked) =>
+                    setIPPolicyDraft((prev) => ({ ...prev, publicConcurrencyExempt: checked === true }))
+                  }
+                />
+                公网并发白名单
+              </label>
+              <Button
+                size="sm"
+                className="h-9 text-xs"
+                disabled={!!busy}
+                onClick={() => void saveIPPolicyDraft()}
+              >
+                {busy === "ip-policy-create" ? <Loader2 className="mr-1.5 size-3.5 animate-spin" /> : null}
+                保存 IP 规则
+              </Button>
+            </div>
+            {sortedIPPolicies.length === 0 ? (
+              <div className="mt-3 rounded-md border border-dashed border-border bg-background px-3 py-6 text-center text-xs text-muted-foreground">
+                暂无 IP 规则。公网 Key 默认对同一 IP 最多 5 路并发，超过会排队等待。
+              </div>
+            ) : (
+              <div className="mt-3 overflow-x-auto rounded-md border border-border bg-background">
+                <Table className="min-w-[720px]">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>IP</TableHead>
+                      <TableHead>状态</TableHead>
+                      <TableHead>备注</TableHead>
+                      <TableHead className="hidden md:table-cell">更新时间</TableHead>
+                      <TableHead className="w-48 text-right">操作</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {sortedIPPolicies.map((policy) => {
+                      const rowBusy = busy === `ip-policy-${policy.id || policy.ip}` || busy === `ip-policy-delete-${policy.id || policy.ip}`
+                      return (
+                        <TableRow key={policy.ip}>
+                          <TableCell className="font-mono text-xs text-foreground">{policy.ip}</TableCell>
+                          <TableCell>
+                            <div className="flex flex-wrap gap-1">
+                              {policy.blocked ? (
+                                <Badge variant="outline" className="border-danger/20 bg-danger/10 text-danger">黑名单</Badge>
+                              ) : (
+                                <Badge variant="outline" className="border-success/20 bg-success/10 text-success">允许</Badge>
+                              )}
+                              {policy.public_concurrency_exempt ? (
+                                <Badge variant="outline" className="border-primary/20 bg-primary/10 text-primary">公网并发白名单</Badge>
+                              ) : null}
+                            </div>
+                          </TableCell>
+                          <TableCell className="max-w-80 truncate text-xs text-muted-foreground">
+                            {policy.note?.trim() || "—"}
+                          </TableCell>
+                          <TableCell className="hidden text-xs text-muted-foreground md:table-cell">
+                            {policy.updated_at ? relativeTime(policy.updated_at) : "—"}
+                          </TableCell>
+                          <TableCell>
+                            <div className="flex justify-end gap-1">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 px-2 text-[11px]"
+                                disabled={!!busy}
+                                onClick={() => void updateIPPolicy(policy, { blocked: !policy.blocked })}
+                              >
+                                {rowBusy ? <Loader2 className="mr-1 size-3 animate-spin" /> : null}
+                                {policy.blocked ? "解封" : "封禁"}
+                              </Button>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 px-2 text-[11px]"
+                                disabled={!!busy}
+                                onClick={() => void updateIPPolicy(policy, { public_concurrency_exempt: !policy.public_concurrency_exempt })}
+                              >
+                                {policy.public_concurrency_exempt ? "取消白名单" : "白名单"}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                className="size-7 text-destructive hover:text-destructive"
+                                disabled={!!busy}
+                                title="删除 IP 规则"
+                                onClick={() => void deleteIPPolicy(policy)}
+                              >
+                                <Trash2 className="size-3.5" />
+                              </Button>
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </div>
+        ) : null}
+
         {showGroups ? (
           <>
             <div className="rounded-md border border-border bg-muted/10 p-3">
@@ -1764,7 +2002,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                   命中 {filteredGroups.length}/{totalGroups}
                 </Badge>
               </div>
-              <div className="grid gap-2 lg:grid-cols-[minmax(220px,1.4fr)_0.85fr_0.85fr_0.85fr_auto]">
+              <div className="grid gap-2 lg:grid-cols-[minmax(220px,1.4fr)_0.8fr_0.8fr_0.8fr_0.8fr_auto]">
                 <div className="relative">
                   <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                   <Input
@@ -1790,10 +2028,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <SelectValue placeholder="格式筛选" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">全部格式</SelectItem>
+                    <SelectItem value="all">OpenAI / Responses</SelectItem>
                     <SelectItem value="openai">OpenAI</SelectItem>
-                    <SelectItem value="claude">Claude</SelectItem>
-                    <SelectItem value="grok">Grok</SelectItem>
                   </SelectContent>
                 </Select>
                 <Select
@@ -1826,6 +2062,24 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <SelectItem value="all">全部状态</SelectItem>
                     <SelectItem value="charity">仅公益 Key</SelectItem>
                     <SelectItem value="normal">非公益</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={groupFilterDraft.status}
+                  onValueChange={(value) =>
+                    setGroupFilterDraft((prev) => ({ ...prev, status: value as GroupStatusFilter }))
+                  }
+                >
+                  <SelectTrigger className="h-9 w-full text-xs">
+                    <SelectValue placeholder="状态筛选" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">全部状态</SelectItem>
+                    <SelectItem value="alive">存活</SelectItem>
+                    <SelectItem value="dead">死亡</SelectItem>
+                    <SelectItem value="zero_balance">零余额</SelectItem>
+                    <SelectItem value="rate_limited">限流</SelectItem>
+                    <SelectItem value="forbidden">403</SelectItem>
                   </SelectContent>
                 </Select>
                 <div className="flex gap-2">
@@ -1863,7 +2117,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <Badge variant="outline" className="bg-background">倍率：{rateFilterLabel(groupFilters.rateBand)}</Badge>
                   ) : null}
                   {groupFilters.charity !== "all" ? (
-                    <Badge variant="outline" className="bg-background">状态：{charityFilterLabel(groupFilters.charity)}</Badge>
+                    <Badge variant="outline" className="bg-background">公益：{charityFilterLabel(groupFilters.charity)}</Badge>
+                  ) : null}
+                  {groupFilters.status !== "all" ? (
+                    <Badge variant="outline" className="bg-background">状态：{statusText(groupFilters.status)}</Badge>
                   ) : null}
                 </div>
               ) : null}
@@ -1883,37 +2140,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 没有符合当前筛选条件的渠道
               </div>
             ) : (
-              <div className="space-y-3">
-                {channelRows.map((row) => {
-                  const alive = row.items.filter((group) => effectiveStatus(group) === "alive").length
-                  const formats = Array.from(new Set(row.items.map((group) => groupClientFormat(group))))
-                    .sort((a, b) => formatRank(a) - formatRank(b))
-                  const openAIText = Number.isFinite(row.openAIPrice) ? formatRatio(row.openAIPrice) : "无"
-                  return (
-                    <div key={row.channelID} className="overflow-hidden rounded-md border border-border bg-background">
-                      <div className="flex flex-wrap items-center justify-between gap-2 bg-muted/20 px-3 py-2">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <p className="truncate text-sm font-semibold text-foreground">{row.channelName}</p>
-                            <Badge variant="outline" className="bg-background">{channelTypeLabel(row.channelType)}</Badge>
-                            {formats.map((format) => (
-                              <Badge key={format} variant="outline" className="bg-background">{clientFormatLabel(format)}</Badge>
-                            ))}
-                          </div>
-                          <p className="mt-0.5 text-[11px] text-muted-foreground">
-                            OpenAI 最低倍率 {openAIText} · 共 {row.items.length} 个分组 · 存活 {alive}
-                          </p>
-                        </div>
-                        <Badge variant="outline" className="border-border bg-background text-muted-foreground">
-                          按 OpenAI 低价排序
-                        </Badge>
-                      </div>
-                      <div>
-                        {row.items.map((group) => renderGroupRow(group))}
-                      </div>
-                    </div>
-                  )
-                })}
+              <div className="space-y-2">
+                {filteredGroups.map((group) => renderGroupRow(group))}
               </div>
             )}
           </>
@@ -1934,7 +2162,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               设置调用额度、请求格式，并绑定允许使用的上游分组。创建后只显示一次完整 Key。
             </DialogDescription>
           </DialogHeader>
-          <KeyDraftFields draft={createDraft} groups={groups} onChange={setCreateDraft} />
+          <KeyDraftFields draft={createDraft} groups={displayGroups} onChange={setCreateDraft} />
           <DialogFooter>
             <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={!!busy}>
               取消
@@ -1963,7 +2191,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </DialogHeader>
           <KeyDraftFields
             draft={editDraft}
-            groups={groups}
+            groups={displayGroups}
             onChange={setEditDraft}
             showEnabled
             showKeepExpiry

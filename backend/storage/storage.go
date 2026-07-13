@@ -118,7 +118,7 @@ func AutoMigrate(db *gorm.DB) error {
 	if err := dropDeletedAtColumns(db); err != nil {
 		return err
 	}
-	return db.AutoMigrate(
+	if err := db.AutoMigrate(
 		&Channel{},
 		&AuthSession{},
 		&CaptchaConfig{},
@@ -135,7 +135,31 @@ func AutoMigrate(db *gorm.DB) error {
 		&GatewayAffinity{},
 		&UpstreamGroupKey{},
 		&UsageLog{},
-	)
+		&IPPolicy{},
+	); err != nil {
+		return err
+	}
+	return backfillGatewayKeyGroupScopes(db)
+}
+
+func backfillGatewayKeyGroupScopes(db *gorm.DB) error {
+	if !db.Migrator().HasTable(&GatewayKey{}) {
+		return nil
+	}
+	hasScope, err := tableHasColumn(db, "gateway_keys", "allowed_group_scope")
+	if err != nil {
+		return fmt.Errorf("inspect gateway_keys.allowed_group_scope: %w", err)
+	}
+	hasIDs, err := tableHasColumn(db, "gateway_keys", "allowed_group_ids")
+	if err != nil {
+		return fmt.Errorf("inspect gateway_keys.allowed_group_ids: %w", err)
+	}
+	if !hasScope || !hasIDs {
+		return nil
+	}
+	return db.Model(&GatewayKey{}).
+		Where("(allowed_group_scope = '' OR allowed_group_scope = ?) AND TRIM(COALESCE(allowed_group_ids, '')) <> ''", "all").
+		Update("allowed_group_scope", "selected").Error
 }
 
 func dropDeletedAtColumns(db *gorm.DB) error {

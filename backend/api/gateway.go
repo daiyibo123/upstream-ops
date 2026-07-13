@@ -17,6 +17,34 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		return
 	}
 	gp := g.Group("/gateway")
+	gp.GET("/ip-policies", func(c *gin.Context) {
+		items, err := d.Gateway.ListIPPolicies()
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": items})
+	})
+	gp.PUT("/ip-policies", func(c *gin.Context) {
+		var in gatewaySvc.IPPolicyInput
+		if err := c.ShouldBindJSON(&in); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		item, err := d.Gateway.UpdateIPPolicy(in.IP, in.Blocked, in.PublicConcurrencyExempt, in.Note)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": item})
+	})
+	gp.DELETE("/ip-policies/:ip", func(c *gin.Context) {
+		if err := d.Gateway.DeleteIPPolicy(c.Param("ip")); err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ok": true})
+	})
 	gp.GET("/keys", func(c *gin.Context) {
 		list, err := d.Gateway.ListGatewayKeys()
 		if err != nil {
@@ -40,6 +68,14 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 			return
 		}
 		key, err := d.Gateway.ConfigurePublicGatewayKey(in)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": key})
+	})
+	gp.POST("/public-key/reset-verification", func(c *gin.Context) {
+		key, err := d.Gateway.ResetPublicGatewayKeyVerification()
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
@@ -316,31 +352,54 @@ func wantsSSE(c *gin.Context) bool {
 	return c.Query("stream") == "1" || strings.Contains(strings.ToLower(c.GetHeader("Accept")), "text/event-stream")
 }
 
+func gatewayProxyPathWithQuery(c *gin.Context, path string) string {
+	if raw := c.Request.URL.RawQuery; raw != "" {
+		return path + "?" + raw
+	}
+	return path
+}
+
+func handleGatewayProxy(c *gin.Context, d *Deps, path string) {
+	if d == nil || d.Gateway == nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	if err := d.Gateway.Proxy(c.Writer, c.Request, path); err != nil {
+		if c.Writer.Written() {
+			return
+		}
+		var gerr *gatewaySvc.GatewayError
+		if errors.As(err, &gerr) {
+			for k, values := range gerr.Header {
+				for _, v := range values {
+					c.Writer.Header().Add(k, v)
+				}
+			}
+			if c.Writer.Header().Get("Content-Type") == "" {
+				c.Writer.Header().Set("Content-Type", "application/json")
+			}
+			c.Writer.WriteHeader(gerr.Status)
+			_, _ = c.Writer.Write(gerr.Body)
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	}
+}
+
 func registerGatewayProxy(r *gin.Engine, d *Deps) {
 	if d.Gateway == nil {
 		return
 	}
+	r.POST("/responses", func(c *gin.Context) {
+		handleGatewayProxy(c, d, gatewayProxyPathWithQuery(c, "/v1/responses"))
+	})
+	for i := 0; i < 100; i++ {
+		r.POST("/"+strconv.Itoa(i)+"/responses", func(c *gin.Context) {
+			handleGatewayProxy(c, d, gatewayProxyPathWithQuery(c, "/v1/responses"))
+		})
+	}
 	r.Any("/v1/*path", func(c *gin.Context) {
 		path := "/v1" + c.Param("path")
-		if raw := c.Request.URL.RawQuery; raw != "" {
-			path += "?" + raw
-		}
-		if err := d.Gateway.Proxy(c.Writer, c.Request, path); err != nil {
-			var gerr *gatewaySvc.GatewayError
-			if errors.As(err, &gerr) {
-				for k, values := range gerr.Header {
-					for _, v := range values {
-						c.Writer.Header().Add(k, v)
-					}
-				}
-				if c.Writer.Header().Get("Content-Type") == "" {
-					c.Writer.Header().Set("Content-Type", "application/json")
-				}
-				c.Writer.WriteHeader(gerr.Status)
-				_, _ = c.Writer.Write(gerr.Body)
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		}
+		handleGatewayProxy(c, d, gatewayProxyPathWithQuery(c, path))
 	})
 }
