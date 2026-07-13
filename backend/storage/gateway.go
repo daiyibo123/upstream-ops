@@ -87,7 +87,7 @@ func (r *GatewayKeys) Touch(id uint, ip string) error {
 	}).Error
 }
 
-func (r *GatewayKeys) AddUsage(id uint, promptTokens, completionTokens, totalTokens int64, now time.Time) error {
+func (r *GatewayKeys) AddUsage(id uint, promptTokens, completionTokens, totalTokens, cachedTokens int64, cost float64, now time.Time) error {
 	day := now.Format("2006-01-02")
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		var key GatewayKey
@@ -96,24 +96,47 @@ func (r *GatewayKeys) AddUsage(id uint, promptTokens, completionTokens, totalTok
 		}
 		if key.UsageDate != day {
 			if err := tx.Model(&GatewayKey{}).Where("id = ?", id).Updates(map[string]any{
-				"usage_date":   day,
-				"today_tokens": 0,
-				"today_cost":   0,
+				"usage_date":          day,
+				"today_tokens":        0,
+				"today_prompt_tokens": 0,
+				"today_cached_tokens": 0,
+				"today_cost":          0,
 			}).Error; err != nil {
 				return err
 			}
 		}
+		if promptTokens < 0 {
+			promptTokens = 0
+		}
+		if completionTokens < 0 {
+			completionTokens = 0
+		}
 		if totalTokens <= 0 {
 			totalTokens = promptTokens + completionTokens
 		}
-		cost := float64(totalTokens) * key.CostPerMillion / 1_000_000
+		if totalTokens < 0 {
+			totalTokens = 0
+		}
+		if cachedTokens < 0 {
+			cachedTokens = 0
+		}
+		if promptTokens > 0 && cachedTokens > promptTokens {
+			cachedTokens = promptTokens
+		}
+		if cost < 0 {
+			cost = 0
+		}
 		return tx.Model(&GatewayKey{}).Where("id = ?", id).Updates(map[string]any{
-			"today_tokens": gorm.Expr("today_tokens + ?", totalTokens),
-			"total_tokens": gorm.Expr("total_tokens + ?", totalTokens),
-			"today_cost":   gorm.Expr("today_cost + ?", cost),
-			"total_cost":   gorm.Expr("total_cost + ?", cost),
-			"enabled":      gorm.Expr("CASE WHEN balance_limit > 0 AND total_cost + ? >= balance_limit THEN ? ELSE enabled END", cost, false),
-			"last_used_at": &now,
+			"today_tokens":        gorm.Expr("today_tokens + ?", totalTokens),
+			"total_tokens":        gorm.Expr("total_tokens + ?", totalTokens),
+			"today_prompt_tokens": gorm.Expr("today_prompt_tokens + ?", promptTokens),
+			"total_prompt_tokens": gorm.Expr("total_prompt_tokens + ?", promptTokens),
+			"today_cached_tokens": gorm.Expr("today_cached_tokens + ?", cachedTokens),
+			"total_cached_tokens": gorm.Expr("total_cached_tokens + ?", cachedTokens),
+			"today_cost":          gorm.Expr("today_cost + ?", cost),
+			"total_cost":          gorm.Expr("total_cost + ?", cost),
+			"enabled":             gorm.Expr("CASE WHEN balance_limit > 0 AND total_cost + ? >= balance_limit THEN ? ELSE enabled END", cost, false),
+			"last_used_at":        &now,
 		}).Error
 	})
 }
@@ -189,6 +212,7 @@ func orderUpstreamGroupKeys(q *gorm.DB, table string) *gorm.DB {
 }
 
 func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
+	normalizeGroupKeyPrices(key)
 	var existing UpstreamGroupKey
 	err := r.db.Where("channel_id = ? AND group_ref = ?", key.ChannelID, key.GroupRef).First(&existing).Error
 	switch {
@@ -200,6 +224,8 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 		existing.GroupName = key.GroupName
 		existing.GroupDesc = key.GroupDesc
 		existing.Ratio = key.Ratio
+		existing.InputPricePerMillion = key.InputPricePerMillion
+		existing.OutputPricePerMillion = key.OutputPricePerMillion
 		if existing.ClientFormat == "" {
 			existing.ClientFormat = "openai"
 		}
@@ -232,6 +258,18 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 		return r.db.Create(key).Error
 	default:
 		return err
+	}
+}
+
+func normalizeGroupKeyPrices(key *UpstreamGroupKey) {
+	if key == nil {
+		return
+	}
+	if key.InputPricePerMillion <= 0 {
+		key.InputPricePerMillion = DefaultInputPricePerMillion
+	}
+	if key.OutputPricePerMillion <= 0 {
+		key.OutputPricePerMillion = DefaultOutputPricePerMillion
 	}
 }
 
@@ -497,5 +535,11 @@ func (r *UsageLogs) List(limit, offset int) ([]UsageLog, int64, error) {
 // DeleteOlderThan 清理指定时间点之前的记录，返回删除条数。
 func (r *UsageLogs) DeleteOlderThan(cutoff time.Time) (int64, error) {
 	res := r.db.Where("created_at < ?", cutoff).Delete(&UsageLog{})
+	return res.RowsAffected, res.Error
+}
+
+// Clear 删除全部使用明细日志；不触碰 GatewayKey 上的累计统计。
+func (r *UsageLogs) Clear() (int64, error) {
+	res := r.db.Where("1 = 1").Delete(&UsageLog{})
 	return res.RowsAffected, res.Error
 }

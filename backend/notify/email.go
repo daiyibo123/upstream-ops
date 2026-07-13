@@ -129,44 +129,37 @@ func sanitizeMailHeader(value string) string {
 func buildEmailHTML(subject, body string, msg Message) string {
 	event := emailEventLabel(msg.Event)
 	when := time.Now().Format("2006-01-02 15:04:05")
-	details := emailDetailRows(body)
-	pre := html.EscapeString(body)
-	pre = strings.ReplaceAll(pre, "\n", "<br>")
-	channel := ""
+	content := emailContentHTML(body)
+	meta := []string{fmt.Sprintf(`<span style="display:inline-block;margin:0 8px 8px 0;border-radius:999px;background:#dbeafe;color:#1e40af;padding:6px 12px;font-size:13px;font-weight:700;">%s</span>`, html.EscapeString(event))}
 	if msg.ChannelID > 0 {
-		channel = fmt.Sprintf(`<span style="display:inline-block;margin-left:8px;color:#64748b;">上游 #%d</span>`, msg.ChannelID)
+		meta = append(meta, fmt.Sprintf(`<span style="display:inline-block;margin:0 8px 8px 0;border-radius:999px;background:#f1f5f9;color:#334155;padding:6px 12px;font-size:13px;font-weight:700;">上游 #%d</span>`, msg.ChannelID))
 	}
-	model := ""
 	if strings.TrimSpace(msg.ModelName) != "" {
-		model = fmt.Sprintf(`<span style="display:inline-block;margin-left:8px;color:#64748b;">%s</span>`, html.EscapeString(msg.ModelName))
+		meta = append(meta, fmt.Sprintf(`<span style="display:inline-block;margin:0 8px 8px 0;border-radius:999px;background:#f1f5f9;color:#334155;padding:6px 12px;font-size:13px;font-weight:700;">%s</span>`, html.EscapeString(msg.ModelName)))
 	}
 	return fmt.Sprintf(`<!doctype html>
 <html>
-<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;color:#0f172a;">
+<body style="margin:0;padding:0;background:#e5e7eb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;color:#111827;">
   <div style="display:none;max-height:0;overflow:hidden;color:transparent;">%s</div>
-  <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background:#f1f5f9;padding:28px 12px;">
+  <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background:#e5e7eb;padding:32px 12px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="max-width:640px;overflow:hidden;border-radius:18px;background:#ffffff;box-shadow:0 18px 50px rgba(15,23,42,.10);">
+        <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="max-width:680px;overflow:hidden;border-radius:18px;background:#ffffff;border:1px solid #d1d5db;box-shadow:0 14px 38px rgba(17,24,39,.14);">
           <tr>
-            <td style="padding:24px 28px;background:linear-gradient(135deg,#0891b2,#2563eb 56%%,#10b981);color:#ffffff;">
-              <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;opacity:.86;">UpstreamOps</div>
-              <h1 style="margin:10px 0 0;font-size:22px;line-height:1.35;font-weight:750;">%s</h1>
-              <div style="margin-top:12px;font-size:13px;opacity:.92;">
-                <span style="display:inline-block;border-radius:999px;background:rgba(255,255,255,.18);padding:5px 10px;">%s</span>
-                %s%s
-              </div>
+            <td style="padding:26px 30px;background:#111827;color:#ffffff;">
+              <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#93c5fd;font-weight:800;">UpstreamOps</div>
+              <h1 style="margin:12px 0 0;font-size:24px;line-height:1.35;font-weight:800;color:#ffffff;">%s</h1>
             </td>
           </tr>
           <tr>
-            <td style="padding:24px 28px 8px;">
-              <div style="margin-bottom:16px;color:#64748b;font-size:13px;">发送时间：%s</div>
+            <td style="padding:24px 30px 8px;">
+              <div style="margin-bottom:12px;">%s</div>
+              <div style="margin-bottom:20px;color:#334155;font-size:14px;line-height:1.6;">发送时间：<span style="color:#111827;font-weight:700;">%s</span></div>
               %s
-              <div style="margin-top:18px;border:1px solid #e2e8f0;border-radius:14px;background:#f8fafc;padding:16px;color:#334155;font-size:14px;line-height:1.75;">%s</div>
             </td>
           </tr>
           <tr>
-            <td style="padding:18px 28px 24px;color:#94a3b8;font-size:12px;border-top:1px solid #eef2f7;">
+            <td style="padding:18px 30px 26px;color:#475569;font-size:13px;line-height:1.7;border-top:1px solid #e5e7eb;">
               这封邮件由 UpstreamOps 自动发送。你可以在系统设置的通知渠道和通知策略里调整接收范围。
             </td>
           </tr>
@@ -175,38 +168,61 @@ func buildEmailHTML(subject, body string, msg Message) string {
     </tr>
   </table>
 </body>
-</html>`, html.EscapeString(subject), html.EscapeString(subject), html.EscapeString(event), channel, model, when, details, pre)
+</html>`, html.EscapeString(subject), html.EscapeString(subject), strings.Join(meta, ""), when, content)
 }
 
-func emailDetailRows(body string) string {
+func emailContentHTML(body string) string {
 	lines := strings.Split(strings.ReplaceAll(body, "\r\n", "\n"), "\n")
 	rows := make([]string, 0, len(lines))
+	notes := make([]string, 0)
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		idx := strings.Index(line, "：")
-		sepLen := len("：")
-		if idx < 0 {
-			idx = strings.Index(line, ":")
-			sepLen = 1
-		}
-		if idx <= 0 || idx >= len(line)-1 {
+		label, value, ok := splitEmailLine(line)
+		if !ok {
+			notes = append(notes, fmt.Sprintf(
+				`<div style="margin:0 0 10px;border-radius:12px;background:#f8fafc;border:1px solid #e5e7eb;padding:12px 14px;color:#111827;font-size:15px;line-height:1.7;">%s</div>`,
+				html.EscapeString(line),
+			))
 			continue
 		}
-		label := strings.TrimSpace(line[:idx])
-		value := strings.TrimSpace(line[idx+sepLen:])
 		rows = append(rows, fmt.Sprintf(
-			`<tr><td style="padding:10px 12px;color:#64748b;font-size:13px;border-bottom:1px solid #eef2f7;width:120px;">%s</td><td style="padding:10px 12px;color:#0f172a;font-size:13px;border-bottom:1px solid #eef2f7;font-weight:600;">%s</td></tr>`,
+			`<tr><td style="padding:13px 14px;color:#334155;font-size:14px;line-height:1.5;border-bottom:1px solid #e5e7eb;width:148px;vertical-align:top;font-weight:700;background:#f8fafc;">%s</td><td style="padding:13px 14px;color:#111827;font-size:15px;line-height:1.55;border-bottom:1px solid #e5e7eb;font-weight:700;vertical-align:top;">%s</td></tr>`,
 			html.EscapeString(label),
 			html.EscapeString(value),
 		))
 	}
-	if len(rows) == 0 {
-		return ""
+	blocks := make([]string, 0, 2)
+	if len(rows) > 0 {
+		blocks = append(blocks, `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #d1d5db;border-radius:14px;border-collapse:separate;border-spacing:0;overflow:hidden;background:#ffffff;">`+strings.Join(rows, "")+`</table>`)
 	}
-	return `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e2e8f0;border-radius:14px;border-collapse:separate;border-spacing:0;overflow:hidden;">` + strings.Join(rows, "") + `</table>`
+	if len(notes) > 0 {
+		blocks = append(blocks, `<div style="margin-top:14px;">`+strings.Join(notes, "")+`</div>`)
+	}
+	if len(blocks) == 0 {
+		return `<div style="border-radius:14px;background:#f8fafc;border:1px solid #e5e7eb;padding:16px;color:#111827;font-size:15px;line-height:1.8;">暂无详细内容</div>`
+	}
+	return strings.Join(blocks, "")
+}
+
+func splitEmailLine(line string) (string, string, bool) {
+	idx := strings.Index(line, "：")
+	sepLen := len("：")
+	if idx < 0 {
+		idx = strings.Index(line, ":")
+		sepLen = 1
+	}
+	if idx <= 0 || idx >= len(line)-1 {
+		return "", "", false
+	}
+	label := strings.TrimSpace(line[:idx])
+	value := strings.TrimSpace(line[idx+sepLen:])
+	if label == "" || value == "" {
+		return "", "", false
+	}
+	return label, value, true
 }
 
 func emailEventLabel(event storage.NotificationEvent) string {

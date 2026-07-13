@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { ChevronLeft, ChevronRight, Loader2, ScrollText } from "lucide-react"
+import { ChevronLeft, ChevronRight, KeyRound, Loader2, ScrollText, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -15,17 +15,29 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { apiFetch } from "@/lib/api"
-import { formatRatio, formatTokens, relativeTime } from "@/lib/format"
+import { formatPercent, formatRatio, formatTokens, relativeTime } from "@/lib/format"
 import type { UsageLogsResponse } from "@/lib/api-types"
 
 const PAGE_SIZE = 50
 
+function cacheRateLabel(rate: number | null | undefined, promptTokens: number | null | undefined) {
+  if (!promptTokens || promptTokens <= 0) return "—"
+  return formatPercent(rate)
+}
+
+function cacheTokenLabel(cachedTokens: number | null | undefined, promptTokens: number | null | undefined) {
+  if (!promptTokens || promptTokens <= 0) return "暂无输入缓存数据"
+  return `${formatTokens(cachedTokens)} cached / ${formatTokens(promptTokens)} input`
+}
+
 export default function UsagePage() {
   const [data, setData] = useState<UsageLogsResponse | null>(null)
   const [loading, setLoading] = useState(true)
+  const [clearing, setClearing] = useState(false)
   const [page, setPage] = useState(1)
 
   const items = data?.items ?? []
+  const keys = data?.keys ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const rangeStart = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1
@@ -51,6 +63,30 @@ export default function UsagePage() {
   }, [page])
 
   const rows = useMemo(() => items, [items])
+  const keyRows = useMemo(
+    () =>
+      keys
+        .slice()
+        .sort((a, b) => b.total_tokens - a.total_tokens || b.today_tokens - a.today_tokens || a.name.localeCompare(b.name)),
+    [keys],
+  )
+
+  async function clearUsageLogs() {
+    if (total <= 0 || clearing) return
+    if (!window.confirm("确定清空下面的调用明细吗？每个 Key 的今日/累计统计会保留。")) return
+    setClearing(true)
+    try {
+      const res = await apiFetch<{ deleted: number }>("/gateway/usage-logs", { method: "DELETE" })
+      setData((prev) => (prev ? { ...prev, items: [], total: 0 } : prev))
+      setPage(1)
+      toast.success(`已清空 ${res.deleted ?? total} 条明细，Key 汇总未受影响`)
+    } catch (err) {
+      const error = err as Error
+      toast.error(error.message || "清空使用记录失败")
+    } finally {
+      setClearing(false)
+    }
+  }
 
   return (
     <section className="space-y-3">
@@ -66,12 +102,113 @@ export default function UsagePage() {
       <Card className="border border-border shadow-none">
         <CardHeader className="flex flex-row items-center justify-between pb-3">
           <CardTitle className="flex items-center gap-2 text-base font-semibold">
+            <KeyRound className="size-4 text-brand" />
+            调用 Key 汇总
+          </CardTitle>
+          <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
+            {keyRows.length} 个 Key
+          </Badge>
+        </CardHeader>
+        <CardContent>
+          <div className="overflow-x-auto rounded-md border border-border">
+            <Table className="min-w-[900px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead>网关 Key</TableHead>
+                  <TableHead className="text-right">今日用量</TableHead>
+                  <TableHead className="text-right">总用量</TableHead>
+                  <TableHead className="text-right">今日缓存命中</TableHead>
+                  <TableHead className="text-right">总缓存命中</TableHead>
+                  <TableHead className="text-right">最近使用</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {loading && !data ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="h-20 text-center text-xs text-muted-foreground">
+                      <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
+                      加载中...
+                    </TableCell>
+                  </TableRow>
+                ) : keyRows.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={6} className="h-20 text-center text-xs text-muted-foreground">
+                      还没有调用 Key
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  keyRows.map((key) => (
+                    <TableRow key={key.id}>
+                      <TableCell>
+                        <div className="min-w-0">
+                          <p className="truncate text-xs font-medium text-foreground">{key.name}</p>
+                          <p className="mt-0.5 text-[10px] text-muted-foreground">
+                            {key.key_prefix} · {key.enabled ? "启用" : "停用"}
+                            {key.is_public ? " · 公益 Key" : ""}
+                          </p>
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right text-xs">
+                        <span className="font-medium text-foreground">{formatTokens(key.today_tokens)}</span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                          输入 {formatTokens(key.today_prompt_tokens)}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right text-xs">
+                        <span className="font-medium text-foreground">{formatTokens(key.total_tokens)}</span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                          输入 {formatTokens(key.total_prompt_tokens)}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right text-xs">
+                        <span className="font-medium text-foreground">
+                          {cacheRateLabel(key.today_cache_hit_rate, key.today_prompt_tokens)}
+                        </span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                          {cacheTokenLabel(key.today_cached_tokens, key.today_prompt_tokens)}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right text-xs">
+                        <span className="font-medium text-foreground">
+                          {cacheRateLabel(key.total_cache_hit_rate, key.total_prompt_tokens)}
+                        </span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                          {cacheTokenLabel(key.total_cached_tokens, key.total_prompt_tokens)}
+                        </span>
+                      </TableCell>
+                      <TableCell className="text-right text-xs text-muted-foreground">
+                        {key.last_used_at ? relativeTime(key.last_used_at) : "未使用"}
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card className="border border-border shadow-none">
+        <CardHeader className="flex flex-row items-center justify-between pb-3">
+          <CardTitle className="flex items-center gap-2 text-base font-semibold">
             <ScrollText className="size-4 text-brand" />
             调用明细
           </CardTitle>
-          <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
-            共 {total} 条
-          </Badge>
+          <div className="flex items-center gap-2">
+            <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
+              共 {total} 条
+            </Badge>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 px-2 text-xs"
+              disabled={loading || clearing || total <= 0}
+              onClick={() => void clearUsageLogs()}
+            >
+              {clearing ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+              清空明细
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="overflow-x-auto rounded-md border border-border">
@@ -127,6 +264,10 @@ export default function UsagePage() {
                         <span className="font-medium text-foreground">{formatTokens(log.total_tokens)}</span>
                         <span className="mt-0.5 block text-[10px] text-muted-foreground">
                           {formatTokens(log.prompt_tokens)} in / {formatTokens(log.completion_tokens)} out
+                        </span>
+                        <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                          缓存 {cacheRateLabel(log.prompt_tokens > 0 ? log.cached_tokens / log.prompt_tokens : null, log.prompt_tokens)}
+                          {log.prompt_tokens > 0 ? ` · ${formatTokens(log.cached_tokens)} hit` : ""}
                         </span>
                       </TableCell>
                       <TableCell className="text-right font-mono text-xs text-foreground">

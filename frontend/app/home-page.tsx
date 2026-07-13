@@ -32,7 +32,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { apiFetch } from "@/lib/api"
-import { dateTime, formatRatio, formatTokens } from "@/lib/format"
+import { dateTime, formatPercent, formatRatio, formatTokens } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { DashboardGatewayGroup } from "@/lib/api-types"
 
@@ -47,6 +47,12 @@ interface PublicKeyStat {
   status: "available" | "expired" | "disabled" | string
   today_tokens: number
   total_tokens: number
+  today_prompt_tokens: number
+  total_prompt_tokens: number
+  today_cached_tokens: number
+  total_cached_tokens: number
+  today_cache_hit_rate: number
+  total_cache_hit_rate: number
   last_used_at?: string | null
 }
 
@@ -88,6 +94,11 @@ function maskPublicKey(value: string) {
 function pct(value: number, total: number) {
   if (!Number.isFinite(value) || !Number.isFinite(total) || total <= 0) return 0
   return Math.max(0, Math.min(100, Math.round((value / total) * 100)))
+}
+
+function cacheRateText(rate: number | null | undefined, promptTokens: number | null | undefined) {
+  if (!promptTokens || promptTokens <= 0) return "缓存命中 —"
+  return `缓存命中 ${formatPercent(rate)}`
 }
 
 function publicKeyErrorMessage(message: string, action: "copy" | "view") {
@@ -362,6 +373,12 @@ export default function HomePage() {
                   <p className="mt-1 text-xs text-muted-foreground">
                     今日 {formatTokens(publicKey?.today_tokens)} · 累计 {formatTokens(publicKey?.total_tokens)}
                     {publicKey?.expires_at ? ` · 有效期至 ${dateTime(publicKey.expires_at)}` : ""}
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {cacheRateText(publicKey?.total_cache_hit_rate, publicKey?.total_prompt_tokens)}
+                    {publicKey?.total_prompt_tokens
+                      ? ` · 命中 ${formatTokens(publicKey.total_cached_tokens)} / 输入 ${formatTokens(publicKey.total_prompt_tokens)}`
+                      : ""}
                   </p>
                 </div>
                 <Badge

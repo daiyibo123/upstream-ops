@@ -51,9 +51,11 @@ const (
 	streamPreflightMaxEvents = 16
 	streamPreflightMaxBytes  = 64 << 10
 	// proxyFailureCooldown 是"请求失败后该候选临时不可调度"的固定时长。
-	proxyFailureCooldown      = 5 * time.Minute
+	proxyFailureCooldown        = 5 * time.Minute
 	defaultHealthProbeBatchSize = 30
 )
+
+var errResponsesStreamTerminal = errors.New("responses stream terminal event emitted")
 
 type Service struct {
 	channels   *storage.Channels
@@ -72,29 +74,29 @@ type Service struct {
 }
 
 type CreateGatewayKeyInput struct {
-	Name            string `json:"name"`
-	ClientFormat    string `json:"client_format"`
-	AllowedGroupIDs []uint `json:"allowed_group_ids"`
-	DailyLimit      int64  `json:"daily_limit"`
-	TotalLimit      int64  `json:"total_limit"`
-	CostPerMillion  float64 `json:"cost_per_million"`
-	BalanceLimit    float64 `json:"balance_limit"`
-	ConcurrencyLimit int    `json:"concurrency_limit"`
-	ExpiresInDays   int    `json:"expires_in_days"`
+	Name             string  `json:"name"`
+	ClientFormat     string  `json:"client_format"`
+	AllowedGroupIDs  []uint  `json:"allowed_group_ids"`
+	DailyLimit       int64   `json:"daily_limit"`
+	TotalLimit       int64   `json:"total_limit"`
+	CostPerMillion   float64 `json:"cost_per_million"`
+	BalanceLimit     float64 `json:"balance_limit"`
+	ConcurrencyLimit int     `json:"concurrency_limit"`
+	ExpiresInDays    int     `json:"expires_in_days"`
 }
 
 type UpdateGatewayKeyInput struct {
-	Name            *string    `json:"name"`
-	Enabled         *bool      `json:"enabled"`
-	ClientFormat    *string    `json:"client_format"`
-	AllowedGroupIDs []uint     `json:"allowed_group_ids"`
-	DailyLimit      *int64     `json:"daily_limit"`
-	TotalLimit      *int64     `json:"total_limit"`
-	CostPerMillion  *float64   `json:"cost_per_million"`
-	BalanceLimit    *float64   `json:"balance_limit"`
-	ConcurrencyLimit *int      `json:"concurrency_limit"`
-	ExpiresInDays   *int       `json:"expires_in_days"`
-	ExpiresAt       *time.Time `json:"expires_at"`
+	Name             *string    `json:"name"`
+	Enabled          *bool      `json:"enabled"`
+	ClientFormat     *string    `json:"client_format"`
+	AllowedGroupIDs  []uint     `json:"allowed_group_ids"`
+	DailyLimit       *int64     `json:"daily_limit"`
+	TotalLimit       *int64     `json:"total_limit"`
+	CostPerMillion   *float64   `json:"cost_per_million"`
+	BalanceLimit     *float64   `json:"balance_limit"`
+	ConcurrencyLimit *int       `json:"concurrency_limit"`
+	ExpiresInDays    *int       `json:"expires_in_days"`
+	ExpiresAt        *time.Time `json:"expires_at"`
 }
 
 type GatewayKeyOutput struct {
@@ -109,6 +111,12 @@ type GatewayKeyOutput struct {
 	TotalLimit         int64      `json:"total_limit"`
 	TodayTokens        int64      `json:"today_tokens"`
 	TotalTokens        int64      `json:"total_tokens"`
+	TodayPromptTokens  int64      `json:"today_prompt_tokens"`
+	TotalPromptTokens  int64      `json:"total_prompt_tokens"`
+	TodayCachedTokens  int64      `json:"today_cached_tokens"`
+	TotalCachedTokens  int64      `json:"total_cached_tokens"`
+	TodayCacheHitRate  float64    `json:"today_cache_hit_rate"`
+	TotalCacheHitRate  float64    `json:"total_cache_hit_rate"`
 	CostPerMillion     float64    `json:"cost_per_million"`
 	BalanceLimit       float64    `json:"balance_limit"`
 	ConcurrencyLimit   int        `json:"concurrency_limit"`
@@ -127,17 +135,23 @@ type GatewayKeyOutput struct {
 }
 
 type GatewayKeyUsageOutput struct {
-	ID               uint    `json:"id"`
-	Name             string  `json:"name"`
-	KeyPrefix        string  `json:"key_prefix"`
-	TodayTokens      int64   `json:"today_tokens"`
-	TodayCost        float64 `json:"today_cost"`
-	TotalTokens      int64   `json:"total_tokens"`
-	TotalCost        float64 `json:"total_cost"`
-	CostPerMillion   float64 `json:"cost_per_million"`
-	BalanceLimit     float64 `json:"balance_limit"`
-	BalanceRemaining float64 `json:"balance_remaining"`
-	UsageDate        string  `json:"usage_date,omitempty"`
+	ID                uint    `json:"id"`
+	Name              string  `json:"name"`
+	KeyPrefix         string  `json:"key_prefix"`
+	TodayTokens       int64   `json:"today_tokens"`
+	TodayCost         float64 `json:"today_cost"`
+	TotalTokens       int64   `json:"total_tokens"`
+	TotalCost         float64 `json:"total_cost"`
+	TodayPromptTokens int64   `json:"today_prompt_tokens"`
+	TotalPromptTokens int64   `json:"total_prompt_tokens"`
+	TodayCachedTokens int64   `json:"today_cached_tokens"`
+	TotalCachedTokens int64   `json:"total_cached_tokens"`
+	TodayCacheHitRate float64 `json:"today_cache_hit_rate"`
+	TotalCacheHitRate float64 `json:"total_cache_hit_rate"`
+	CostPerMillion    float64 `json:"cost_per_million"`
+	BalanceLimit      float64 `json:"balance_limit"`
+	BalanceRemaining  float64 `json:"balance_remaining"`
+	UsageDate         string  `json:"usage_date,omitempty"`
 }
 
 type ConfigurePublicGatewayKeyInput struct {
@@ -149,17 +163,23 @@ type ConfigurePublicGatewayKeyInput struct {
 }
 
 type PublicGatewayKeyOutput struct {
-	ID               uint       `json:"id"`
-	Enabled          bool       `json:"enabled"`
-	Name             string     `json:"name"`
-	KeyPrefix        string     `json:"key_prefix"`
-	MaskedKey        string     `json:"masked_key,omitempty"`
-	PasswordRequired bool       `json:"password_required"`
-	PasswordHint     string     `json:"password_hint,omitempty"`
-	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
-	TodayTokens      int64      `json:"today_tokens"`
-	TotalTokens      int64      `json:"total_tokens"`
-	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
+	ID                uint       `json:"id"`
+	Enabled           bool       `json:"enabled"`
+	Name              string     `json:"name"`
+	KeyPrefix         string     `json:"key_prefix"`
+	MaskedKey         string     `json:"masked_key,omitempty"`
+	PasswordRequired  bool       `json:"password_required"`
+	PasswordHint      string     `json:"password_hint,omitempty"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	TodayTokens       int64      `json:"today_tokens"`
+	TotalTokens       int64      `json:"total_tokens"`
+	TodayPromptTokens int64      `json:"today_prompt_tokens"`
+	TotalPromptTokens int64      `json:"total_prompt_tokens"`
+	TodayCachedTokens int64      `json:"today_cached_tokens"`
+	TotalCachedTokens int64      `json:"total_cached_tokens"`
+	TodayCacheHitRate float64    `json:"today_cache_hit_rate"`
+	TotalCacheHitRate float64    `json:"total_cache_hit_rate"`
+	LastUsedAt        *time.Time `json:"last_used_at,omitempty"`
 }
 
 type BootstrapResult struct {
@@ -199,24 +219,24 @@ func blockedBootstrapKeyKeyword(ch storage.Channel, group connector.APIKeyGroup)
 }
 
 type HealthResult struct {
-	Total         int                `json:"total"`
-	Checked       int                `json:"checked"`
-	Alive         int                `json:"alive"`
-	Dead          int                `json:"dead"`
-	ZeroBalance   int                `json:"zero_balance"`
-	RateLimited   int                `json:"rate_limited"`
-	Forbidden     int                `json:"forbidden"`
-	NonGeneration int                `json:"non_generation"`
-	AuthFailed    int                `json:"auth_failed"`
-	Timeout       int                `json:"timeout"`
-	NetworkError  int                `json:"network_error"`
-	UpstreamError int                `json:"upstream_error"`
-	ModelError    int                `json:"model_error"`
+	Total          int                `json:"total"`
+	Checked        int                `json:"checked"`
+	Alive          int                `json:"alive"`
+	Dead           int                `json:"dead"`
+	ZeroBalance    int                `json:"zero_balance"`
+	RateLimited    int                `json:"rate_limited"`
+	Forbidden      int                `json:"forbidden"`
+	NonGeneration  int                `json:"non_generation"`
+	AuthFailed     int                `json:"auth_failed"`
+	Timeout        int                `json:"timeout"`
+	NetworkError   int                `json:"network_error"`
+	UpstreamError  int                `json:"upstream_error"`
+	ModelError     int                `json:"model_error"`
 	InvalidRequest int                `json:"invalid_request"`
-	ServerError     int                `json:"server_error"`
-	BatchSize       int                `json:"batch_size"`
-	Batches         int                `json:"batches"`
-	Items           []HealthResultItem `json:"items"`
+	ServerError    int                `json:"server_error"`
+	BatchSize      int                `json:"batch_size"`
+	Batches        int                `json:"batches"`
+	Items          []HealthResultItem `json:"items"`
 }
 
 type HealthResultItem struct {
@@ -266,6 +286,7 @@ type usageTokens struct {
 	Prompt      int64
 	Completion  int64
 	Total       int64
+	Cached      int64
 	ResponseID  string
 	SoftFailure string
 }
@@ -363,6 +384,14 @@ func (s *Service) ListUsageLogs(limit, offset int) ([]storage.UsageLog, int64, e
 	return s.usageLogs.List(limit, offset)
 }
 
+// ClearUsageLogs 删除请求明细日志，但保留 GatewayKey 上的当日/累计用量统计。
+func (s *Service) ClearUsageLogs() (int64, error) {
+	if s.usageLogs == nil {
+		return 0, nil
+	}
+	return s.usageLogs.Clear()
+}
+
 // recordUsageLog 在请求成功后异步写一条使用记录。失败只记 warn，绝不影响主请求。
 func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *storage.UpstreamGroupKey, model string, usage usageTokens) {
 	if s.usageLogs == nil || candidate == nil {
@@ -377,6 +406,7 @@ func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *stor
 		PromptTokens:     usage.Prompt,
 		CompletionTokens: usage.Completion,
 		TotalTokens:      usage.Total,
+		CachedTokens:     usage.Cached,
 		Ratio:            candidate.Ratio,
 	}
 	if gatewayKey != nil {
@@ -386,6 +416,37 @@ func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *stor
 	if err := s.usageLogs.Add(entry); err != nil && s.log != nil {
 		s.log.Warn("record usage log failed", "err", err)
 	}
+}
+
+func gatewayUsageCost(usage usageTokens, candidate *storage.UpstreamGroupKey) float64 {
+	if candidate == nil {
+		return 0
+	}
+	promptTokens := usage.Prompt
+	if promptTokens < 0 {
+		promptTokens = 0
+	}
+	completionTokens := usage.Completion
+	if completionTokens < 0 {
+		completionTokens = 0
+	}
+	totalTokens := usage.Total
+	if totalTokens <= 0 {
+		totalTokens = promptTokens + completionTokens
+	}
+	if promptTokens+completionTokens <= 0 && totalTokens > 0 {
+		promptTokens = totalTokens
+	}
+	inputPrice := candidate.InputPricePerMillion
+	if inputPrice <= 0 {
+		inputPrice = storage.DefaultInputPricePerMillion
+	}
+	outputPrice := candidate.OutputPricePerMillion
+	if outputPrice <= 0 {
+		outputPrice = storage.DefaultOutputPricePerMillion
+	}
+	ratio := normalizedRatio(candidate.Ratio)
+	return (float64(promptTokens)*inputPrice + float64(completionTokens)*outputPrice) * ratio / 1_000_000
 }
 
 func (s *Service) UpdateUpstreamConfig(cfg config.UpstreamConfig) {
@@ -419,27 +480,23 @@ func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutp
 	if err != nil {
 		return nil, err
 	}
-	costPerMillion := math.Max(0, input.CostPerMillion)
 	balanceLimit := math.Max(0, input.BalanceLimit)
 	concurrencyLimit := input.ConcurrencyLimit
 	if concurrencyLimit < 0 {
 		concurrencyLimit = 0
 	}
-	if balanceLimit > 0 && costPerMillion <= 0 {
-		return nil, errors.New("设置余额上限时需要填写每百万 Token 费用")
-	}
 	rec := &storage.GatewayKey{
-		Name:            name,
-		KeyPrefix:       visiblePrefix(key),
-		KeyHash:         HashKey(key),
-		KeyCipher:       ciphertext,
-		Enabled:         true,
-		ClientFormat:    normalizeClientFormat(input.ClientFormat),
-		AllowedGroupIDs: encodeUintList(input.AllowedGroupIDs),
-		DailyLimit:      maxInt64(0, input.DailyLimit),
-		TotalLimit:      maxInt64(0, input.TotalLimit),
-		CostPerMillion:  costPerMillion,
-		BalanceLimit:    balanceLimit,
+		Name:             name,
+		KeyPrefix:        visiblePrefix(key),
+		KeyHash:          HashKey(key),
+		KeyCipher:        ciphertext,
+		Enabled:          true,
+		ClientFormat:     normalizeClientFormat(input.ClientFormat),
+		AllowedGroupIDs:  encodeUintList(input.AllowedGroupIDs),
+		DailyLimit:       maxInt64(0, input.DailyLimit),
+		TotalLimit:       maxInt64(0, input.TotalLimit),
+		CostPerMillion:   math.Max(0, input.CostPerMillion),
+		BalanceLimit:     balanceLimit,
 		ConcurrencyLimit: concurrencyLimit,
 	}
 	if input.ExpiresInDays > 0 {
@@ -529,9 +586,6 @@ func (s *Service) UpdateGatewayKey(id uint, input UpdateGatewayKeyInput) (*Gatew
 		if key.ConcurrencyLimit < 0 {
 			key.ConcurrencyLimit = 0
 		}
-	}
-	if key.BalanceLimit > 0 && key.CostPerMillion <= 0 {
-		return nil, errors.New("设置余额上限时需要填写每百万 Token 费用")
 	}
 	if input.ExpiresInDays != nil {
 		days := *input.ExpiresInDays
@@ -790,20 +844,22 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 	// groupRef 用分组名归一化，保证同渠道下唯一。
 	groupRef := "manual:" + strings.ToLower(groupName)
 	rec := &storage.UpstreamGroupKey{
-		ChannelID:    ch.ID,
-		ChannelName:  ch.Name,
-		ChannelType:  ch.Type,
-		ClientFormat: format,
-		RequestMode:  mode,
-		GroupRef:     groupRef,
-		GroupName:    groupName,
-		GroupDesc:    strings.TrimSpace(input.GroupDesc),
-		Ratio:        ratio,
-		Priority:     input.Priority,
-		Charity:      input.Charity,
-		Enabled:      true,
-		KeyCipher:    cipher,
-		Status:       "unknown",
+		ChannelID:             ch.ID,
+		ChannelName:           ch.Name,
+		ChannelType:           ch.Type,
+		ClientFormat:          format,
+		RequestMode:           mode,
+		GroupRef:              groupRef,
+		GroupName:             groupName,
+		GroupDesc:             strings.TrimSpace(input.GroupDesc),
+		Ratio:                 ratio,
+		InputPricePerMillion:  storage.DefaultInputPricePerMillion,
+		OutputPricePerMillion: storage.DefaultOutputPricePerMillion,
+		Priority:              input.Priority,
+		Charity:               input.Charity,
+		Enabled:               true,
+		KeyCipher:             cipher,
+		Status:                "unknown",
 	}
 	if err := s.groupKeys.Upsert(rec); err != nil {
 		return nil, fmt.Errorf("保存分组失败: %w", err)
@@ -978,12 +1034,12 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 	for pos, idx := range enabled {
 		item := healthResultItemFromGroup(&list[idx], "queued")
 		observer.Emit(progress.Event{
-			Stage: progress.StageGatewayHealth,
+			Stage:   progress.StageGatewayHealth,
 			Message: fmt.Sprintf("等待测活：%s / %s", list[idx].ChannelName, list[idx].GroupName),
-			Data: healthProgressPayload("queued", item, 0, batchSize, 0, result.Total),
-			Time: time.Now(),
-			Index: pos + 1,
-			Total: result.Total,
+			Data:    healthProgressPayload("queued", item, 0, batchSize, 0, result.Total),
+			Time:    time.Now(),
+			Index:   pos + 1,
+			Total:   result.Total,
 		})
 	}
 	if len(enabled) > 0 {
@@ -1026,12 +1082,12 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 				checking := healthResultItemFromGroup(&list[idx], "checking")
 				checking.Batch = batchNo
 				observer.Emit(progress.Event{
-					Stage: progress.StageGatewayHealth,
+					Stage:   progress.StageGatewayHealth,
 					Message: fmt.Sprintf("正在测活：%s / %s", list[idx].ChannelName, list[idx].GroupName),
-					Data: healthProgressPayload("checking", checking, batchNo, batchSize, int(atomic.LoadInt64(&completed)), result.Total),
-					Time: time.Now(),
-					Index: int(atomic.LoadInt64(&completed)),
-					Total: result.Total,
+					Data:    healthProgressPayload("checking", checking, batchNo, batchSize, int(atomic.LoadInt64(&completed)), result.Total),
+					Time:    time.Now(),
+					Index:   int(atomic.LoadInt64(&completed)),
+					Total:   result.Total,
 				})
 
 				// Timeout starts here, after this item leaves the queue.
@@ -1044,13 +1100,13 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 				done := int(atomic.AddInt64(&completed, 1))
 				ok := item.Status == "alive"
 				observer.Emit(progress.Event{
-					Stage: progress.StageGatewayHealth,
+					Stage:   progress.StageGatewayHealth,
 					Message: fmt.Sprintf("测活完成：%s / %s %s", item.ChannelName, item.GroupName, statusTextForHealth(item.Status)),
-					OK: &ok,
-					Data: healthProgressPayload(item.Status, item, batchNo, batchSize, done, result.Total),
-					Time: time.Now(),
-					Index: done,
-					Total: result.Total,
+					OK:      &ok,
+					Data:    healthProgressPayload(item.Status, item, batchNo, batchSize, done, result.Total),
+					Time:    time.Now(),
+					Index:   done,
+					Total:   result.Total,
 				})
 			}
 		}()
@@ -1113,13 +1169,13 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 	summary := fmt.Sprintf("测活完成：%d/%d 存活", result.Alive, result.Checked)
 	summary = appendHealthResultSummary(summary, result)
 	observer.Emit(progress.Event{
-		Stage: progress.StageDone,
+		Stage:   progress.StageDone,
 		Message: summary,
-		OK: ptrBool(true),
-		Data: result,
-		Time: time.Now(),
-		Index: result.Checked,
-		Total: result.Total,
+		OK:      ptrBool(true),
+		Data:    result,
+		Time:    time.Now(),
+		Index:   result.Checked,
+		Total:   result.Total,
 	})
 	return result, nil
 }
@@ -1180,12 +1236,12 @@ func healthResultItemFromGroup(key *storage.UpstreamGroupKey, status string) Hea
 
 func healthProgressPayload(status string, item HealthResultItem, batch, batchSize, completed, total int) map[string]any {
 	return map[string]any{
-		"status": status,
-		"item": item,
-		"batch": batch,
+		"status":     status,
+		"item":       item,
+		"batch":      batch,
 		"batch_size": batchSize,
-		"completed": completed,
-		"total": total,
+		"completed":  completed,
+		"total":      total,
 	}
 }
 
@@ -1428,6 +1484,9 @@ func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamG
 	if normalizeClientFormat(candidate.ClientFormat) == "claude" && request.ResponseMode == "claude" {
 		return request.alt()
 	}
+	if request.ResponseMode == "responses" && request.Stream && normalizeClientFormat(candidate.ClientFormat) != "claude" {
+		return request.altWithFallbackToSelf()
+	}
 	switch normalizeUpstreamRequestMode(candidate.RequestMode) {
 	case "chat":
 		return request.alt()
@@ -1481,6 +1540,36 @@ func (r normalizedRequest) alt() normalizedRequest {
 	return r
 }
 
+func (r normalizedRequest) altWithFallbackToSelf() normalizedRequest {
+	if !r.hasAlt() {
+		return r
+	}
+	origPath := r.Path
+	origBody := append([]byte(nil), r.Body...)
+	origMode := r.ResponseMode
+	origStream := r.Stream
+	out := r.alt()
+	out.AltPath = origPath
+	out.AltBody = origBody
+	out.AltMode = origMode
+	out.AltStream = origStream
+	return out
+}
+
+func looksLikeCodexClient(header http.Header) bool {
+	if header == nil {
+		return false
+	}
+	text := strings.ToLower(strings.Join([]string{
+		header.Get("User-Agent"),
+		header.Get("OpenAI-Beta"),
+		header.Get("Originator"),
+		header.Get("X-Stainless-Package-Version"),
+		header.Get("X-Stainless-Runtime"),
+	}, " "))
+	return strings.Contains(text, "codex") || strings.Contains(text, "responses=experimental")
+}
+
 func (s *Service) attemptStream(
 	ctx context.Context,
 	gatewayKey *storage.GatewayKey,
@@ -1492,7 +1581,7 @@ func (s *Service) attemptStream(
 	retry, usage, err := s.streamProxyCandidate(ctx, normalized, candidate, w)
 	if err == nil {
 		s.recordRuntimeSuccess(candidate.ID, time.Since(start))
-		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
+		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 		_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 		s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
 		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
@@ -1513,7 +1602,7 @@ func (s *Service) attemptStream(
 		retry, usage, err = s.streamProxyCandidate(ctx, fallback, candidate, w)
 		if err == nil {
 			s.recordRuntimeSuccess(candidate.ID, time.Since(start))
-			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
+			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
 			s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
@@ -1532,7 +1621,7 @@ func (s *Service) attemptStream(
 		retry, usage, err = s.streamProxyCandidate(ctx, rectified, candidate, w)
 		if err == nil {
 			s.recordRuntimeSuccess(candidate.ID, time.Since(start))
-			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
+			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
 			s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
@@ -1563,7 +1652,7 @@ func (s *Service) attemptNonStream(
 	if err == nil {
 		s.recordRuntimeSuccess(candidate.ID, time.Since(start))
 		usage := extractUsage(respBody)
-		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
+		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 		_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 		s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
 		s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
@@ -1577,7 +1666,7 @@ func (s *Service) attemptNonStream(
 		if err == nil {
 			s.recordRuntimeSuccess(candidate.ID, time.Since(start))
 			usage := extractUsage(respBody)
-			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
+			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
 			s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
@@ -1595,7 +1684,7 @@ func (s *Service) attemptNonStream(
 		if err == nil {
 			s.recordRuntimeSuccess(candidate.ID, time.Since(start))
 			usage := extractUsage(respBody)
-			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, time.Now())
+			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
 			s.recordUsageLog(gatewayKey, candidate, modelFromRequestBody(normalized.Body), usage)
@@ -1633,6 +1722,10 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	}
 	copyRequestHeaders(req.Header, request.Header)
 	applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
+	if request.Stream {
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+	}
 
 	client := s.httpClientFor(ctx, ch)
 	resp, err := client.Do(req)
@@ -1668,7 +1761,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			return true, usageTokens{}, err
 		}
 		copyResponseHeaders(w, header, key)
-		w.Header().Set("Content-Type", "text/event-stream")
+		setStreamResponseHeaders(w)
 		w.WriteHeader(resp.StatusCode)
 		switch request.ResponseMode {
 		case "chat":
@@ -1758,20 +1851,22 @@ func upstreamGroupKeyFrom(ch storage.Channel, group connector.APIKeyGroup, group
 		groupRef, _ = groupRefFor(ch.Type, group)
 	}
 	return &storage.UpstreamGroupKey{
-		ChannelID:        ch.ID,
-		ChannelName:      ch.Name,
-		ChannelType:      ch.Type,
-		ClientFormat:     inferGroupClientFormat(group.Name, group.Description),
-		RequestMode:      "responses",
-		GroupRef:         groupRef,
-		GroupName:        strings.TrimSpace(group.Name),
-		GroupDesc:        strings.TrimSpace(group.Description),
-		Ratio:            normalizedRatio(group.Ratio),
-		Enabled:          true,
-		ConcurrencyLimit: 0,
-		KeyCipher:        keyCipher,
-		Status:           "unknown",
-		FailureCount:     0,
+		ChannelID:             ch.ID,
+		ChannelName:           ch.Name,
+		ChannelType:           ch.Type,
+		ClientFormat:          inferGroupClientFormat(group.Name, group.Description),
+		RequestMode:           "responses",
+		GroupRef:              groupRef,
+		GroupName:             strings.TrimSpace(group.Name),
+		GroupDesc:             strings.TrimSpace(group.Description),
+		Ratio:                 normalizedRatio(group.Ratio),
+		InputPricePerMillion:  storage.DefaultInputPricePerMillion,
+		OutputPricePerMillion: storage.DefaultOutputPricePerMillion,
+		Enabled:               true,
+		ConcurrencyLimit:      0,
+		KeyCipher:             keyCipher,
+		Status:                "unknown",
+		FailureCount:          0,
 	}
 }
 
@@ -2739,7 +2834,8 @@ func responsesToChatRequestBody(body []byte) ([]byte, bool, error) {
 	for k, v := range raw {
 		switch k {
 		case "input", "instructions", "max_output_tokens", "previous_response_id",
-			"store", "reasoning", "text", "include", "parallel_tool_calls", "truncation":
+			"store", "reasoning", "text", "include", "parallel_tool_calls", "truncation",
+			"tools", "tool_choice":
 			// 这些是 Responses 专有字段，下面单独处理或直接丢弃。
 			continue
 		default:
@@ -2755,6 +2851,12 @@ func responsesToChatRequestBody(body []byte) ([]byte, bool, error) {
 		messages = []map[string]any{{"role": "user", "content": "."}}
 	}
 	out["messages"] = messages
+	if tools := responsesToolsToChatTools(raw["tools"]); len(tools) > 0 {
+		out["tools"] = tools
+		if choice := responsesToolChoiceToChat(raw["tool_choice"]); choice != nil {
+			out["tool_choice"] = choice
+		}
+	}
 	if mt, ok := raw["max_output_tokens"]; ok {
 		out["max_tokens"] = mt
 	}
@@ -2763,7 +2865,130 @@ func responsesToChatRequestBody(body []byte) ([]byte, bool, error) {
 	return encoded, stream, err
 }
 
-// responsesInputToChatMessages 把 Responses 的 input（可能是字符串或消息数组）转回 chat messages。
+// responsesToolsToChatTools converts Responses API tool declarations into Chat Completions function tools.
+func responsesToolsToChatTools(value any) []map[string]any {
+	items, ok := value.([]any)
+	if !ok || len(items) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(items))
+	seen := map[string]bool{}
+	for _, item := range items {
+		switch tool := item.(type) {
+		case string:
+			name := strings.TrimSpace(tool)
+			if converted := chatFunctionTool(name, "", nil); converted != nil && !seen[name] {
+				out = append(out, converted)
+				seen[name] = true
+			}
+		case map[string]any:
+			out = append(out, responsesToolToChatTools(tool, "", seen)...)
+		}
+	}
+	return out
+}
+
+func responsesToolToChatTools(tool map[string]any, namespace string, seen map[string]bool) []map[string]any {
+	if tool == nil {
+		return nil
+	}
+	typ := strings.ToLower(strings.TrimSpace(stringValue(tool["type"])))
+	name := strings.TrimSpace(stringValue(tool["name"]))
+	if namespace != "" && name != "" {
+		name = namespace + "__" + name
+	}
+	description := stringValue(tool["description"])
+	params := firstNonNil(tool["parameters"], tool["input_schema"], tool["schema"])
+	switch typ {
+	case "function", "custom":
+		if converted := chatFunctionTool(name, description, params); converted != nil && !seen[name] {
+			seen[name] = true
+			return []map[string]any{converted}
+		}
+	case "tool_search":
+		name = "tool_search"
+		if converted := chatFunctionTool(name, "Search for an available tool by query.", map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"query": map[string]any{"type": "string"}},
+			"required":   []string{"query"},
+		}); converted != nil && !seen[name] {
+			seen[name] = true
+			return []map[string]any{converted}
+		}
+	case "namespace":
+		ns := strings.Trim(strings.ReplaceAll(name, ".", "__"), "_")
+		children, _ := tool["tools"].([]any)
+		out := make([]map[string]any, 0, len(children))
+		for _, child := range children {
+			if childMap, ok := child.(map[string]any); ok {
+				out = append(out, responsesToolToChatTools(childMap, ns, seen)...)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+func chatFunctionTool(name, description string, params any) map[string]any {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if params == nil {
+		params = map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        name,
+			"description": description,
+			"parameters":  params,
+		},
+	}
+}
+
+func responsesToolChoiceToChat(value any) any {
+	switch v := value.(type) {
+	case nil:
+		return nil
+	case string:
+		choice := strings.TrimSpace(v)
+		switch strings.ToLower(choice) {
+		case "", "auto", "none", "required":
+			if choice == "" {
+				return nil
+			}
+			return choice
+		default:
+			return map[string]any{"type": "function", "function": map[string]any{"name": choice}}
+		}
+	case map[string]any:
+		typ := strings.ToLower(strings.TrimSpace(stringValue(v["type"])))
+		if typ == "function" || typ == "custom" {
+			name := strings.TrimSpace(stringValue(v["name"]))
+			if name == "" {
+				if fn, ok := v["function"].(map[string]any); ok {
+					name = strings.TrimSpace(stringValue(fn["name"]))
+				}
+			}
+			if name != "" {
+				return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+			}
+		}
+	}
+	return nil
+}
+
+func firstNonNil(values ...any) any {
+	for _, value := range values {
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+// responsesInputToChatMessages converts Responses input into Chat Completions messages.
 func responsesInputToChatMessages(input any) []map[string]any {
 	switch v := input.(type) {
 	case string:
@@ -2974,6 +3199,9 @@ func fallbackRequestAfterFailure(request normalizedRequest, errMsg string) (norm
 	if !request.hasAlt() || request.ResponseMode == "raw" {
 		return request, "", false
 	}
+	if request.ResponseMode == "responses_from_chat" && looksLikeEndpointMissingError(errMsg) {
+		return request.alt(), "upstream native responses fallback", true
+	}
 	// responses 模式且备有 chat 回退：只要错误像"上游不支持 responses 端点"，就自动降级到
 	// chat/completions 再打一次同一个候选。放宽判定——很多中转站上游根本不认 /v1/responses，
 	// 返回的是 gin 默认的 "404 page not found"（不含 responses 字样），不能强求错误里出现 responses。
@@ -3089,11 +3317,17 @@ func affinityIsHard(rawKey string) bool {
 func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 	out := orderCandidates(candidates)
 	sort.SliceStable(out, func(i, j int) bool {
+		schedI := candidateSchedulable(out[i])
+		schedJ := candidateSchedulable(out[j])
+		if schedI != schedJ {
+			return schedI
+		}
+		if schedI && out[i].Charity != out[j].Charity {
+			return out[i].Charity
+		}
 		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
 			return rankI < rankJ
 		}
-		// 公益优先：同为可用状态时，公益渠道永远排在付费渠道前面。
-		// 公益全部不可用（被降级到 dead/冷却）后，才会轮到付费渠道。
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
@@ -3283,6 +3517,14 @@ func (s *Service) clearRuntimeDisable(id uint) {
 func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 	out := append([]storage.UpstreamGroupKey(nil), in...)
 	sort.SliceStable(out, func(i, j int) bool {
+		schedI := candidateSchedulable(out[i])
+		schedJ := candidateSchedulable(out[j])
+		if schedI != schedJ {
+			return schedI
+		}
+		if schedI && out[i].Charity != out[j].Charity {
+			return out[i].Charity
+		}
 		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
 			return rankI < rankJ
 		}
@@ -3303,7 +3545,14 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 	return out
 }
 
+func candidateSchedulable(item storage.UpstreamGroupKey) bool {
+	return statusRank(item.Status) <= statusRank("unknown")
+}
+
 func affinityWouldPromoteCostlier(item, best storage.UpstreamGroupKey) bool {
+	if candidateSchedulable(item) && candidateSchedulable(best) && item.Charity != best.Charity {
+		return best.Charity
+	}
 	if statusRank(item.Status) > statusRank(best.Status) {
 		return true
 	}
@@ -3433,7 +3682,7 @@ func chatToResponsesResponse(body []byte) ([]byte, error) {
 	text := chatCompletionText(raw)
 	model, _ := raw["model"].(string)
 	id, _ := raw["id"].(string)
-	if id == "" {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), "resp") {
 		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	resp := map[string]any{
@@ -3475,56 +3724,315 @@ func streamNonSSEAsResponsesEvents(w http.ResponseWriter, status int, header htt
 			outBody = converted
 		}
 	}
-	response := completedResponseFromBody(outBody)
-	usage := extractUsage(outBody)
+	id, model, text, usage := responsesCompletionPartsFromBody(outBody)
 	copyResponseHeaders(w, header, key)
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
+	setStreamResponseHeaders(w)
 	w.WriteHeader(status)
-	payload, _ := json.Marshal(map[string]any{"type": "response.completed", "response": response})
-	if err := writeSSEEvent(w, sseEvent{Event: "response.completed", Data: string(payload)}); err != nil {
+	if err := writeResponsesStreamStart(w, id, model); err != nil {
 		return usage, err
 	}
-	if err := writeSSEData(w, "[DONE]"); err != nil {
+	if text != "" {
+		if err := writeResponsesTextDelta(w, id, text); err != nil {
+			return usage, err
+		}
+	}
+	if err := writeResponsesStreamEnd(w, id, model, text, usage); err != nil {
 		return usage, err
 	}
 	return usage, nil
 }
 
-func completedResponseFromBody(body []byte) map[string]any {
+func responsesCompletionPartsFromBody(body []byte) (string, string, string, usageTokens) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil || raw == nil {
-		return map[string]any{
-			"id":          "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36),
-			"object":      "response",
-			"created_at":  time.Now().Unix(),
-			"status":      "completed",
-			"output_text": strings.TrimSpace(string(body)),
-			"output": []map[string]any{{
-				"type":   "message",
-				"role":   "assistant",
-				"status": "completed",
-				"content": []map[string]any{{
-					"type": "output_text",
-					"text": strings.TrimSpace(string(body)),
-				}},
-			}},
-		}
+		return "", "", strings.TrimSpace(string(body)), usageTokens{}
 	}
 	if responseRaw, ok := raw["response"].(map[string]any); ok {
 		raw = responseRaw
 	}
-	if strings.TrimSpace(stringValue(raw["id"])) == "" {
-		raw["id"] = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	id := responseIDFromMap(raw)
+	if id == "" {
+		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
-	if strings.TrimSpace(stringValue(raw["object"])) == "" {
-		raw["object"] = "response"
+	model := strings.TrimSpace(stringValue(raw["model"]))
+	text := responseText(raw)
+	if text == "" {
+		text = strings.TrimSpace(string(body))
 	}
-	raw["status"] = "completed"
-	if _, ok := raw["created_at"]; !ok {
-		raw["created_at"] = time.Now().Unix()
+	usage := usageTokens{ResponseID: id}
+	if usageRaw, ok := raw["usage"].(map[string]any); ok {
+		usage = usageFromMap(usageRaw)
+		usage.ResponseID = id
 	}
-	return raw
+	return id, model, text, usage
+}
+
+func buildResponsesCompletedResponse(id, model, itemID, text string, usage usageTokens) map[string]any {
+	if id == "" {
+		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	if itemID == "" {
+		itemID = "item_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	item := map[string]any{
+		"id":      itemID,
+		"type":    "message",
+		"role":    "assistant",
+		"status":  "completed",
+		"content": []map[string]any{{"type": "output_text", "text": text}},
+	}
+	resp := map[string]any{
+		"id":          id,
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"status":      "completed",
+		"model":       model,
+		"output":      []map[string]any{item},
+		"output_text": text,
+	}
+	if usage.Total > 0 {
+		resp["usage"] = map[string]int64{
+			"input_tokens":  usage.Prompt,
+			"output_tokens": usage.Completion,
+			"total_tokens":  usage.Total,
+		}
+	}
+	return resp
+}
+
+func writeResponsesStreamStart(w http.ResponseWriter, id, model string) error {
+	if err := writeResponsesCreated(w, id, model); err != nil {
+		return err
+	}
+	return writeResponsesOutputStart(w, id)
+}
+
+func writeResponsesCreated(w http.ResponseWriter, id, model string) error {
+	if id == "" {
+		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	created := map[string]any{
+		"type": "response.created",
+		"response": map[string]any{
+			"id":         id,
+			"object":     "response",
+			"created_at": time.Now().Unix(),
+			"status":     "in_progress",
+			"model":      model,
+			"output":     []any{},
+		},
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.created", Data: mustJSON(created)})
+}
+
+func writeResponsesOutputStart(w http.ResponseWriter, id string) error {
+	if id == "" {
+		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	itemID := responseItemID(id)
+	added := map[string]any{
+		"type":         "response.output_item.added",
+		"response_id":  id,
+		"output_index": 0,
+		"item": map[string]any{
+			"id":      itemID,
+			"type":    "message",
+			"role":    "assistant",
+			"status":  "in_progress",
+			"content": []any{},
+		},
+	}
+	if err := writeSSEEvent(w, sseEvent{Event: "response.output_item.added", Data: mustJSON(added)}); err != nil {
+		return err
+	}
+	part := map[string]any{
+		"type":          "response.content_part.added",
+		"response_id":   id,
+		"item_id":       itemID,
+		"output_index":  0,
+		"content_index": 0,
+		"part":          map[string]any{"type": "output_text", "text": ""},
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.content_part.added", Data: mustJSON(part)})
+}
+
+func writeResponsesTextDelta(w http.ResponseWriter, id, delta string) error {
+	payload := map[string]any{
+		"type":          "response.output_text.delta",
+		"response_id":   id,
+		"item_id":       responseItemID(id),
+		"output_index":  0,
+		"content_index": 0,
+		"delta":         delta,
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.output_text.delta", Data: mustJSON(payload)})
+}
+
+func writeResponsesFunctionCallAdded(w http.ResponseWriter, responseID string, outputIndex int, callID, name string) error {
+	itemID := responseFunctionItemID(responseID, outputIndex)
+	payload := map[string]any{
+		"type":         "response.output_item.added",
+		"response_id":  responseID,
+		"output_index": outputIndex,
+		"item": map[string]any{
+			"id":        itemID,
+			"type":      "function_call",
+			"call_id":   callID,
+			"name":      name,
+			"arguments": "",
+			"status":    "in_progress",
+		},
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.output_item.added", Data: mustJSON(payload)})
+}
+
+func writeResponsesFunctionCallArgumentsDelta(w http.ResponseWriter, responseID string, outputIndex int, callID, delta string) error {
+	payload := map[string]any{
+		"type":         "response.function_call_arguments.delta",
+		"response_id":  responseID,
+		"item_id":      responseFunctionItemID(responseID, outputIndex),
+		"output_index": outputIndex,
+		"call_id":      callID,
+		"delta":        delta,
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.function_call_arguments.delta", Data: mustJSON(payload)})
+}
+
+func writeResponsesFunctionCallDone(w http.ResponseWriter, responseID string, outputIndex int, callID, name, arguments string) error {
+	itemID := responseFunctionItemID(responseID, outputIndex)
+	argsDone := map[string]any{
+		"type":         "response.function_call_arguments.done",
+		"response_id":  responseID,
+		"item_id":      itemID,
+		"output_index": outputIndex,
+		"call_id":      callID,
+		"arguments":    arguments,
+	}
+	if err := writeSSEEvent(w, sseEvent{Event: "response.function_call_arguments.done", Data: mustJSON(argsDone)}); err != nil {
+		return err
+	}
+	itemDone := map[string]any{
+		"type":         "response.output_item.done",
+		"response_id":  responseID,
+		"output_index": outputIndex,
+		"item": map[string]any{
+			"id":        itemID,
+			"type":      "function_call",
+			"call_id":   callID,
+			"name":      name,
+			"arguments": arguments,
+			"status":    "completed",
+		},
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.output_item.done", Data: mustJSON(itemDone)})
+}
+
+func writeResponsesStreamEnd(w http.ResponseWriter, id, model, text string, usage usageTokens) error {
+	if id == "" {
+		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	itemID := responseItemID(id)
+	textDone := map[string]any{
+		"type":          "response.output_text.done",
+		"response_id":   id,
+		"item_id":       itemID,
+		"output_index":  0,
+		"content_index": 0,
+		"text":          text,
+	}
+	if err := writeSSEEvent(w, sseEvent{Event: "response.output_text.done", Data: mustJSON(textDone)}); err != nil {
+		return err
+	}
+	partDone := map[string]any{
+		"type":          "response.content_part.done",
+		"response_id":   id,
+		"item_id":       itemID,
+		"output_index":  0,
+		"content_index": 0,
+		"part":          map[string]any{"type": "output_text", "text": text},
+	}
+	if err := writeSSEEvent(w, sseEvent{Event: "response.content_part.done", Data: mustJSON(partDone)}); err != nil {
+		return err
+	}
+	itemDone := map[string]any{
+		"type":         "response.output_item.done",
+		"response_id":  id,
+		"output_index": 0,
+		"item": map[string]any{
+			"id":      itemID,
+			"type":    "message",
+			"role":    "assistant",
+			"status":  "completed",
+			"content": []map[string]any{{"type": "output_text", "text": text}},
+		},
+	}
+	if err := writeSSEEvent(w, sseEvent{Event: "response.output_item.done", Data: mustJSON(itemDone)}); err != nil {
+		return err
+	}
+	completed := buildResponsesCompletedResponse(id, model, itemID, text, usage)
+	if err := writeSSEEvent(w, sseEvent{Event: "response.completed", Data: mustJSON(map[string]any{"type": "response.completed", "response": completed})}); err != nil {
+		return err
+	}
+	return writeSSEData(w, "[DONE]")
+}
+
+func writeResponsesStreamFailure(w http.ResponseWriter, id, model, code, message string) error {
+	if id == "" {
+		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	code = strings.TrimSpace(code)
+	if code == "" {
+		code = "upstream_error"
+	}
+	message = strings.TrimSpace(message)
+	if message == "" {
+		message = "upstream stream failed"
+	}
+	payload := map[string]any{
+		"type": "response.failed",
+		"response": map[string]any{
+			"id":     id,
+			"object": "response",
+			"status": "failed",
+			"model":  model,
+			"output": []any{},
+			"error":  map[string]any{"code": code, "message": message},
+		},
+	}
+	if err := writeSSEEvent(w, sseEvent{Event: "response.failed", Data: mustJSON(payload)}); err != nil {
+		return err
+	}
+	return writeSSEData(w, "[DONE]")
+}
+
+func responseItemID(responseID string) string {
+	if responseID == "" {
+		responseID = strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return "item_" + strings.TrimPrefix(responseID, "resp_")
+}
+
+func responseFunctionItemID(responseID string, outputIndex int) string {
+	if responseID == "" {
+		responseID = strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return fmt.Sprintf("fc_%s_%d", strings.TrimPrefix(responseID, "resp_"), outputIndex)
+}
+
+func mustJSON(v any) string {
+	data, _ := json.Marshal(v)
+	return string(data)
+}
+
+func setStreamResponseHeaders(w http.ResponseWriter) {
+	if w == nil {
+		return
+	}
+	header := w.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache, no-transform")
+	header.Set("Connection", "keep-alive")
+	header.Set("X-Accel-Buffering", "no")
 }
 
 func looksLikeChatCompletionResponse(body []byte) bool {
@@ -3777,7 +4285,72 @@ func usageFromMap(usageRaw map[string]any) usageTokens {
 	if total == 0 {
 		total = prompt + completion
 	}
-	return usageTokens{Prompt: prompt, Completion: completion, Total: total}
+	if prompt < 0 {
+		prompt = 0
+	}
+	if completion < 0 {
+		completion = 0
+	}
+	if total < 0 {
+		total = 0
+	}
+	cached := cachedTokensFromUsage(usageRaw)
+	if cached < 0 {
+		cached = 0
+	}
+	if prompt > 0 && cached > prompt {
+		cached = prompt
+	}
+	return usageTokens{Prompt: prompt, Completion: completion, Total: total, Cached: cached}
+}
+
+func cachedTokensFromUsage(usageRaw map[string]any) int64 {
+	for _, path := range [][]string{
+		{"prompt_tokens_details", "cached_tokens"},
+		{"input_tokens_details", "cached_tokens"},
+	} {
+		if n := nestedIntField(usageRaw, path...); n > 0 {
+			return n
+		}
+	}
+	for _, key := range []string{
+		"cached_tokens",
+		"cache_read_input_tokens",
+		"prompt_cache_hit_tokens",
+		"cache_hit_tokens",
+		"cached_input_tokens",
+	} {
+		if n := intField(usageRaw, key); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func nestedIntField(raw map[string]any, path ...string) int64 {
+	if len(path) == 0 {
+		return 0
+	}
+	var cur any = raw
+	for i, key := range path {
+		obj, ok := cur.(map[string]any)
+		if !ok {
+			return 0
+		}
+		value, ok := obj[key]
+		if !ok {
+			return 0
+		}
+		if i == len(path)-1 {
+			n, ok := numericValue(value)
+			if !ok {
+				return 0
+			}
+			return n
+		}
+		cur = value
+	}
+	return 0
 }
 
 type limitedCapture struct {
@@ -3829,23 +4402,80 @@ func streamResponsesAsChat(w http.ResponseWriter, r io.Reader) (usageTokens, err
 func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader) (usageTokens, error) {
 	id := "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	model := ""
-	createdSent := false
+	startSent := false
 	var best usageTokens
 	var textBuf strings.Builder
+	type chatToolCallState struct {
+		OutputIndex int
+		CallID      string
+		Name        string
+		Added       bool
+		Args        strings.Builder
+	}
+	toolCalls := map[int]*chatToolCallState{}
+	toolOrder := make([]int, 0)
 
-	emitCreated := func() error {
-		if createdSent {
+	emitStart := func() error {
+		if startSent {
 			return nil
 		}
-		createdSent = true
-		payload, _ := json.Marshal(map[string]any{
-			"type": "response.created",
-			"response": map[string]any{
-				"id": id, "object": "response", "status": "in_progress", "model": model,
-			},
-		})
-		if err := writeSSEEvent(w, sseEvent{Event: "response.created", Data: string(payload)}); err != nil {
-			return err
+		startSent = true
+		return writeResponsesStreamStart(w, id, model)
+	}
+	emitToolCalls := func(raw map[string]any) error {
+		choices, _ := raw["choices"].([]any)
+		for _, c := range choices {
+			choice, _ := c.(map[string]any)
+			if choice == nil {
+				continue
+			}
+			delta, _ := choice["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			calls, _ := delta["tool_calls"].([]any)
+			for _, item := range calls {
+				call, _ := item.(map[string]any)
+				if call == nil {
+					continue
+				}
+				idx := int(intField(call, "index"))
+				state, ok := toolCalls[idx]
+				if !ok {
+					state = &chatToolCallState{OutputIndex: idx + 1}
+					toolCalls[idx] = state
+					toolOrder = append(toolOrder, idx)
+				}
+				if callID := stringValue(call["id"]); callID != "" {
+					state.CallID = callID
+				}
+				fn, _ := call["function"].(map[string]any)
+				if name := stringValue(fn["name"]); name != "" {
+					state.Name = name
+				}
+				argsDelta := stringValue(fn["arguments"])
+				if state.CallID == "" {
+					state.CallID = "call_" + strconv.FormatInt(time.Now().UnixNano()+int64(idx), 36)
+				}
+				if state.Name == "" && argsDelta == "" {
+					continue
+				}
+				if !state.Added {
+					if err := emitStart(); err != nil {
+						return err
+					}
+					if err := writeResponsesFunctionCallAdded(w, id, state.OutputIndex, state.CallID, state.Name); err != nil {
+						return err
+					}
+					state.Added = true
+				}
+				if argsDelta != "" {
+					state.Args.WriteString(argsDelta)
+					if err := writeResponsesFunctionCallArgumentsDelta(w, id, state.OutputIndex, state.CallID, argsDelta); err != nil {
+						return err
+					}
+				}
+			}
 		}
 		return nil
 	}
@@ -3861,7 +4491,7 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		if v, ok := raw["model"].(string); ok && v != "" {
 			model = v
 		}
-		if v, ok := raw["id"].(string); ok && v != "" {
+		if v, ok := raw["id"].(string); ok && strings.HasPrefix(strings.ToLower(strings.TrimSpace(v)), "resp") {
 			id = v
 			best.ResponseID = v
 		}
@@ -3871,50 +4501,38 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 				best.ResponseID = id
 			}
 		}
-		// 从 chat chunk 里取出增量文本。
-		delta := chatChunkDeltaText(raw)
-		if delta != "" {
-			if err := emitCreated(); err != nil {
-				return err
-			}
-			textBuf.WriteString(delta)
-			payload, _ := json.Marshal(map[string]any{
-				"type":        "response.output_text.delta",
-				"delta":       delta,
-				"item_id":     id,
-				"response_id": id,
-			})
-			if err := writeSSEEvent(w, sseEvent{Event: "response.output_text.delta", Data: string(payload)}); err != nil {
+		if _, ok := raw["choices"].([]any); ok {
+			if err := emitStart(); err != nil {
 				return err
 			}
 		}
-		return nil
+		// 从 chat chunk 里取出增量文本。
+		delta := chatChunkDeltaText(raw)
+		if delta != "" {
+			textBuf.WriteString(delta)
+			if err := writeResponsesTextDelta(w, id, delta); err != nil {
+				return err
+			}
+		}
+		return emitToolCalls(raw)
 	})
 	// 即使上游中途断（err != nil），只要已经开始输出，也补齐 response.completed + [DONE]，
 	// 让 Responses 协议的客户端平滑收尾，不报 "stream closed before response.completed"。
 	streamErr := err
-	if err := emitCreated(); err != nil {
+	if err := emitStart(); err != nil {
 		return best, err
 	}
-	// 收尾：completed 事件带上完整文本和 usage。
-	completed := map[string]any{
-		"id": id, "object": "response", "status": "completed", "model": model,
-		"output": []map[string]any{{
-			"type": "message", "role": "assistant", "status": "completed",
-			"content": []map[string]any{{"type": "output_text", "text": textBuf.String()}},
-		}},
-		"output_text": textBuf.String(),
-	}
-	if best.Total > 0 {
-		completed["usage"] = map[string]int64{
-			"input_tokens": best.Prompt, "output_tokens": best.Completion, "total_tokens": best.Total,
+	for _, idx := range toolOrder {
+		state := toolCalls[idx]
+		if state == nil || !state.Added {
+			continue
+		}
+		if err := writeResponsesFunctionCallDone(w, id, state.OutputIndex, state.CallID, state.Name, state.Args.String()); err != nil {
+			return best, err
 		}
 	}
-	payload, _ := json.Marshal(map[string]any{"type": "response.completed", "response": completed})
-	if err := writeSSEEvent(w, sseEvent{Event: "response.completed", Data: string(payload)}); err != nil {
-		return best, err
-	}
-	if err := writeSSEData(w, "[DONE]"); err != nil {
+	// 收尾：补齐 Responses 生命周期终态，保证 Codex 一定能看到 response.completed。
+	if err := writeResponsesStreamEnd(w, id, model, textBuf.String(), best); err != nil {
 		return best, err
 	}
 	// streamErr 已经用"补 completed"平滑收尾，且我们从没往调用方写头之外的坏数据，
@@ -4179,10 +4797,16 @@ func (r *sseStreamReader) Next() (sseEvent, error) {
 		case strings.HasPrefix(line, "event:"):
 			r.event = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
 		case strings.HasPrefix(line, "data:"):
+			value := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if r.data.Len() > 0 {
 				r.data.WriteByte('\n')
 			}
-			r.data.WriteString(strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			r.data.WriteString(value)
+			if sseDataLineReady(value) {
+				if ev, ok := dispatch(); ok {
+					return ev, nil
+				}
+			}
 		}
 	}
 	r.closed = true
@@ -4193,6 +4817,14 @@ func (r *sseStreamReader) Next() (sseEvent, error) {
 		return ev, nil
 	}
 	return sseEvent{}, io.EOF
+}
+
+func sseDataLineReady(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "[DONE]" {
+		return true
+	}
+	return strings.HasPrefix(value, "{") && strings.HasSuffix(value, "}")
 }
 
 func readSSEEvents(buffered []sseEvent, reader *sseStreamReader, emit func(event, data string) error) error {
@@ -4361,56 +4993,182 @@ func sseEventType(ev sseEvent) string {
 
 func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader, responseMode string) (usageTokens, error) {
 	var best usageTokens
-	needsResponsesCompleted := responseMode == "responses"
+	if responseMode != "responses" {
+		err := readSSEEvents(buffered, reader, func(event, data string) error {
+			if usage := usageFromSSEData(data); usage.Total > 0 {
+				best = usage
+			}
+			return writeSSEEvent(w, sseEvent{Event: event, Data: data})
+		})
+		return best, err
+	}
+
 	completedSeen := false
+	failedSeen := false
+	doneSent := false
+	createdSeen := false
+	outputStarted := false
 	model := ""
 	respID := ""
+	var textBuf strings.Builder
+
+	emitSyntheticEnd := func(streamErr error) error {
+		if !createdSeen {
+			if err := writeResponsesStreamStart(w, respID, model); err != nil {
+				return err
+			}
+			createdSeen = true
+			outputStarted = true
+		} else if !outputStarted {
+			if err := writeResponsesOutputStart(w, respID); err != nil {
+				return err
+			}
+			outputStarted = true
+		}
+		if err := writeResponsesStreamEnd(w, respID, model, textBuf.String(), best); err != nil {
+			return err
+		}
+		completedSeen = true
+		doneSent = true
+		if streamErr != nil && !errors.Is(streamErr, errResponsesStreamTerminal) {
+			best.SoftFailure = "upstream stream ended before response.completed: " + streamErr.Error()
+		} else {
+			best.SoftFailure = "upstream stream ended before response.completed"
+		}
+		return nil
+	}
+
 	err := readSSEEvents(buffered, reader, func(event, data string) error {
-		if needsResponsesCompleted && strings.TrimSpace(data) == "[DONE]" && !completedSeen {
+		trimmedData := strings.TrimSpace(data)
+		if trimmedData == "" {
 			return nil
+		}
+		if trimmedData == "[DONE]" {
+			if !completedSeen && !failedSeen {
+				if err := emitSyntheticEnd(nil); err != nil {
+					return err
+				}
+				return errResponsesStreamTerminal
+			}
+			if !doneSent {
+				doneSent = true
+				if err := writeSSEData(w, "[DONE]"); err != nil {
+					return err
+				}
+			}
+			return errResponsesStreamTerminal
 		}
 		if usage := usageFromSSEData(data); usage.Total > 0 {
 			best = usage
 		}
-		if strings.TrimSpace(data) != "" && data != "[DONE]" {
-			if id, m := sseResponseIDAndModel(data); id != "" || m != "" {
-				if id != "" {
-					respID = id
-					best.ResponseID = id
-				}
-				if m != "" {
-					model = m
-				}
+		if id, m := sseResponseIDAndModel(data); id != "" || m != "" {
+			if id != "" {
+				respID = id
+				best.ResponseID = id
+			}
+			if m != "" {
+				model = m
 			}
 		}
-		typ := sseEventType(sseEvent{Event: event, Data: data})
-		if typ == "response.completed" {
+
+		ev := sseEvent{Event: event, Data: data}
+		if failed, msg := streamEventFailure(ev); failed {
+			failedSeen = true
+			doneSent = true
+			if err := writeResponsesStreamFailure(w, respID, model, "upstream_error", msg); err != nil {
+				return err
+			}
+			best.SoftFailure = msg
+			return errResponsesStreamTerminal
+		}
+
+		typ := sseEventType(ev)
+		if strings.HasPrefix(typ, "response.") && strings.TrimSpace(event) == "" {
+			event = typ
+		}
+		switch typ {
+		case "response.created":
+			createdSeen = true
+		case "response.output_item.added":
+			if !createdSeen {
+				if err := writeResponsesCreated(w, respID, model); err != nil {
+					return err
+				}
+				createdSeen = true
+			}
+			outputStarted = true
+		case "response.content_part.added":
+			if !createdSeen {
+				if err := writeResponsesCreated(w, respID, model); err != nil {
+					return err
+				}
+				createdSeen = true
+			}
+		case "response.output_text.delta":
+			if !createdSeen {
+				if err := writeResponsesCreated(w, respID, model); err != nil {
+					return err
+				}
+				createdSeen = true
+			}
+			if !outputStarted {
+				if err := writeResponsesOutputStart(w, respID); err != nil {
+					return err
+				}
+				outputStarted = true
+			}
+			if delta := responseDeltaText(data); delta != "" {
+				textBuf.WriteString(delta)
+			}
+		case "response.completed":
+			if !createdSeen {
+				if err := writeResponsesCreated(w, respID, model); err != nil {
+					return err
+				}
+				createdSeen = true
+			}
 			completedSeen = true
+		case "response.failed", "response.incomplete", "response.cancelled":
+			failedSeen = true
 		}
 		return writeSSEEvent(w, sseEvent{Event: event, Data: data})
 	})
-	// 关键容错：上游始终没发 response.completed 时补一个合成终止事件——无论上游是"正常 EOF"还是
-	// "中途断开/超时（err != nil）"。
-	//
-	// 走 Responses 协议的客户端（Codex 直连）必须收到 response.completed 才认为流结束，
-	// 否则报 "stream closed before response.completed"。上游中途把 TCP 断掉、或 idle 超时
-	// 触发我们主动 Close，都会让 readSSEEvents 返回 err；这些情况下客户端其实已经拿到了
-	// 大部分内容，补一个 completed 让它平滑收尾，远好过把断流错误透传出去。
-	// 这正是 ccswitch 走 chat 路径时靠 [DONE] 达到的效果。
-	if needsResponsesCompleted && !completedSeen {
-		if writeErr := writeSyntheticResponseCompleted(w, respID, model, best); writeErr != nil {
-			return best, writeErr
-		}
-		if err != nil {
-			best.SoftFailure = "upstream stream ended before response.completed: " + err.Error()
-		} else {
-			best.SoftFailure = "upstream stream ended before response.completed"
-		}
-		// 已经给了客户端完整的终止事件，这个"上游中途断"的错误就不再上抛，
-		// 否则上层会误判为候选失败并可能重复请求。
+	if errors.Is(err, errResponsesStreamTerminal) {
 		return best, nil
 	}
-	return best, err
+	if failedSeen {
+		if !doneSent {
+			if writeErr := writeSSEData(w, "[DONE]"); writeErr != nil {
+				return best, writeErr
+			}
+		}
+		return best, nil
+	}
+	if !completedSeen {
+		if writeErr := emitSyntheticEnd(err); writeErr != nil {
+			return best, writeErr
+		}
+		return best, nil
+	}
+	if !doneSent {
+		if writeErr := writeSSEData(w, "[DONE]"); writeErr != nil {
+			return best, writeErr
+		}
+		doneSent = true
+	}
+	if err != nil {
+		best.SoftFailure = "upstream stream ended after response.completed: " + err.Error()
+		return best, nil
+	}
+	return best, nil
+}
+
+func responseDeltaText(data string) string {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(stringValue(raw["delta"]))
 }
 
 // sseResponseIDAndModel 从一个 responses SSE data 里尽量提取 response id 和 model。
@@ -4440,31 +5198,6 @@ func sseResponseIDAndModel(data string) (string, string) {
 		}
 	}
 	return id, model
-}
-
-// writeSyntheticResponseCompleted 合成一个 response.completed 事件 + [DONE]，用于上游漏发终止事件时兜底。
-func writeSyntheticResponseCompleted(w http.ResponseWriter, id, model string, usage usageTokens) error {
-	if id == "" {
-		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	}
-	resp := map[string]any{
-		"id":     id,
-		"object": "response",
-		"status": "completed",
-		"model":  model,
-	}
-	if usage.Total > 0 {
-		resp["usage"] = map[string]int64{
-			"input_tokens":  usage.Prompt,
-			"output_tokens": usage.Completion,
-			"total_tokens":  usage.Total,
-		}
-	}
-	payload, _ := json.Marshal(map[string]any{"type": "response.completed", "response": resp})
-	if err := writeSSEEvent(w, sseEvent{Event: "response.completed", Data: string(payload)}); err != nil {
-		return err
-	}
-	return writeSSEData(w, "[DONE]")
 }
 
 func writeSSEEvent(w http.ResponseWriter, ev sseEvent) error {
@@ -4630,60 +5363,89 @@ func enforceGatewayQuota(key *storage.GatewayKey) error {
 	return nil
 }
 
+func cacheHitRate(cachedTokens, promptTokens int64) float64 {
+	if promptTokens <= 0 {
+		return 0
+	}
+	if cachedTokens < 0 {
+		cachedTokens = 0
+	}
+	if cachedTokens > promptTokens {
+		cachedTokens = promptTokens
+	}
+	return float64(cachedTokens) / float64(promptTokens)
+}
+
 func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 	todayTokens := key.TodayTokens
 	todayCost := key.TodayCost
+	todayPromptTokens := key.TodayPromptTokens
+	todayCachedTokens := key.TodayCachedTokens
 	if key.UsageDate != "" && key.UsageDate != time.Now().Format("2006-01-02") {
 		todayTokens = 0
 		todayCost = 0
+		todayPromptTokens = 0
+		todayCachedTokens = 0
 	}
 	balanceRemaining := 0.0
 	if key.BalanceLimit > 0 {
 		balanceRemaining = math.Max(0, key.BalanceLimit-key.TotalCost)
 	}
 	return GatewayKeyOutput{
-		ID:              key.ID,
-		Name:            key.Name,
-		KeyPrefix:       key.KeyPrefix,
-		Enabled:         key.Enabled,
-		DailyLimit:      key.DailyLimit,
-		TotalLimit:      key.TotalLimit,
-		TodayTokens:     todayTokens,
-		TotalTokens:     key.TotalTokens,
-		CostPerMillion:  key.CostPerMillion,
-		BalanceLimit:    key.BalanceLimit,
-		ConcurrencyLimit: key.ConcurrencyLimit,
-		BalanceRemaining: balanceRemaining,
-		TodayCost:       todayCost,
-		TotalCost:       key.TotalCost,
-		UsageDate:       key.UsageDate,
-		ExpiresAt:       key.ExpiresAt,
-		IsPublic:        key.IsPublic,
-		PublicName:      key.PublicName,
+		ID:                 key.ID,
+		Name:               key.Name,
+		KeyPrefix:          key.KeyPrefix,
+		Enabled:            key.Enabled,
+		DailyLimit:         key.DailyLimit,
+		TotalLimit:         key.TotalLimit,
+		TodayTokens:        todayTokens,
+		TotalTokens:        key.TotalTokens,
+		TodayPromptTokens:  todayPromptTokens,
+		TotalPromptTokens:  key.TotalPromptTokens,
+		TodayCachedTokens:  todayCachedTokens,
+		TotalCachedTokens:  key.TotalCachedTokens,
+		TodayCacheHitRate:  cacheHitRate(todayCachedTokens, todayPromptTokens),
+		TotalCacheHitRate:  cacheHitRate(key.TotalCachedTokens, key.TotalPromptTokens),
+		CostPerMillion:     key.CostPerMillion,
+		BalanceLimit:       key.BalanceLimit,
+		ConcurrencyLimit:   key.ConcurrencyLimit,
+		BalanceRemaining:   balanceRemaining,
+		TodayCost:          todayCost,
+		TotalCost:          key.TotalCost,
+		UsageDate:          key.UsageDate,
+		ExpiresAt:          key.ExpiresAt,
+		IsPublic:           key.IsPublic,
+		PublicName:         key.PublicName,
 		PublicPasswordHint: key.PublicPasswordHint,
-		LastUsedAt:      key.LastUsedAt,
-		LastUsedIP:      key.LastUsedIP,
-		ClientFormat:    normalizeClientFormat(key.ClientFormat),
-		AllowedGroupIDs: decodeUintList(key.AllowedGroupIDs),
-		CreatedAt:       key.CreatedAt,
-		UpdatedAt:       key.UpdatedAt,
+		LastUsedAt:         key.LastUsedAt,
+		LastUsedIP:         key.LastUsedIP,
+		ClientFormat:       normalizeClientFormat(key.ClientFormat),
+		AllowedGroupIDs:    decodeUintList(key.AllowedGroupIDs),
+		CreatedAt:          key.CreatedAt,
+		UpdatedAt:          key.UpdatedAt,
 	}
 }
 
 func gatewayKeyUsageOutput(key storage.GatewayKey) GatewayKeyUsageOutput {
 	out := gatewayKeyOutput(key)
 	return GatewayKeyUsageOutput{
-		ID:               out.ID,
-		Name:             out.Name,
-		KeyPrefix:        out.KeyPrefix,
-		TodayTokens:      out.TodayTokens,
-		TodayCost:        out.TodayCost,
-		TotalTokens:      out.TotalTokens,
-		TotalCost:        out.TotalCost,
-		CostPerMillion:   out.CostPerMillion,
-		BalanceLimit:     out.BalanceLimit,
-		BalanceRemaining: out.BalanceRemaining,
-		UsageDate:        out.UsageDate,
+		ID:                out.ID,
+		Name:              out.Name,
+		KeyPrefix:         out.KeyPrefix,
+		TodayTokens:       out.TodayTokens,
+		TodayCost:         out.TodayCost,
+		TotalTokens:       out.TotalTokens,
+		TotalCost:         out.TotalCost,
+		TodayPromptTokens: out.TodayPromptTokens,
+		TotalPromptTokens: out.TotalPromptTokens,
+		TodayCachedTokens: out.TodayCachedTokens,
+		TotalCachedTokens: out.TotalCachedTokens,
+		TodayCacheHitRate: out.TodayCacheHitRate,
+		TotalCacheHitRate: out.TotalCacheHitRate,
+		CostPerMillion:    out.CostPerMillion,
+		BalanceLimit:      out.BalanceLimit,
+		BalanceRemaining:  out.BalanceRemaining,
+		UsageDate:         out.UsageDate,
 	}
 }
 
@@ -4692,24 +5454,34 @@ func publicGatewayKeyOutput(key *storage.GatewayKey) *PublicGatewayKeyOutput {
 		return nil
 	}
 	todayTokens := key.TodayTokens
+	todayPromptTokens := key.TodayPromptTokens
+	todayCachedTokens := key.TodayCachedTokens
 	if key.UsageDate != "" && key.UsageDate != time.Now().Format("2006-01-02") {
 		todayTokens = 0
+		todayPromptTokens = 0
+		todayCachedTokens = 0
 	}
 	name := strings.TrimSpace(key.PublicName)
 	if name == "" {
 		name = key.Name
 	}
 	return &PublicGatewayKeyOutput{
-		ID:               key.ID,
-		Enabled:          key.IsPublic && key.Enabled,
-		Name:             name,
-		KeyPrefix:        key.KeyPrefix,
-		PasswordRequired: key.PublicPasswordCipher != "",
-		PasswordHint:     key.PublicPasswordHint,
-		ExpiresAt:        key.ExpiresAt,
-		TodayTokens:      todayTokens,
-		TotalTokens:      key.TotalTokens,
-		LastUsedAt:       key.LastUsedAt,
+		ID:                key.ID,
+		Enabled:           key.IsPublic && key.Enabled,
+		Name:              name,
+		KeyPrefix:         key.KeyPrefix,
+		PasswordRequired:  key.PublicPasswordCipher != "",
+		PasswordHint:      key.PublicPasswordHint,
+		ExpiresAt:         key.ExpiresAt,
+		TodayTokens:       todayTokens,
+		TotalTokens:       key.TotalTokens,
+		TodayPromptTokens: todayPromptTokens,
+		TotalPromptTokens: key.TotalPromptTokens,
+		TodayCachedTokens: todayCachedTokens,
+		TotalCachedTokens: key.TotalCachedTokens,
+		TodayCacheHitRate: cacheHitRate(todayCachedTokens, todayPromptTokens),
+		TotalCacheHitRate: cacheHitRate(key.TotalCachedTokens, key.TotalPromptTokens),
+		LastUsedAt:        key.LastUsedAt,
 	}
 }
 

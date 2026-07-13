@@ -305,43 +305,53 @@ type UsageLog struct {
 	PromptTokens     int64     `json:"prompt_tokens"`
 	CompletionTokens int64     `json:"completion_tokens"`
 	TotalTokens      int64     `json:"total_tokens"`
+	CachedTokens     int64     `gorm:"not null;default:0" json:"cached_tokens"`
 	Ratio            float64   `json:"ratio"`
 	CreatedAt        time.Time `gorm:"index" json:"created_at"`
 }
 
 func (UsageLog) TableName() string { return "usage_logs" }
 
+const (
+	DefaultInputPricePerMillion  = 5.0
+	DefaultOutputPricePerMillion = 30.0
+)
+
 // GatewayKey is the local API key a client uses against this deployment's
 // OpenAI-compatible /v1/* gateway. The full key is encrypted for reveal/copy;
 // authentication uses KeyHash so request handling does not need to decrypt.
 type GatewayKey struct {
-	ID              uint       `gorm:"primaryKey" json:"id"`
-	Name            string     `gorm:"size:128;not null" json:"name"`
-	KeyPrefix       string     `gorm:"size:24;not null;index" json:"key_prefix"`
-	KeyHash         string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
-	KeyCipher       string     `gorm:"type:text;not null" json:"-"`
-	Enabled         bool       `gorm:"not null;default:true" json:"enabled"`
-	ClientFormat    string     `gorm:"size:16;not null;default:'openai'" json:"client_format"`
-	AllowedGroupIDs string     `gorm:"type:text" json:"allowed_group_ids,omitempty"`
-	DailyLimit      int64      `gorm:"not null;default:0" json:"daily_limit"`
-	TotalLimit      int64      `gorm:"not null;default:0" json:"total_limit"`
-	TodayTokens     int64      `gorm:"not null;default:0" json:"today_tokens"`
-	TotalTokens     int64      `gorm:"not null;default:0" json:"total_tokens"`
-	CostPerMillion  float64    `gorm:"not null;default:0" json:"cost_per_million"`
-	BalanceLimit    float64    `gorm:"not null;default:0" json:"balance_limit"`
-	ConcurrencyLimit int       `gorm:"not null;default:0" json:"concurrency_limit"`
-	TodayCost       float64    `gorm:"not null;default:0" json:"today_cost"`
-	TotalCost       float64    `gorm:"not null;default:0" json:"total_cost"`
-	UsageDate       string     `gorm:"size:10;index" json:"usage_date,omitempty"`
-	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
-	IsPublic        bool       `gorm:"not null;default:false;index" json:"is_public"`
-	PublicName      string     `gorm:"size:128" json:"public_name,omitempty"`
-	PublicPasswordCipher string `gorm:"type:text" json:"-"`
-	PublicPasswordHint string   `gorm:"size:256" json:"public_password_hint,omitempty"`
-	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
-	LastUsedIP      string     `gorm:"size:128" json:"last_used_ip,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID                   uint       `gorm:"primaryKey" json:"id"`
+	Name                 string     `gorm:"size:128;not null" json:"name"`
+	KeyPrefix            string     `gorm:"size:24;not null;index" json:"key_prefix"`
+	KeyHash              string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
+	KeyCipher            string     `gorm:"type:text;not null" json:"-"`
+	Enabled              bool       `gorm:"not null;default:true" json:"enabled"`
+	ClientFormat         string     `gorm:"size:16;not null;default:'openai'" json:"client_format"`
+	AllowedGroupIDs      string     `gorm:"type:text" json:"allowed_group_ids,omitempty"`
+	DailyLimit           int64      `gorm:"not null;default:0" json:"daily_limit"`
+	TotalLimit           int64      `gorm:"not null;default:0" json:"total_limit"`
+	TodayTokens          int64      `gorm:"not null;default:0" json:"today_tokens"`
+	TotalTokens          int64      `gorm:"not null;default:0" json:"total_tokens"`
+	TodayPromptTokens    int64      `gorm:"not null;default:0" json:"today_prompt_tokens"`
+	TotalPromptTokens    int64      `gorm:"not null;default:0" json:"total_prompt_tokens"`
+	TodayCachedTokens    int64      `gorm:"not null;default:0" json:"today_cached_tokens"`
+	TotalCachedTokens    int64      `gorm:"not null;default:0" json:"total_cached_tokens"`
+	CostPerMillion       float64    `gorm:"not null;default:0" json:"cost_per_million"`
+	BalanceLimit         float64    `gorm:"not null;default:0" json:"balance_limit"`
+	ConcurrencyLimit     int        `gorm:"not null;default:0" json:"concurrency_limit"`
+	TodayCost            float64    `gorm:"not null;default:0" json:"today_cost"`
+	TotalCost            float64    `gorm:"not null;default:0" json:"total_cost"`
+	UsageDate            string     `gorm:"size:10;index" json:"usage_date,omitempty"`
+	ExpiresAt            *time.Time `json:"expires_at,omitempty"`
+	IsPublic             bool       `gorm:"not null;default:false;index" json:"is_public"`
+	PublicName           string     `gorm:"size:128" json:"public_name,omitempty"`
+	PublicPasswordCipher string     `gorm:"type:text" json:"-"`
+	PublicPasswordHint   string     `gorm:"size:256" json:"public_password_hint,omitempty"`
+	LastUsedAt           *time.Time `json:"last_used_at,omitempty"`
+	LastUsedIP           string     `gorm:"size:128" json:"last_used_ip,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	UpdatedAt            time.Time  `json:"updated_at"`
 }
 
 func (GatewayKey) TableName() string { return "gateway_keys" }
@@ -364,17 +374,19 @@ func (GatewayAffinity) TableName() string { return "gateway_affinities" }
 // UpstreamGroupKey stores one upstream API key bound to a channel group. The
 // gateway scheduler chooses among these records by live status and ratio.
 type UpstreamGroupKey struct {
-	ID           uint        `gorm:"primaryKey" json:"id"`
-	ChannelID    uint        `gorm:"not null;uniqueIndex:idx_upstream_group_key;index" json:"channel_id"`
-	ChannelName  string      `gorm:"size:128" json:"channel_name,omitempty"`
-	ChannelType  ChannelType `gorm:"size:32;not null" json:"channel_type"`
-	ClientFormat string      `gorm:"size:16;not null;default:'openai';index" json:"client_format"`
-	RequestMode  string      `gorm:"size:16;not null;default:'responses';index" json:"request_mode"`
-	GroupRef     string      `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
-	GroupName    string      `gorm:"size:256;not null" json:"group_name"`
-	GroupDesc    string      `gorm:"size:512" json:"group_description,omitempty"`
-	Ratio        float64     `gorm:"not null;default:1" json:"ratio"`
-	Priority     int         `gorm:"not null;default:0;index" json:"priority"`
+	ID                    uint        `gorm:"primaryKey" json:"id"`
+	ChannelID             uint        `gorm:"not null;uniqueIndex:idx_upstream_group_key;index" json:"channel_id"`
+	ChannelName           string      `gorm:"size:128" json:"channel_name,omitempty"`
+	ChannelType           ChannelType `gorm:"size:32;not null" json:"channel_type"`
+	ClientFormat          string      `gorm:"size:16;not null;default:'openai';index" json:"client_format"`
+	RequestMode           string      `gorm:"size:16;not null;default:'responses';index" json:"request_mode"`
+	GroupRef              string      `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
+	GroupName             string      `gorm:"size:256;not null" json:"group_name"`
+	GroupDesc             string      `gorm:"size:512" json:"group_description,omitempty"`
+	Ratio                 float64     `gorm:"not null;default:1" json:"ratio"`
+	InputPricePerMillion  float64     `gorm:"not null;default:5" json:"input_price_per_million"`
+	OutputPricePerMillion float64     `gorm:"not null;default:30" json:"output_price_per_million"`
+	Priority              int         `gorm:"not null;default:0;index" json:"priority"`
 	// Charity 标记这个分组是"公益/免费"渠道。调度时公益永远优先于付费，
 	// 公益内部再按倍率高低（这里沿用 ratio 低者优先）排序，公益全挂了才轮到付费。
 	Charity          bool       `gorm:"not null;default:false;index" json:"charity"`

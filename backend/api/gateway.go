@@ -261,7 +261,20 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": items, "total": total}})
+		keys, err := d.Gateway.ListGatewayKeys()
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": items, "total": total, "keys": keys}})
+	})
+	gp.DELETE("/usage-logs", func(c *gin.Context) {
+		deleted, err := d.Gateway.ClearUsageLogs()
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"deleted": deleted}})
 	})
 }
 

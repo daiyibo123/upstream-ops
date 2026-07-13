@@ -8,6 +8,15 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, and the Dockerfile version argument before its matching Git tag is pushed.
 
+## v0.22.1 - 2026-07-13
+
+### Fixed
+
+- Fixed Codex direct URL streaming without ccswitch routing by preferring the chat-completions bridge for `/v1/responses` streaming requests on OpenAI-compatible upstreams, even when the client User-Agent does not explicitly identify Codex.
+- Converted Responses API tool declarations and chat `tool_calls` stream chunks into Codex-compatible Responses function-call events when using the chat-completions bridge.
+- Normalized data-only Responses SSE chunks by adding the required `event: response.*` lines, so Codex can reliably observe `response.output_text.delta`, `response.completed`, and the final `[DONE]`.
+- Hardened Responses SSE termination: upstream `[DONE]`, EOF, idle timeout, or mid-stream error now produce a valid Responses terminal event (`response.completed` or `response.failed`) instead of closing the stream early.
+
 ## v0.22.0 - 2026-07-13
 
 ### Added

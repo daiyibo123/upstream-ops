@@ -139,17 +139,23 @@ func publicDashboardTitle(d *Deps) string {
 }
 
 type publicKeyStat struct {
-	Enabled          bool       `json:"enabled"`
-	Name             string     `json:"name"`
-	KeyPrefix        string     `json:"key_prefix,omitempty"`
-	MaskedKey        string     `json:"masked_key,omitempty"`
-	PasswordRequired bool       `json:"password_required"`
-	PasswordHint     string     `json:"password_hint,omitempty"`
-	ExpiresAt        string     `json:"expires_at,omitempty"`
-	Status           string     `json:"status"`
-	TodayTokens      int64      `json:"today_tokens"`
-	TotalTokens      int64      `json:"total_tokens"`
-	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
+	Enabled           bool       `json:"enabled"`
+	Name              string     `json:"name"`
+	KeyPrefix         string     `json:"key_prefix,omitempty"`
+	MaskedKey         string     `json:"masked_key,omitempty"`
+	PasswordRequired  bool       `json:"password_required"`
+	PasswordHint      string     `json:"password_hint,omitempty"`
+	ExpiresAt         string     `json:"expires_at,omitempty"`
+	Status            string     `json:"status"`
+	TodayTokens       int64      `json:"today_tokens"`
+	TotalTokens       int64      `json:"total_tokens"`
+	TodayPromptTokens int64      `json:"today_prompt_tokens"`
+	TotalPromptTokens int64      `json:"total_prompt_tokens"`
+	TodayCachedTokens int64      `json:"today_cached_tokens"`
+	TotalCachedTokens int64      `json:"total_cached_tokens"`
+	TodayCacheHitRate float64    `json:"today_cache_hit_rate"`
+	TotalCacheHitRate float64    `json:"total_cache_hit_rate"`
+	LastUsedAt        *time.Time `json:"last_used_at,omitempty"`
 }
 
 func publicKeySummary(d *Deps) publicKeyStat {
@@ -169,6 +175,15 @@ func publicKeySummary(d *Deps) publicKeyStat {
 		PasswordHint:     key.PasswordHint,
 		Status:           "disabled",
 	}
+	stat.TodayTokens = key.TodayTokens
+	stat.TotalTokens = key.TotalTokens
+	stat.TodayPromptTokens = key.TodayPromptTokens
+	stat.TotalPromptTokens = key.TotalPromptTokens
+	stat.TodayCachedTokens = key.TodayCachedTokens
+	stat.TotalCachedTokens = key.TotalCachedTokens
+	stat.TodayCacheHitRate = key.TodayCacheHitRate
+	stat.TotalCacheHitRate = key.TotalCacheHitRate
+	stat.LastUsedAt = key.LastUsedAt
 	if !stat.Enabled {
 		return stat
 	}
@@ -180,9 +195,6 @@ func publicKeySummary(d *Deps) publicKeyStat {
 		stat.ExpiresAt = key.ExpiresAt.Format("2006-01-02")
 	}
 	stat.Status = "available"
-	stat.TodayTokens = key.TodayTokens
-	stat.TotalTokens = key.TotalTokens
-	stat.LastUsedAt = key.LastUsedAt
 	return stat
 }
 
@@ -241,41 +253,49 @@ type dashboardGatewayStat struct {
 }
 
 type dashboardGatewayGroup struct {
-	ID            uint       `json:"id"`
-	ChannelID     uint       `json:"channel_id"`
-	ChannelName   string     `json:"channel_name"`
-	SiteDomain    string     `json:"site_domain,omitempty"`
-	ClientFormat  string     `json:"client_format"`
-	GroupName     string     `json:"group_name"`
-	Ratio         float64    `json:"ratio"`
-	Priority      int        `json:"priority"`
-	Charity       bool       `json:"charity"`
-	Enabled       bool       `json:"enabled"`
-	Status        string     `json:"status"`
-	FailureCount  int        `json:"failure_count"`
-	TotalTokens   int64      `json:"total_tokens"`
-	LastCheckedAt *time.Time `json:"last_checked_at,omitempty"`
-	LastUsedAt    *time.Time `json:"last_used_at,omitempty"`
-	LastError     string     `json:"last_error,omitempty"`
+	ID                    uint       `json:"id"`
+	ChannelID             uint       `json:"channel_id"`
+	ChannelName           string     `json:"channel_name"`
+	SiteDomain            string     `json:"site_domain,omitempty"`
+	ClientFormat          string     `json:"client_format"`
+	GroupName             string     `json:"group_name"`
+	Ratio                 float64    `json:"ratio"`
+	InputPricePerMillion  float64    `json:"input_price_per_million"`
+	OutputPricePerMillion float64    `json:"output_price_per_million"`
+	Priority              int        `json:"priority"`
+	Charity               bool       `json:"charity"`
+	Enabled               bool       `json:"enabled"`
+	Status                string     `json:"status"`
+	FailureCount          int        `json:"failure_count"`
+	TotalTokens           int64      `json:"total_tokens"`
+	LastCheckedAt         *time.Time `json:"last_checked_at,omitempty"`
+	LastUsedAt            *time.Time `json:"last_used_at,omitempty"`
+	LastError             string     `json:"last_error,omitempty"`
 }
 
 type dashboardGatewayKey struct {
-	ID               uint       `json:"id"`
-	Name             string     `json:"name"`
-	KeyPrefix        string     `json:"key_prefix"`
-	Enabled          bool       `json:"enabled"`
-	DailyLimit       int64      `json:"daily_limit"`
-	TotalLimit       int64      `json:"total_limit"`
-	TodayTokens      int64      `json:"today_tokens"`
-	TotalTokens      int64      `json:"total_tokens"`
-	CostPerMillion   float64    `json:"cost_per_million"`
-	BalanceLimit     float64    `json:"balance_limit"`
-	ConcurrencyLimit int        `json:"concurrency_limit"`
-	BalanceRemaining float64    `json:"balance_remaining"`
-	TodayCost        float64    `json:"today_cost"`
-	TotalCost        float64    `json:"total_cost"`
-	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
-	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
+	ID                uint       `json:"id"`
+	Name              string     `json:"name"`
+	KeyPrefix         string     `json:"key_prefix"`
+	Enabled           bool       `json:"enabled"`
+	DailyLimit        int64      `json:"daily_limit"`
+	TotalLimit        int64      `json:"total_limit"`
+	TodayTokens       int64      `json:"today_tokens"`
+	TotalTokens       int64      `json:"total_tokens"`
+	TodayPromptTokens int64      `json:"today_prompt_tokens"`
+	TotalPromptTokens int64      `json:"total_prompt_tokens"`
+	TodayCachedTokens int64      `json:"today_cached_tokens"`
+	TotalCachedTokens int64      `json:"total_cached_tokens"`
+	TodayCacheHitRate float64    `json:"today_cache_hit_rate"`
+	TotalCacheHitRate float64    `json:"total_cache_hit_rate"`
+	CostPerMillion    float64    `json:"cost_per_million"`
+	BalanceLimit      float64    `json:"balance_limit"`
+	ConcurrencyLimit  int        `json:"concurrency_limit"`
+	BalanceRemaining  float64    `json:"balance_remaining"`
+	TodayCost         float64    `json:"today_cost"`
+	TotalCost         float64    `json:"total_cost"`
+	ExpiresAt         *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt        *time.Time `json:"last_used_at,omitempty"`
 }
 
 type dashboardServerStat struct {
@@ -387,22 +407,28 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 		stat.TodayTokens += todayTokens
 		stat.TotalTokens += key.TotalTokens
 		stat.Keys = append(stat.Keys, dashboardGatewayKey{
-			ID:               key.ID,
-			Name:             key.Name,
-			KeyPrefix:        key.KeyPrefix,
-			Enabled:          key.Enabled,
-			DailyLimit:       key.DailyLimit,
-			TotalLimit:       key.TotalLimit,
-			TodayTokens:      todayTokens,
-			TotalTokens:      key.TotalTokens,
-			CostPerMillion:   key.CostPerMillion,
-			BalanceLimit:     key.BalanceLimit,
-			ConcurrencyLimit: key.ConcurrencyLimit,
-			BalanceRemaining: key.BalanceRemaining,
-			TodayCost:        key.TodayCost,
-			TotalCost:        key.TotalCost,
-			ExpiresAt:        key.ExpiresAt,
-			LastUsedAt:       key.LastUsedAt,
+			ID:                key.ID,
+			Name:              key.Name,
+			KeyPrefix:         key.KeyPrefix,
+			Enabled:           key.Enabled,
+			DailyLimit:        key.DailyLimit,
+			TotalLimit:        key.TotalLimit,
+			TodayTokens:       todayTokens,
+			TotalTokens:       key.TotalTokens,
+			TodayPromptTokens: key.TodayPromptTokens,
+			TotalPromptTokens: key.TotalPromptTokens,
+			TodayCachedTokens: key.TodayCachedTokens,
+			TotalCachedTokens: key.TotalCachedTokens,
+			TodayCacheHitRate: key.TodayCacheHitRate,
+			TotalCacheHitRate: key.TotalCacheHitRate,
+			CostPerMillion:    key.CostPerMillion,
+			BalanceLimit:      key.BalanceLimit,
+			ConcurrencyLimit:  key.ConcurrencyLimit,
+			BalanceRemaining:  key.BalanceRemaining,
+			TodayCost:         key.TodayCost,
+			TotalCost:         key.TotalCost,
+			ExpiresAt:         key.ExpiresAt,
+			LastUsedAt:        key.LastUsedAt,
 		})
 	}
 	stat.TotalGroups = len(groups)
@@ -433,22 +459,24 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 		stat.PromptTokens += group.PromptTokens
 		stat.CompletionTokens += group.CompletionTokens
 		g := dashboardGatewayGroup{
-			ID:            group.ID,
-			ChannelID:     group.ChannelID,
-			ChannelName:   group.ChannelName,
-			SiteDomain:    siteDomains[group.ChannelID],
-			ClientFormat:  group.ClientFormat,
-			GroupName:     group.GroupName,
-			Ratio:         group.Ratio,
-			Priority:      group.Priority,
-			Charity:       group.Charity,
-			Enabled:       group.Enabled,
-			Status:        status,
-			FailureCount:  group.FailureCount,
-			TotalTokens:   group.TotalTokens,
-			LastCheckedAt: group.LastCheckedAt,
-			LastUsedAt:    group.LastUsedAt,
-			LastError:     group.LastError,
+			ID:                    group.ID,
+			ChannelID:             group.ChannelID,
+			ChannelName:           group.ChannelName,
+			SiteDomain:            siteDomains[group.ChannelID],
+			ClientFormat:          group.ClientFormat,
+			GroupName:             group.GroupName,
+			Ratio:                 group.Ratio,
+			InputPricePerMillion:  group.InputPricePerMillion,
+			OutputPricePerMillion: group.OutputPricePerMillion,
+			Priority:              group.Priority,
+			Charity:               group.Charity,
+			Enabled:               group.Enabled,
+			Status:                status,
+			FailureCount:          group.FailureCount,
+			TotalTokens:           group.TotalTokens,
+			LastCheckedAt:         group.LastCheckedAt,
+			LastUsedAt:            group.LastUsedAt,
+			LastError:             group.LastError,
 		}
 		stat.Groups = append(stat.Groups, g)
 		if group.Enabled && (group.Status == "alive" || group.Status == "unknown") {

@@ -88,6 +88,12 @@ export function formatRatio(value: number | null | undefined) {
   })
 }
 
+export function formatPercent(value: number | null | undefined, digits = 1) {
+  if (value == null || !Number.isFinite(value)) return "—"
+  const pct = value * 100
+  return `${trimFixed(pct, digits)}%`
+}
+
 /** 把倍率渲染成"1.20 → 1.50"。 */
 export function ratioArrow(from: number | null | undefined, to: number) {
   return `${formatRatio(from)} → ${formatRatio(to)}`

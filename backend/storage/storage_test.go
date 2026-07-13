@@ -35,6 +35,61 @@ func openTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+func TestUsageLogsClearPreservesGatewayKeyUsage(t *testing.T) {
+	db := openTestDB(t)
+	keys := NewGatewayKeys(db)
+	logs := NewUsageLogs(db)
+	key := &GatewayKey{
+		Name:      "test-key",
+		KeyPrefix: "sk-test",
+		KeyHash:   "hash-test",
+		KeyCipher: "cipher",
+		Enabled:   true,
+	}
+	if err := keys.Create(key); err != nil {
+		t.Fatalf("create gateway key: %v", err)
+	}
+	now := time.Now()
+	if err := keys.AddUsage(key.ID, 10, 5, 15, 4, 0.03, now); err != nil {
+		t.Fatalf("add usage: %v", err)
+	}
+	if err := logs.Add(&UsageLog{
+		GatewayKeyID:     key.ID,
+		GatewayKeyName:   key.Name,
+		PromptTokens:     10,
+		CompletionTokens: 5,
+		TotalTokens:      15,
+		CachedTokens:     4,
+		CreatedAt:        now,
+	}); err != nil {
+		t.Fatalf("add usage log: %v", err)
+	}
+
+	deleted, err := logs.Clear()
+	if err != nil {
+		t.Fatalf("clear usage logs: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted logs = %d, want 1", deleted)
+	}
+	_, total, err := logs.List(50, 0)
+	if err != nil {
+		t.Fatalf("list usage logs: %v", err)
+	}
+	if total != 0 {
+		t.Fatalf("usage logs total = %d, want 0", total)
+	}
+	updated, err := keys.FindByID(key.ID)
+	if err != nil {
+		t.Fatalf("load gateway key: %v", err)
+	}
+	if updated.TodayTokens != 15 || updated.TotalTokens != 15 ||
+		updated.TodayPromptTokens != 10 || updated.TotalPromptTokens != 10 ||
+		updated.TodayCachedTokens != 4 || updated.TotalCachedTokens != 4 {
+		t.Fatalf("gateway key usage changed after clear: %#v", updated)
+	}
+}
+
 func TestAggregateBalanceTrend(t *testing.T) {
 	db := openTestDB(t)
 	rates := NewRates(db)

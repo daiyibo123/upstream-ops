@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -272,6 +273,9 @@ func TestProxyConvertsChatCompletionToResponses(t *testing.T) {
 	if updated.TotalTokens != 5 || updated.TodayTokens != 5 {
 		t.Fatalf("usage not recorded: %#v", updated)
 	}
+	if math.Abs(updated.TotalCost-0.000075) > 0.000000001 || math.Abs(updated.TodayCost-0.000075) > 0.000000001 {
+		t.Fatalf("cost = today %.8f total %.8f, want 0.000075", updated.TodayCost, updated.TotalCost)
+	}
 }
 
 func TestGatewayKeyBalanceLimitDisablesKey(t *testing.T) {
@@ -282,11 +286,9 @@ func TestGatewayKeyBalanceLimitDisablesKey(t *testing.T) {
 	defer upstream.Close()
 
 	env := newGatewayProxyTestEnv(t, strings.Repeat("q", 32))
-	costPerMillion := 500000.0
 	balanceLimit := 1.0
 	if _, err := env.svc.UpdateGatewayKey(env.localKey.ID, UpdateGatewayKeyInput{
-		CostPerMillion: &costPerMillion,
-		BalanceLimit:   &balanceLimit,
+		BalanceLimit: &balanceLimit,
 	}); err != nil {
 		t.Fatalf("update gateway key balance: %v", err)
 	}
@@ -301,7 +303,7 @@ func TestGatewayKeyBalanceLimitDisablesKey(t *testing.T) {
 	}
 	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
 		ChannelID: channel.ID, ChannelName: "balance", ChannelType: storage.ChannelTypeSub2API,
-		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+		GroupRef: "default", GroupName: "default", Ratio: 1, InputPricePerMillion: 500000, OutputPricePerMillion: 500000, KeyCipher: keyCipher, Status: "alive",
 	}); err != nil {
 		t.Fatalf("insert group key: %v", err)
 	}
@@ -332,6 +334,17 @@ func TestGatewayKeyBalanceLimitDisablesKey(t *testing.T) {
 	}
 	if _, err := env.svc.Authenticate(env.localKey.Key, "127.0.0.1"); err == nil {
 		t.Fatal("exhausted key should not authenticate")
+	}
+}
+
+func TestGatewayUsageCostUsesGroupPricesAndRatio(t *testing.T) {
+	got := gatewayUsageCost(usageTokens{Prompt: 3, Completion: 2, Total: 5}, &storage.UpstreamGroupKey{
+		Ratio:                 2,
+		InputPricePerMillion:  5,
+		OutputPricePerMillion: 30,
+	})
+	if math.Abs(got-0.00015) > 0.000000001 {
+		t.Fatalf("cost = %.8f, want 0.00015", got)
 	}
 }
 
@@ -785,6 +798,40 @@ func TestOrderCandidatesPrefersCharityBeforePaid(t *testing.T) {
 	}
 }
 
+func TestOrderCandidatesPrefersUnknownCharityBeforeAlivePaid(t *testing.T) {
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Status: "alive", Ratio: 0.01, Charity: false},
+		{ID: 2, Status: "unknown", Ratio: 1, Charity: true},
+	}
+	ordered := orderCandidates(candidates)
+	if ordered[0].ID != 2 || ordered[1].ID != 1 {
+		t.Fatalf("unknown charity should be tried before alive paid: %#v", ordered)
+	}
+}
+
+func TestOrderCandidatesFallsBackToPaidWhenCharityUnusable(t *testing.T) {
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Status: "alive", Ratio: 0.01, Charity: false},
+		{ID: 2, Status: "rate_limited", Ratio: 1, Charity: true},
+		{ID: 3, Status: "dead", Ratio: 0.5, Charity: true},
+	}
+	ordered := orderCandidates(candidates)
+	if ordered[0].ID != 1 {
+		t.Fatalf("unusable charity should not block paid fallback: %#v", ordered)
+	}
+}
+
+func TestSoftAffinityDoesNotPromotePaidOverCharity(t *testing.T) {
+	paid := storage.UpstreamGroupKey{ID: 1, Status: "alive", Ratio: 0.01, Charity: false}
+	charity := storage.UpstreamGroupKey{ID: 2, Status: "unknown", Ratio: 1, Charity: true}
+	if !affinityWouldPromoteCostlier(paid, charity) {
+		t.Fatal("soft affinity should not promote paid candidate over schedulable charity")
+	}
+	if affinityWouldPromoteCostlier(charity, paid) {
+		t.Fatal("soft affinity may promote schedulable charity over paid candidate")
+	}
+}
+
 func TestHealthProbeRequiresGenerationSuccess(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -953,8 +1000,8 @@ func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encrypt key: %v", err)
 	}
-	// More than three batches. Queued groups must not inherit timeout from
-	// earlier batches, and each batch should run with controlled parallelism.
+	// More than one batch. Queued groups must not inherit timeout from earlier
+	// batches, and each batch should run with controlled parallelism.
 	for i := 0; i < 35; i++ {
 		ref := "group-" + strconv.Itoa(i)
 		if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
@@ -972,21 +1019,21 @@ func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
 	if result.Alive != 35 {
 		t.Fatalf("alive = %d, want 35; result=%#v", result.Alive, result)
 	}
-	if result.BatchSize != 10 || result.Batches != 4 {
-		t.Fatalf("batch metadata = size %d batches %d, want 10/4", result.BatchSize, result.Batches)
+	if result.BatchSize != 30 || result.Batches != 2 {
+		t.Fatalf("batch metadata = size %d batches %d, want 30/2", result.BatchSize, result.Batches)
 	}
-	if got := atomic.LoadInt64(&maxInFlight); got > 10 {
-		t.Fatalf("maximum concurrent upstream requests = %d, want at most 10", got)
+	if got := atomic.LoadInt64(&maxInFlight); got > 30 {
+		t.Fatalf("maximum concurrent upstream requests = %d, want at most 30", got)
 	}
-	if got := atomic.LoadInt64(&maxInFlight); got < 10 {
-		t.Fatalf("maximum concurrent upstream requests = %d, want first batch to fill 10 slots", got)
+	if got := atomic.LoadInt64(&maxInFlight); got < 30 {
+		t.Fatalf("maximum concurrent upstream requests = %d, want first batch to fill 30 slots", got)
 	}
 	for _, item := range result.Items {
 		if item.Status != "alive" {
 			t.Fatalf("group %d status = %s: %s", item.ID, item.Status, item.Error)
 		}
-		if item.Batch < 1 || item.Batch > 4 {
-			t.Fatalf("group %d batch = %d, want 1..4", item.ID, item.Batch)
+		if item.Batch < 1 || item.Batch > 2 {
+			t.Fatalf("group %d batch = %d, want 1..2", item.ID, item.Batch)
 		}
 	}
 }
@@ -1657,8 +1704,8 @@ func TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
 		t.Fatalf("proxy request: %v", err)
 	}
 	out := rec.Body.String()
-	if responsesHits != 1 || chatHits != 1 {
-		t.Fatalf("expected responses->chat stream fallback: responses=%d chat=%d", responsesHits, chatHits)
+	if responsesHits != 0 || chatHits != 1 {
+		t.Fatalf("expected direct chat bridge for responses stream: responses=%d chat=%d", responsesHits, chatHits)
 	}
 	if !strings.Contains(out, "response.completed") || !strings.Contains(out, "pong") || !strings.Contains(out, "[DONE]") {
 		t.Fatalf("stream fallback output malformed: %s", out)
@@ -1718,6 +1765,64 @@ func TestProxyConvertsChatSSEFromResponsesEndpointForCodexDirect(t *testing.T) {
 	}
 }
 
+func TestCodexResponsesStreamPrefersChatBridge(t *testing.T) {
+	var responsesHits, chatHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			responsesHits++
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("native responses should not be used first for Codex"))
+		case "/v1/chat/completions":
+			chatHits++
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_codex\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl_codex\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"}}]}\n\n" +
+				"data: {\"id\":\"chatcmpl_codex\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n" +
+				"data: [DONE]\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("c", 32))
+	channel := &storage.Channel{Name: "codex-chat-bridge", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "codex-chat-bridge", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+		RequestMode: "responses",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	if responsesHits != 0 || chatHits != 1 {
+		t.Fatalf("hits responses=%d chat=%d, want direct chat bridge", responsesHits, chatHits)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "response.output_item.added") || !strings.Contains(out, "response.output_text.done") || !strings.Contains(out, "response.completed") || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("Codex responses bridge missing lifecycle events: %s", out)
+	}
+	if got := rec.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Fatalf("X-Accel-Buffering = %q, want no", got)
+	}
+}
+
 func TestSynthesizesResponseCompletedWhenUpstreamOmitsIt(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -1757,6 +1862,83 @@ func TestSynthesizesResponseCompletedWhenUpstreamOmitsIt(t *testing.T) {
 	}
 	if !strings.Contains(out, "response.completed") {
 		t.Fatalf("gateway should synthesize response.completed when upstream omits it: %s", out)
+	}
+}
+
+func TestResponsesToChatRequestBodyConvertsCodexTools(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-test",
+		"input":"ping",
+		"stream":true,
+		"tools":[
+			{"type":"custom","name":"exec","description":"Run command","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}},
+			{"type":"namespace","name":"mcp.fs","tools":[{"type":"function","name":"read","description":"Read file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}]},
+			{"type":"tool_search"}
+		],
+		"tool_choice":{"type":"custom","name":"exec"}
+	}`)
+	converted, stream, err := responsesToChatRequestBody(body)
+	if err != nil {
+		t.Fatalf("convert responses to chat: %v", err)
+	}
+	if !stream {
+		t.Fatalf("stream flag was not preserved")
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(converted, &raw); err != nil {
+		t.Fatalf("decode converted body: %v", err)
+	}
+	tools, _ := raw["tools"].([]any)
+	if len(tools) != 3 {
+		t.Fatalf("tools len = %d, body=%s", len(tools), converted)
+	}
+	gotNames := map[string]bool{}
+	for _, item := range tools {
+		tool, _ := item.(map[string]any)
+		if tool["type"] != "function" {
+			t.Fatalf("tool was not converted to chat function tool: %#v", tool)
+		}
+		fn, _ := tool["function"].(map[string]any)
+		gotNames[stringValue(fn["name"])] = true
+		if fn["parameters"] == nil {
+			t.Fatalf("tool parameters missing: %#v", fn)
+		}
+	}
+	for _, name := range []string{"exec", "mcp__fs__read", "tool_search"} {
+		if !gotNames[name] {
+			t.Fatalf("missing converted tool %q in %v; body=%s", name, gotNames, converted)
+		}
+	}
+	choice, _ := raw["tool_choice"].(map[string]any)
+	fn, _ := choice["function"].(map[string]any)
+	if stringValue(fn["name"]) != "exec" {
+		t.Fatalf("tool_choice not converted: %#v", raw["tool_choice"])
+	}
+}
+
+func TestStreamChatAsResponsesEventsConvertsToolCalls(t *testing.T) {
+	body := strings.NewReader(
+		"data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_exec\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"cmd\\\"\"}}]}}]}\n\n" +
+			"data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"ls\\\"}\"}}]}}]}\n\n" +
+			"data: [DONE]\n\n")
+	rec := httptest.NewRecorder()
+	if _, err := streamChatAsResponsesEvents(rec, nil, newSSEStreamReader(body)); err != nil {
+		t.Fatalf("stream chat as responses: %v", err)
+	}
+	out := rec.Body.String()
+	for _, want := range []string{
+		"response.output_item.added",
+		"response.function_call_arguments.delta",
+		"response.function_call_arguments.done",
+		"response.output_item.done",
+		"response.completed",
+		"data: [DONE]",
+		"exec",
+		"{\\\"cmd\\\":\\\"ls\\\"}",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in stream:\n%s", want, out)
+		}
 	}
 }
 
@@ -1867,11 +2049,56 @@ func TestBlockedBootstrapKeyKeywordChecksGroupDescription(t *testing.T) {
 
 func TestExtractStreamUsageFromResponsesSSE(t *testing.T) {
 	body := []byte("event: response.completed\n" +
-		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":5,\"total_tokens\":12}}}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":5,\"total_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":3}}}}\n\n" +
 		"data: [DONE]\n")
 	usage := extractStreamUsage(body)
-	if usage.Prompt != 7 || usage.Completion != 5 || usage.Total != 12 {
+	if usage.Prompt != 7 || usage.Completion != 5 || usage.Total != 12 || usage.Cached != 3 {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestUsageFromMapExtractsCachedTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  map[string]any
+		want int64
+	}{
+		{
+			name: "openai prompt details",
+			raw: map[string]any{
+				"prompt_tokens": 10,
+				"prompt_tokens_details": map[string]any{
+					"cached_tokens": 4,
+				},
+			},
+			want: 4,
+		},
+		{
+			name: "responses input details",
+			raw: map[string]any{
+				"input_tokens": 12,
+				"input_tokens_details": map[string]any{
+					"cached_tokens": 5,
+				},
+			},
+			want: 5,
+		},
+		{
+			name: "claude cache read",
+			raw: map[string]any{
+				"input_tokens":            20,
+				"cache_read_input_tokens": 7,
+			},
+			want: 7,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := usageFromMap(tc.raw)
+			if usage.Cached != tc.want {
+				t.Fatalf("cached tokens = %d, want %d", usage.Cached, tc.want)
+			}
+		})
 	}
 }
 
@@ -1895,6 +2122,39 @@ func TestStreamRawSSEPreservesChatDone(t *testing.T) {
 	}
 }
 
+func TestStreamRawSSENormalizesDataOnlyResponsesEventsForCodex(t *testing.T) {
+	body := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp_data_only\",\"model\":\"gpt-test\",\"delta\":\"pong\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_data_only\",\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n")
+	rec := httptest.NewRecorder()
+	usage, err := streamRawSSE(rec, nil, newSSEStreamReader(body), "responses")
+	if err != nil {
+		t.Fatalf("stream raw responses sse: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "event: response.output_text.delta") || !strings.Contains(out, "event: response.completed") || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("responses data-only events were not normalized for Codex: %s", out)
+	}
+	if usage.Total != 5 || usage.ResponseID != "resp_data_only" {
+		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestStreamRawSSESynthesizesResponsesCompletedBeforeUpstreamDone(t *testing.T) {
+	body := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp_done_first\",\"model\":\"gpt-test\",\"delta\":\"pong\"}\n\n" +
+		"data: [DONE]\n\n")
+	rec := httptest.NewRecorder()
+	_, err := streamRawSSE(rec, nil, newSSEStreamReader(body), "responses")
+	if err != nil {
+		t.Fatalf("stream raw responses sse: %v", err)
+	}
+	out := rec.Body.String()
+	completedAt := strings.Index(out, "event: response.completed")
+	doneAt := strings.Index(out, "data: [DONE]")
+	if completedAt < 0 || doneAt < 0 || completedAt > doneAt {
+		t.Fatalf("response.completed must be emitted before [DONE]: %s", out)
+	}
+}
+
 func TestStreamNonSSEAsResponsesEventsWrapsChatJSON(t *testing.T) {
 	body := []byte(`{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-test","choices":[{"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
 	rec := httptest.NewRecorder()
@@ -1913,11 +2173,29 @@ func TestStreamNonSSEAsResponsesEventsWrapsChatJSON(t *testing.T) {
 		t.Fatalf("content-type = %q", got)
 	}
 	out := rec.Body.String()
-	if !strings.Contains(out, "event: response.completed") || !strings.Contains(out, "pong") || !strings.Contains(out, "data: [DONE]") {
+	if !strings.Contains(out, "event: response.output_item.added") || !strings.Contains(out, "event: response.output_text.done") || !strings.Contains(out, "event: response.completed") || !strings.Contains(out, "pong") || !strings.Contains(out, "data: [DONE]") {
 		t.Fatalf("unexpected wrapped stream: %s", out)
 	}
 	if usage.Prompt != 3 || usage.Completion != 2 || usage.Total != 5 {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestSSEReaderDispatchesDataLineWithoutBlankSeparator(t *testing.T) {
+	reader := newSSEStreamReader(strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\ndata: [DONE]\n"))
+	ev, err := reader.Next()
+	if err != nil {
+		t.Fatalf("first event: %v", err)
+	}
+	if !strings.Contains(ev.Data, "pong") {
+		t.Fatalf("first event = %#v", ev)
+	}
+	ev, err = reader.Next()
+	if err != nil {
+		t.Fatalf("done event: %v", err)
+	}
+	if strings.TrimSpace(ev.Data) != "[DONE]" {
+		t.Fatalf("done event = %#v", ev)
 	}
 }
 

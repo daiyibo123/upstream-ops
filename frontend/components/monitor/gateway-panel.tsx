@@ -55,6 +55,8 @@ type GroupFormatFilter = "all" | ColumnClientFormat
 type RateFilter = "all" | "0-0.05" | "0.06-0.1" | "0.1-0.2" | "0.2+"
 type CharityFilter = "all" | "charity" | "normal"
 
+const FORMAT_ORDER: ClientFormat[] = ["openai", "claude", "grok", "any"]
+
 interface GroupFilters {
   search: string
   format: GroupFormatFilter
@@ -79,7 +81,6 @@ interface KeyDraft {
   selectedGroupIds: number[]
   dailyLimitM: string
   totalLimitM: string
-  costPerMillion: string
   balanceLimit: string
   concurrencyLimit: string
   expiresInDays: string
@@ -94,7 +95,6 @@ function createDefaultDraft(): KeyDraft {
     selectedGroupIds: [],
     dailyLimitM: "",
     totalLimitM: "",
-    costPerMillion: "",
     balanceLimit: "",
     concurrencyLimit: "",
     expiresInDays: "0",
@@ -236,9 +236,17 @@ function groupMatchesFormat(group: UpstreamGroupKey, format: ClientFormat) {
   return format === "any" || groupFormat === "any" || groupFormat === format
 }
 
-function groupBelongsToColumn(group: UpstreamGroupKey, format: ColumnClientFormat) {
-  const groupFormat = groupClientFormat(group)
-  return groupFormat === format || groupFormat === "any"
+function groupMatchesFormatFilter(group: UpstreamGroupKey, format: GroupFormatFilter) {
+  return format === "all" || groupClientFormat(group) === format
+}
+
+function formatRank(value?: string | null) {
+  const idx = FORMAT_ORDER.indexOf(normalizeClientFormat(value))
+  return idx >= 0 ? idx : FORMAT_ORDER.length
+}
+
+function isOpenAIHealthGroup(group: UpstreamGroupKey) {
+  return groupClientFormat(group) === "openai"
 }
 
 function rateFilterLabel(value: RateFilter) {
@@ -263,7 +271,7 @@ function charityFilterLabel(value: CharityFilter) {
     case "normal":
       return "非公益"
     default:
-      return "全部公益状态"
+      return "全部状态"
   }
 }
 
@@ -327,13 +335,12 @@ function groupSearchText(group: UpstreamGroupKey) {
 }
 
 function groupMatchesFilters(group: UpstreamGroupKey, filters: GroupFilters) {
-  const checks: boolean[] = []
   const query = normalizeSearchText(filters.search)
-  if (query) checks.push(groupSearchText(group).includes(query))
-  if (filters.format !== "all") checks.push(groupMatchesFormat(group, filters.format))
-  if (filters.rateBand !== "all") checks.push(groupMatchesRateBand(group, filters.rateBand))
-  if (filters.charity !== "all") checks.push(groupMatchesCharity(group, filters.charity))
-  return checks.length === 0 || checks.some(Boolean)
+  if (query && !groupSearchText(group).includes(query)) return false
+  if (!groupMatchesFormatFilter(group, filters.format)) return false
+  if (!groupMatchesRateBand(group, filters.rateBand)) return false
+  if (!groupMatchesCharity(group, filters.charity)) return false
+  return true
 }
 
 function activeGroupFilterCount(filters: GroupFilters) {
@@ -488,7 +495,6 @@ function draftFromKey(key: GatewayKey): KeyDraft {
     selectedGroupIds: ids,
     dailyLimitM: tokensToMInput(key.daily_limit),
     totalLimitM: tokensToMInput(key.total_limit),
-    costPerMillion: key.cost_per_million > 0 ? String(key.cost_per_million) : "",
     balanceLimit: key.balance_limit > 0 ? String(key.balance_limit) : "",
     concurrencyLimit: key.concurrency_limit > 0 ? String(key.concurrency_limit) : "",
     expiresInDays: "keep",
@@ -502,7 +508,6 @@ function buildGatewayKeyPayload(draft: KeyDraft, includeEnabled: boolean, includ
     allowed_group_ids: draft.scope === "selected" ? draft.selectedGroupIds : [],
     daily_limit: mInputToTokens(draft.dailyLimitM),
     total_limit: mInputToTokens(draft.totalLimitM),
-    cost_per_million: Math.max(0, Number(draft.costPerMillion) || 0),
     balance_limit: Math.max(0, Number(draft.balanceLimit) || 0),
     concurrency_limit: Math.max(0, Math.floor(Number(draft.concurrencyLimit) || 0)),
   }
@@ -654,16 +659,6 @@ function KeyDraftFields({
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="gateway-key-cost">每百万 Token 费用（$）</Label>
-          <Input
-            id="gateway-key-cost"
-            value={draft.costPerMillion}
-            inputMode="decimal"
-            onChange={(event) => onChange({ ...draft, costPerMillion: sanitizeMInput(event.target.value) })}
-            placeholder="留空不计费"
-          />
-        </div>
-        <div className="space-y-1.5">
           <Label htmlFor="gateway-key-balance">可消耗余额（$）</Label>
           <Input
             id="gateway-key-balance"
@@ -700,7 +695,7 @@ function KeyDraftFields({
           </Select>
         </div>
         <p className="text-xs leading-5 text-muted-foreground sm:col-span-2 lg:col-span-2 lg:self-end">
-          余额按每百万 Token 费用折算；超过最大并发的请求会排队等待，不会直接失败。
+          余额按命中的上游分组价格和倍率折算；超过最大并发的请求会排队等待，不会直接失败。
         </p>
       </div>
 
@@ -885,7 +880,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [priorityDrafts, setPriorityDrafts] = useState<Record<number, string>>({})
   const [healthResults, setHealthResults] = useState<Record<number, GatewayHealthResult["items"][number]>>({})
   const [healthProgress, setHealthProgress] = useState<HealthProgress | null>(null)
-  const [selectedHealthGroupIds, setSelectedHealthGroupIds] = useState<number[]>([])
   const [groupFilterDraft, setGroupFilterDraft] = useState<GroupFilters>(() => createDefaultGroupFilters())
   const [groupFilters, setGroupFilters] = useState<GroupFilters>(() => createDefaultGroupFilters())
   const [keySearch, setKeySearch] = useState("")
@@ -905,29 +899,66 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     () => sortGroupsForDisplay(groups.filter((group) => groupMatchesFilters(group, groupFilters))),
     [groups, groupFilters],
   )
-  const groupColumns = useMemo(
-    () => [
-      {
-        key: "openai" as const,
-        title: "OpenAI",
-        description: "ChatGPT / Responses / Chat Completions",
-        items: filteredGroups.filter((group) => groupBelongsToColumn(group, "openai")),
-      },
-      {
-        key: "claude" as const,
-        title: "Claude",
-        description: "Anthropic Messages 兼容渠道",
-        items: filteredGroups.filter((group) => groupBelongsToColumn(group, "claude")),
-      },
-      {
-        key: "grok" as const,
-        title: "Grok",
-        description: "xAI / Grok 兼容渠道",
-        items: filteredGroups.filter((group) => groupBelongsToColumn(group, "grok")),
-      },
-    ],
-    [filteredGroups],
-  )
+  const openAIPriceByChannel = useMemo(() => {
+    const prices = new Map<number, number>()
+    for (const group of groups) {
+      if (!isOpenAIHealthGroup(group)) continue
+      const ratio = Number(group.ratio ?? 0)
+      if (!Number.isFinite(ratio)) continue
+      prices.set(group.channel_id, Math.min(prices.get(group.channel_id) ?? Number.POSITIVE_INFINITY, ratio))
+    }
+    return prices
+  }, [groups])
+  const channelRows = useMemo(() => {
+    const rows = new Map<number, {
+      channelID: number
+      channelName: string
+      channelType: UpstreamGroupKey["channel_type"]
+      items: UpstreamGroupKey[]
+      openAIPrice: number
+      cheapestPrice: number
+    }>()
+    for (const group of filteredGroups) {
+      const channelID = group.channel_id
+      const row = rows.get(channelID) ?? {
+        channelID,
+        channelName: group.channel_name || `#${channelID}`,
+        channelType: group.channel_type,
+        items: [],
+        openAIPrice: openAIPriceByChannel.get(channelID) ?? Number.POSITIVE_INFINITY,
+        cheapestPrice: Number.POSITIVE_INFINITY,
+      }
+      row.items.push(group)
+      const ratio = Number(group.ratio ?? 0)
+      if (Number.isFinite(ratio)) {
+        row.cheapestPrice = Math.min(row.cheapestPrice, ratio)
+        if (groupClientFormat(group) === "openai") {
+          row.openAIPrice = Math.min(row.openAIPrice, ratio)
+        }
+      }
+      rows.set(channelID, row)
+    }
+    return Array.from(rows.values())
+      .map((row) => ({
+        ...row,
+        items: row.items.slice().sort((a, b) =>
+          formatRank(a.client_format) - formatRank(b.client_format) ||
+          a.ratio - b.ratio ||
+          (b.priority || 0) - (a.priority || 0) ||
+          a.id - b.id,
+        ),
+      }))
+      .sort((a, b) => {
+        const aHasOpenAI = Number.isFinite(a.openAIPrice)
+        const bHasOpenAI = Number.isFinite(b.openAIPrice)
+        if (aHasOpenAI !== bHasOpenAI) return aHasOpenAI ? -1 : 1
+        const rawAPrice = aHasOpenAI ? a.openAIPrice : a.cheapestPrice
+        const rawBPrice = bHasOpenAI ? b.openAIPrice : b.cheapestPrice
+        const aPrice = Number.isFinite(rawAPrice) ? rawAPrice : Number.MAX_VALUE
+        const bPrice = Number.isFinite(rawBPrice) ? rawBPrice : Number.MAX_VALUE
+        return aPrice - bPrice || a.channelName.localeCompare(b.channelName, "zh-CN") || a.channelID - b.channelID
+      })
+  }, [filteredGroups, openAIPriceByChannel])
   const displayAliveCount = useMemo(
     () => filteredGroups.filter((group) => effectiveStatus(group) === "alive").length,
     [filteredGroups],
@@ -957,18 +988,13 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     [filteredGroups],
   )
   const activeFilters = activeGroupFilterCount(groupFilters)
-  const selectedHealthGroupSet = useMemo(() => new Set(selectedHealthGroupIds), [selectedHealthGroupIds])
-  const selectedHealthGroups = useMemo(
-    () => groups.filter((group) => selectedHealthGroupSet.has(group.id)),
-    [groups, selectedHealthGroupSet],
+  const openAIHealthGroups = useMemo(
+    () => groups.filter(isOpenAIHealthGroup),
+    [groups],
   )
-  const selectedEnabledHealthGroups = useMemo(
-    () => selectedHealthGroups.filter((group) => group.enabled !== false),
-    [selectedHealthGroups],
-  )
-  const selectedVisibleHealthCount = useMemo(
-    () => filteredGroups.filter((group) => selectedHealthGroupSet.has(group.id)).length,
-    [filteredGroups, selectedHealthGroupSet],
+  const enabledOpenAIHealthGroups = useMemo(
+    () => openAIHealthGroups.filter((group) => group.enabled !== false),
+    [openAIHealthGroups],
   )
 
   async function load() {
@@ -981,8 +1007,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       setKeys(Array.isArray(keyList) ? keyList : [])
       const nextGroups = sortGroupsForDisplay(Array.isArray(groupResult) ? groupResult : [])
       setGroups(nextGroups)
-      const validGroupIds = new Set(nextGroups.map((group) => group.id))
-      setSelectedHealthGroupIds((prev) => prev.filter((id) => validGroupIds.has(id)))
       setConcurrencyDrafts(
         Object.fromEntries(nextGroups.map((group) => [group.id, String(group.concurrency_limit || 0)])),
       )
@@ -1008,12 +1032,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
     if (mInputToTokens(draft.dailyLimitM) < 0 || mInputToTokens(draft.totalLimitM) < 0) {
       toast.error("额度必须是大于等于 0 的数字")
-      return false
-    }
-    const balanceLimit = Number(draft.balanceLimit) || 0
-    const costPerMillion = Number(draft.costPerMillion) || 0
-    if (balanceLimit > 0 && costPerMillion <= 0) {
-      toast.error("设置可消耗余额时，需要填写每百万 Token 费用")
       return false
     }
     const concurrencyLimit = Number(draft.concurrencyLimit) || 0
@@ -1138,37 +1156,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
-  function toggleHealthGroupSelected(id: number, selected: boolean) {
-    setSelectedHealthGroupIds((prev) => {
-      if (selected) {
-        return prev.includes(id) ? prev : [...prev, id].sort((a, b) => a - b)
-      }
-      return prev.filter((item) => item !== id)
-    })
-  }
-
-  function selectVisibleHealthGroups() {
-    setSelectedHealthGroupIds((prev) => {
-      const next = new Set(prev)
-      for (const group of filteredGroups) {
-        next.add(group.id)
-      }
-      return Array.from(next).sort((a, b) => a - b)
-    })
-  }
-
-  function clearHealthSelection() {
-    setSelectedHealthGroupIds([])
-  }
-
   async function testGroups() {
-    if (selectedHealthGroups.length === 0) {
-      toast.error("请先勾选要测活的分组 Key")
-      return
-    }
-    const enabledTargets = selectedEnabledHealthGroups
+    const enabledTargets = enabledOpenAIHealthGroups
     if (enabledTargets.length === 0) {
-      toast.error("选中的分组都已停用，无法测活")
+      toast.error("没有可测活的 OpenAI 分组")
       return
     }
     setBusy("test")
@@ -1238,6 +1229,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   }
 
   async function testGroup(group: UpstreamGroupKey) {
+    if (!isOpenAIHealthGroup(group)) {
+      toast.error("目前只测活 OpenAI 格式渠道")
+      return
+    }
     setBusy(`test-${group.id}`)
     try {
       const result = await apiFetch<GatewayHealthResult["items"][number]>(`/gateway/group-keys/${group.id}/test`, { method: "POST" })
@@ -1359,6 +1354,199 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
+  function renderGroupRow(group: UpstreamGroupKey) {
+    const latestHealth = healthResults[group.id]
+    const status = latestHealth?.status ?? effectiveStatus(group)
+    const Icon = status === "alive" ? CheckCircle2 : isFailureHealthStatus(status) ? XCircle : RefreshCw
+    const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
+    const healthError = latestHealth?.error || group.last_error
+    const format = groupClientFormat(group)
+    const canTest = isOpenAIHealthGroup(group) && group.enabled !== false
+
+    return (
+      <div
+        key={group.id}
+        className={cn(
+          "grid gap-2 border-t border-border p-3 text-xs lg:grid-cols-[minmax(260px,1.6fr)_110px_120px_120px_90px_90px_145px_110px] lg:items-center",
+          group.charity && "bg-success/5",
+        )}
+      >
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <p className="truncate text-sm font-semibold text-foreground">{group.group_name}</p>
+            <Badge variant="outline" className="bg-background">{clientFormatLabel(format)}</Badge>
+            {group.charity ? (
+              <Badge variant="outline" className="gap-1 border-success/20 bg-success/10 px-1.5 text-[10px] text-success">
+                <HeartHandshake className="size-3" />
+                公益
+              </Badge>
+            ) : null}
+          </div>
+          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+            {group.group_description || group.group_ref}
+          </p>
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            <Badge variant="outline" className="bg-background">倍率 {formatRatio(group.ratio)}</Badge>
+            <Badge variant="outline" className="bg-background">{requestModeLabel(group.request_mode)}</Badge>
+            <Badge variant="outline" className="bg-background">{upstreamKeyLabel(group)}</Badge>
+            <Badge variant="outline" className="bg-background">{formatTokens(group.total_tokens)} tok</Badge>
+          </div>
+        </div>
+
+        <Badge variant="outline" className={cn("w-fit gap-1.5", statusTone(status))}>
+          <Icon className={cn("size-3", status === "checking" && "animate-spin")} />
+          {statusText(status)}
+        </Badge>
+
+        <Select
+          value={format}
+          disabled={!!busy}
+          onValueChange={(value) => void changeGroupClientFormat(group, value)}
+        >
+          <SelectTrigger className="h-8 w-full text-xs" aria-label="渠道格式">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="openai">OpenAI</SelectItem>
+            <SelectItem value="claude">Claude</SelectItem>
+            <SelectItem value="grok">Grok</SelectItem>
+          </SelectContent>
+        </Select>
+
+        <Select
+          value={normalizeRequestMode(group.request_mode)}
+          disabled={!!busy}
+          onValueChange={(value) => void changeGroupRequestMode(group, normalizeRequestMode(value))}
+        >
+          <SelectTrigger className="h-8 w-full text-xs" aria-label="上游接口">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="responses">Responses</SelectItem>
+            <SelectItem value="chat">Chat</SelectItem>
+          </SelectContent>
+        </Select>
+
+        <Input
+          value={priorityDrafts[group.id] ?? String(group.priority || 0)}
+          inputMode="numeric"
+          className="h-8 px-2 text-xs"
+          disabled={!!busy}
+          title="优先级：数值越大越优先；同优先级再按低倍率调度"
+          onChange={(event) =>
+            setPriorityDrafts((prev) => ({
+              ...prev,
+              [group.id]: event.target.value.replace(/[^\d]/g, ""),
+            }))
+          }
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.currentTarget.blur()
+          }}
+          onBlur={() => {
+            const draft = priorityDrafts[group.id] ?? String(group.priority || 0)
+            if (Number(draft) !== (group.priority || 0)) void savePriority(group)
+          }}
+        />
+
+        <Input
+          value={concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)}
+          inputMode="numeric"
+          className="h-8 px-2 text-xs"
+          disabled={!!busy}
+          title="并发上限，0 表示不限"
+          onChange={(event) =>
+            setConcurrencyDrafts((prev) => ({
+              ...prev,
+              [group.id]: event.target.value.replace(/[^\d]/g, ""),
+            }))
+          }
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.currentTarget.blur()
+          }}
+          onBlur={() => {
+            const draft = concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)
+            if (Number(draft) !== (group.concurrency_limit || 0)) void saveConcurrencyLimit(group)
+          }}
+        />
+
+        <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
+          <label className="flex items-center gap-1.5">
+            <Switch
+              checked={group.enabled !== false}
+              disabled={!!busy}
+              title={group.enabled === false ? "启用这个上游分组" : "禁用后不会参与调度和测活"}
+              onCheckedChange={(checked) => void toggleGroupEnabled(group, checked)}
+            />
+            启用
+          </label>
+          <label className="flex items-center gap-1.5">
+            <Switch
+              checked={group.charity === true}
+              disabled={!!busy}
+              title={group.charity ? "取消公益标记" : "标记为公益分组"}
+              onCheckedChange={(checked) => void toggleGroupCharity(group, checked)}
+            />
+            公益
+          </label>
+        </div>
+
+        <div className="flex items-center justify-start gap-1 lg:justify-end">
+          {group.disabled_until && new Date(group.disabled_until).getTime() > Date.now() ? (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[11px]"
+              disabled={!!busy}
+              title="立即解除冷却，恢复调度"
+              onClick={() => void clearCooldown(group)}
+            >
+              解冷
+            </Button>
+          ) : null}
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1 px-2 text-[11px]"
+            disabled={!!busy || !canTest}
+            title={isOpenAIHealthGroup(group) ? "仅测活此 OpenAI 分组" : "目前只测活 OpenAI 格式渠道"}
+            onClick={() => void testGroup(group)}
+          >
+            {busy === `test-${group.id}` ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+            测活
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7 text-muted-foreground hover:text-danger"
+            disabled={!!busy}
+            title="删除该分组（清理上游已删除的残留，仅删本地）"
+            onClick={() => void deleteGroup(group)}
+          >
+            <Trash2 className="size-3.5" />
+          </Button>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground lg:col-span-8">
+          <span>测活：{latestHealth?.checked_at ? relativeTime(latestHealth.checked_at) : group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}</span>
+          <span>延迟：{latencyMS > 0 ? `${latencyMS}ms` : "—"}</span>
+          <span>并发：{(group.concurrency_limit || 0) > 0 ? `${group.concurrency_limit} 路` : "不限"}</span>
+          <span>优先级：{group.priority || 0}</span>
+        </div>
+        {healthError ? (
+          <p
+            className={cn(
+              "truncate rounded-md px-2 py-1 text-[11px] lg:col-span-8",
+              isWarningHealthStatus(status) ? "bg-warning/10 text-warning" : "bg-danger/10 text-danger",
+            )}
+            title={healthError}
+          >
+            {healthError}
+          </p>
+        ) : null}
+      </div>
+    )
+  }
+
   return (
     <Card className="border border-border shadow-none">
       <CardHeader className="flex flex-col gap-3 pb-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1394,27 +1582,20 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               启用 {displayEnabledCount}/{totalGroups}
             </Badge>
             <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
-              已选 {selectedHealthGroupIds.length}
-              {activeFilters > 0 ? ` · 当前筛选 ${selectedVisibleHealthCount}` : ""}
+              OpenAI 可测 {enabledOpenAIHealthGroups.length}/{openAIHealthGroups.length}
             </Badge>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
               {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
               一键创建分组 Key
             </Button>
-            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || filteredGroups.length === 0} onClick={selectVisibleHealthGroups}>
-              选中当前筛选
-            </Button>
-            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || selectedHealthGroupIds.length === 0} onClick={clearHealthSelection}>
-              清空选择
-            </Button>
-            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={testGroups}>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || enabledOpenAIHealthGroups.length === 0} onClick={testGroups}>
               {busy === "test" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-              测活已选分组
+              一键测活
             </Button>
             {healthProgress ? (
               <div className="w-full rounded-md border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground sm:w-auto">
                 <span className="font-medium text-foreground">
-                  {healthProgress.completed}/{healthProgress.total || totalGroups}
+                  {healthProgress.completed}/{healthProgress.total || enabledOpenAIHealthGroups.length}
                 </span>
                 <span className="mx-1">·</span>
                 <span>
@@ -1576,7 +1757,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 <div>
                   <p className="text-xs font-medium text-foreground">统一筛选区</p>
                   <p className="mt-1 text-[11px] text-muted-foreground">
-                    搜索、格式、倍率、公益 Key 按“或”匹配；不填条件时展示全部渠道。
+                    搜索、格式、倍率、状态按条件筛选；不填条件时展示全部渠道。
                   </p>
                 </div>
                 <Badge variant="outline" className="border-border bg-background text-muted-foreground">
@@ -1595,7 +1776,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                       }
                     }}
                     className="h-9 pl-8 text-xs"
-                    placeholder="模糊搜索渠道、分组、格式、公益、倍率"
+                    placeholder="模糊搜索渠道、分组、格式、状态、倍率"
                     aria-label="搜索可用渠道对应的上游分组"
                   />
                 </div>
@@ -1639,10 +1820,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                   }
                 >
                   <SelectTrigger className="h-9 w-full text-xs">
-                    <SelectValue placeholder="公益 Key 筛选" />
+                    <SelectValue placeholder="状态筛选" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">全部公益状态</SelectItem>
+                    <SelectItem value="all">全部状态</SelectItem>
                     <SelectItem value="charity">仅公益 Key</SelectItem>
                     <SelectItem value="normal">非公益</SelectItem>
                   </SelectContent>
@@ -1682,7 +1863,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <Badge variant="outline" className="bg-background">倍率：{rateFilterLabel(groupFilters.rateBand)}</Badge>
                   ) : null}
                   {groupFilters.charity !== "all" ? (
-                    <Badge variant="outline" className="bg-background">公益：{charityFilterLabel(groupFilters.charity)}</Badge>
+                    <Badge variant="outline" className="bg-background">状态：{charityFilterLabel(groupFilters.charity)}</Badge>
                   ) : null}
                 </div>
               ) : null}
@@ -1702,260 +1883,33 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 没有符合当前筛选条件的渠道
               </div>
             ) : (
-              <div className="grid gap-3 xl:grid-cols-3">
-                {groupColumns.map((column) => {
-                  const alive = column.items.filter((group) => effectiveStatus(group) === "alive").length
+              <div className="space-y-3">
+                {channelRows.map((row) => {
+                  const alive = row.items.filter((group) => effectiveStatus(group) === "alive").length
+                  const formats = Array.from(new Set(row.items.map((group) => groupClientFormat(group))))
+                    .sort((a, b) => formatRank(a) - formatRank(b))
+                  const openAIText = Number.isFinite(row.openAIPrice) ? formatRatio(row.openAIPrice) : "无"
                   return (
-                    <div key={column.key} className="rounded-md border border-border bg-background">
-                      <div className="border-b border-border p-3">
-                        <div className="flex items-center justify-between gap-2">
-                          <div>
-                            <p className="text-sm font-semibold text-foreground">{column.title}</p>
-                            <p className="mt-0.5 text-[11px] text-muted-foreground">{column.description}</p>
+                    <div key={row.channelID} className="overflow-hidden rounded-md border border-border bg-background">
+                      <div className="flex flex-wrap items-center justify-between gap-2 bg-muted/20 px-3 py-2">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <p className="truncate text-sm font-semibold text-foreground">{row.channelName}</p>
+                            <Badge variant="outline" className="bg-background">{channelTypeLabel(row.channelType)}</Badge>
+                            {formats.map((format) => (
+                              <Badge key={format} variant="outline" className="bg-background">{clientFormatLabel(format)}</Badge>
+                            ))}
                           </div>
-                          <Badge variant="outline" className="bg-muted/40">
-                            {column.items.length} 个
-                          </Badge>
+                          <p className="mt-0.5 text-[11px] text-muted-foreground">
+                            OpenAI 最低倍率 {openAIText} · 共 {row.items.length} 个分组 · 存活 {alive}
+                          </p>
                         </div>
-                        <div className="mt-2 flex gap-1.5 text-[11px]">
-                          <Badge variant="outline" className="border-success/20 bg-success/10 text-success">存活 {alive}</Badge>
-                          <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
-                            其它 {Math.max(0, column.items.length - alive)}
-                          </Badge>
-                        </div>
+                        <Badge variant="outline" className="border-border bg-background text-muted-foreground">
+                          按 OpenAI 低价排序
+                        </Badge>
                       </div>
-                      <div className="space-y-2 p-2">
-                        {column.items.length === 0 ? (
-                          <div className="rounded-md border border-dashed border-border px-3 py-8 text-center text-xs text-muted-foreground">
-                            暂无匹配 {column.title} 的渠道
-                          </div>
-                        ) : (
-                          column.items.map((group) => {
-                            const latestHealth = healthResults[group.id]
-                            const status = latestHealth?.status ?? effectiveStatus(group)
-                            const Icon = status === "alive" ? CheckCircle2 : isFailureHealthStatus(status) ? XCircle : RefreshCw
-                            const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
-                            const selected = selectedHealthGroupSet.has(group.id)
-                            const healthError = latestHealth?.error || group.last_error
-                            return (
-                              <div
-                                key={`${column.key}-${group.id}`}
-                                className={cn(
-                                  "rounded-md border border-border bg-card p-3 text-xs shadow-sm",
-                                  group.charity && "border-success/20 bg-success/5",
-                                  selected && "border-brand/30 ring-1 ring-brand/20",
-                                )}
-                              >
-                                <div className="flex items-start justify-between gap-2">
-                                  <div className="flex min-w-0 items-start gap-2">
-                                    <Checkbox
-                                      className="mt-0.5 shrink-0"
-                                      checked={selected}
-                                      disabled={!!busy}
-                                      aria-label={`选择 ${group.channel_name || group.channel_id} / ${group.group_name} 参与测活`}
-                                      onCheckedChange={(checked) => toggleHealthGroupSelected(group.id, checked === true)}
-                                    />
-                                    <div className="min-w-0">
-                                      <div className="flex flex-wrap items-center gap-1.5">
-                                        <p className="truncate text-sm font-semibold text-foreground">
-                                          {group.channel_name || `#${group.channel_id}`}
-                                        </p>
-                                        {group.charity ? (
-                                          <Badge variant="outline" className="gap-1 border-success/20 bg-success/10 px-1.5 text-[10px] text-success">
-                                            <HeartHandshake className="size-3" />
-                                            公益
-                                          </Badge>
-                                        ) : null}
-                                      </div>
-                                      <p className="mt-0.5 truncate text-muted-foreground">{channelTypeLabel(group.channel_type)}</p>
-                                    </div>
-                                  </div>
-                                  <Badge variant="outline" className={cn("shrink-0 gap-1.5", statusTone(status))}>
-                                    <Icon className={cn("size-3", status === "checking" && "animate-spin")} />
-                                    {statusText(status)}
-                                  </Badge>
-                                </div>
-
-                                <div className="mt-3 rounded-md bg-muted/40 px-2 py-2">
-                                  <p className="truncate font-medium text-foreground">{group.group_name}</p>
-                                  <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
-                                    {group.group_description || group.group_ref}
-                                  </p>
-                                  <div className="mt-2 flex flex-wrap gap-1.5">
-                                    <Badge variant="outline" className="bg-background">倍率 {formatRatio(group.ratio)}</Badge>
-                                    <Badge variant="outline" className="bg-background">{upstreamKeyLabel(group)}</Badge>
-                                    <Badge variant="outline" className="bg-background">优先级 {group.priority || 0}</Badge>
-                                    <Badge variant="outline" className="bg-background">{formatTokens(group.total_tokens)} tok</Badge>
-                                    <Badge variant="outline" className="bg-background">{requestModeLabel(group.request_mode)}</Badge>
-                                  </div>
-                                </div>
-
-                                <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
-                                  <div className="space-y-1">
-                                    <Label className="text-[11px] text-muted-foreground">格式</Label>
-                                    <Select
-                                      value={normalizeClientFormat(group.client_format)}
-                                      disabled={!!busy}
-                                      onValueChange={(value) => void changeGroupClientFormat(group, value)}
-                                    >
-                                      <SelectTrigger className="h-8 w-full text-xs">
-                                        <SelectValue />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        <SelectItem value="openai">OpenAI</SelectItem>
-                                        <SelectItem value="claude">Claude</SelectItem>
-                                        <SelectItem value="grok">Grok</SelectItem>
-                                      </SelectContent>
-                                    </Select>
-                                  </div>
-                                  <div className="space-y-1">
-                                    <Label className="text-[11px] text-muted-foreground">上游接口</Label>
-                                    <Select
-                                      value={normalizeRequestMode(group.request_mode)}
-                                      disabled={!!busy}
-                                      onValueChange={(value) => void changeGroupRequestMode(group, normalizeRequestMode(value))}
-                                    >
-                                      <SelectTrigger className="h-8 w-full text-xs">
-                                        <SelectValue />
-                                      </SelectTrigger>
-                                      <SelectContent>
-                                        <SelectItem value="responses">Responses</SelectItem>
-                                        <SelectItem value="chat">Chat</SelectItem>
-                                      </SelectContent>
-                                    </Select>
-                                  </div>
-                                  <div className="space-y-1">
-                                    <Label className="text-[11px] text-muted-foreground">优先级</Label>
-                                    <div className="flex items-center gap-1">
-                                      <Input
-                                        value={priorityDrafts[group.id] ?? String(group.priority || 0)}
-                                        inputMode="numeric"
-                                        className="h-8 px-2 text-xs"
-                                        disabled={!!busy}
-                                        title="数值越大越优先；同优先级再按低倍率调度"
-                                        onChange={(event) =>
-                                          setPriorityDrafts((prev) => ({
-                                            ...prev,
-                                            [group.id]: event.target.value.replace(/[^\d]/g, ""),
-                                          }))
-                                        }
-                                        onKeyDown={(event) => {
-                                          if (event.key === "Enter") event.currentTarget.blur()
-                                        }}
-                                        onBlur={() => {
-                                          const draft = priorityDrafts[group.id] ?? String(group.priority || 0)
-                                          if (Number(draft) !== (group.priority || 0)) void savePriority(group)
-                                        }}
-                                      />
-                                      {busy === `group-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
-                                    </div>
-                                  </div>
-                                  <div className="space-y-1">
-                                    <Label className="text-[11px] text-muted-foreground">并发上限</Label>
-                                    <div className="flex items-center gap-1">
-                                      <Input
-                                        value={concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)}
-                                        inputMode="numeric"
-                                        className="h-8 px-2 text-xs"
-                                        disabled={!!busy}
-                                        title="0 表示不限"
-                                        onChange={(event) =>
-                                          setConcurrencyDrafts((prev) => ({
-                                            ...prev,
-                                            [group.id]: event.target.value.replace(/[^\d]/g, ""),
-                                          }))
-                                        }
-                                        onKeyDown={(event) => {
-                                          if (event.key === "Enter") event.currentTarget.blur()
-                                        }}
-                                        onBlur={() => {
-                                          const draft = concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)
-                                          if (Number(draft) !== (group.concurrency_limit || 0)) void saveConcurrencyLimit(group)
-                                        }}
-                                      />
-                                      {busy === `group-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
-                                    </div>
-                                  </div>
-                                </div>
-
-                                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
-                                  <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
-                                    <label className="flex items-center gap-1.5">
-                                      <Switch
-                                        checked={group.enabled !== false}
-                                        disabled={!!busy}
-                                        title={group.enabled === false ? "启用这个上游分组" : "禁用后不会参与调度和测活"}
-                                        onCheckedChange={(checked) => void toggleGroupEnabled(group, checked)}
-                                      />
-                                      启用
-                                    </label>
-                                    <label className="flex items-center gap-1.5">
-                                      <Switch
-                                        checked={group.charity === true}
-                                        disabled={!!busy}
-                                        title={group.charity ? "取消公益标记" : "标记为公益分组"}
-                                        onCheckedChange={(checked) => void toggleGroupCharity(group, checked)}
-                                      />
-                                      公益
-                                    </label>
-                                  </div>
-                                  <div className="flex items-center gap-1">
-                                    {group.disabled_until && new Date(group.disabled_until).getTime() > Date.now() ? (
-                                      <Button
-                                        variant="outline"
-                                        size="sm"
-                                        className="h-7 px-2 text-[11px]"
-                                        disabled={!!busy}
-                                        title="立即解除冷却，恢复调度"
-                                        onClick={() => void clearCooldown(group)}
-                                      >
-                                        解除冷却
-                                      </Button>
-                                    ) : null}
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      className="h-7 gap-1 px-2 text-[11px]"
-                                      disabled={!!busy || group.enabled === false}
-                                      title="仅测活此上游分组"
-                                      onClick={() => void testGroup(group)}
-                                    >
-                                      {busy === `test-${group.id}` ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
-                                      测活
-                                    </Button>
-                                    <Button
-                                      variant="ghost"
-                                      size="icon"
-                                      className="size-7 text-muted-foreground hover:text-danger"
-                                      disabled={!!busy}
-                                      title="删除该分组（清理上游已删除的残留，仅删本地）"
-                                      onClick={() => void deleteGroup(group)}
-                                    >
-                                      <Trash2 className="size-3.5" />
-                                    </Button>
-                                  </div>
-                                </div>
-
-                                <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-                                  <span>测活：{latestHealth?.checked_at ? relativeTime(latestHealth.checked_at) : group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}</span>
-                                  <span>延迟：{latencyMS > 0 ? `${latencyMS}ms` : "—"}</span>
-                                  <span>并发：{(group.concurrency_limit || 0) > 0 ? `${group.concurrency_limit} 路` : "不限"}</span>
-                                </div>
-                                {healthError ? (
-                                  <p
-                                    className={cn(
-                                      "mt-2 truncate rounded-md px-2 py-1 text-[11px]",
-                                      isWarningHealthStatus(status) ? "bg-warning/10 text-warning" : "bg-danger/10 text-danger",
-                                    )}
-                                    title={healthError}
-                                  >
-                                    {healthError}
-                                  </p>
-                                ) : null}
-                              </div>
-                            )
-                          })
-                        )}
+                      <div>
+                        {row.items.map((group) => renderGroupRow(group))}
                       </div>
                     </div>
                   )

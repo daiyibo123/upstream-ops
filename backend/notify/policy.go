@@ -38,12 +38,13 @@ type CooldownStore interface {
 
 // RateChange 是一条待发送的倍率相关记录（去抖 / 合并的基本单元）。
 type RateChange struct {
-	GroupName string
-	OldRatio  float64
-	NewRatio  float64
-	OldComp   float64
-	NewComp   float64
-	ChangedAt time.Time
+	GroupName   string
+	Description string
+	OldRatio    float64
+	NewRatio    float64
+	OldComp     float64
+	NewComp     float64
+	ChangedAt   time.Time
 }
 
 type RateStructureChange struct {
@@ -62,6 +63,42 @@ func (rc RateChange) ChangePctAbove(minPct float64) bool {
 	}
 	pct := math.Abs(rc.NewRatio-rc.OldRatio) / math.Abs(rc.OldRatio) * 100
 	return pct >= minPct
+}
+
+// MatchesOpenAILowRatioPolicy 判断一条倍率变化是否值得发送通知。
+//
+// 当前通知策略偏向"少而准"：
+//   - 只关注 OpenAI 兼容分组（通过分组名/描述排除 Claude、Grok 等专用分组）；
+//   - 任一侧倍率 < 0.05 时，涨价/降价都通知；
+//   - 0.05 <= 新倍率 < 0.1 时，只通知降价；
+//   - >= 0.1 的普通波动不通知。
+//
+// 这只影响通知发送，不影响 RateChangeLog 历史记录。
+func (rc RateChange) MatchesOpenAILowRatioPolicy() bool {
+	if !rc.isOpenAICompatible() {
+		return false
+	}
+	if positiveBelow(rc.OldRatio, 0.05) || positiveBelow(rc.NewRatio, 0.05) {
+		return true
+	}
+	if rc.NewRatio < rc.OldRatio && rc.NewRatio >= 0.05 && rc.NewRatio < 0.1 {
+		return true
+	}
+	return false
+}
+
+func (rc RateChange) isOpenAICompatible() bool {
+	text := strings.ToLower(strings.TrimSpace(rc.GroupName + " " + rc.Description))
+	for _, marker := range []string{"claude", "anthropic", "opus", "sonnet", "haiku", "grok", "xai", "x.ai"} {
+		if strings.Contains(text, marker) {
+			return false
+		}
+	}
+	return true
+}
+
+func positiveBelow(value, limit float64) bool {
+	return value > 0 && value < limit
 }
 
 // BuildBatchMessage 把多条 RateChange 合并成一条 notify.Message。

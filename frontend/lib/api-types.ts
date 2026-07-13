@@ -185,6 +185,8 @@ export interface DashboardGatewayGroup {
   client_format?: "openai" | "claude" | "grok" | "any" | string
   group_name: string
   ratio: number
+  input_price_per_million?: number
+  output_price_per_million?: number
   priority: number
   charity?: boolean
   enabled: boolean
@@ -205,6 +207,12 @@ export interface DashboardGatewayKey {
   total_limit: number
   today_tokens: number
   total_tokens: number
+  today_prompt_tokens: number
+  total_prompt_tokens: number
+  today_cached_tokens: number
+  total_cached_tokens: number
+  today_cache_hit_rate: number
+  total_cache_hit_rate: number
   cost_per_million: number
   balance_limit: number
   concurrency_limit: number
@@ -523,6 +531,12 @@ export interface GatewayKey {
   total_limit: number
   today_tokens: number
   total_tokens: number
+  today_prompt_tokens: number
+  total_prompt_tokens: number
+  today_cached_tokens: number
+  total_cached_tokens: number
+  today_cache_hit_rate: number
+  total_cache_hit_rate: number
   cost_per_million: number
   balance_limit: number
   concurrency_limit: number
@@ -531,6 +545,7 @@ export interface GatewayKey {
   total_cost: number
   usage_date?: string
   expires_at?: string | null
+  is_public?: boolean
   last_used_at?: string | null
   last_used_ip?: string
   created_at: string
@@ -549,6 +564,12 @@ export interface GatewayKeyUsage {
   today_cost: number
   total_tokens: number
   total_cost: number
+  today_prompt_tokens: number
+  total_prompt_tokens: number
+  today_cached_tokens: number
+  total_cached_tokens: number
+  today_cache_hit_rate: number
+  total_cache_hit_rate: number
   cost_per_million: number
   balance_limit: number
   balance_remaining: number
@@ -566,6 +587,12 @@ export interface PublicGatewayKey {
   expires_at?: string | null
   today_tokens: number
   total_tokens: number
+  today_prompt_tokens: number
+  total_prompt_tokens: number
+  today_cached_tokens: number
+  total_cached_tokens: number
+  today_cache_hit_rate: number
+  total_cache_hit_rate: number
   last_used_at?: string | null
 }
 
@@ -580,6 +607,8 @@ export interface UpstreamGroupKey {
   group_name: string
   group_description?: string
   ratio: number
+  input_price_per_million?: number
+  output_price_per_million?: number
   priority: number
   charity?: boolean
   enabled: boolean
@@ -639,6 +668,7 @@ export interface UsageLog {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  cached_tokens: number
   ratio?: number
   created_at: string
 }
@@ -646,6 +676,7 @@ export interface UsageLog {
 export interface UsageLogsResponse {
   items: UsageLog[]
   total: number
+  keys: GatewayKey[]
 }
 
 export interface GatewayBootstrapResult {

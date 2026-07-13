@@ -127,7 +127,11 @@ func (d *Dispatcher) DispatchRateEventBatch(ctx context.Context, channel *storag
 
 	filtered := make([]RateChange, 0, len(changes))
 	for _, c := range changes {
-		if event != storage.EventRateChanged || c.ChangePctAbove(policy.MinChangePct) {
+		if event != storage.EventRateChanged {
+			filtered = append(filtered, c)
+			continue
+		}
+		if c.MatchesOpenAILowRatioPolicy() && c.ChangePctAbove(policy.MinChangePct) {
 			filtered = append(filtered, c)
 		}
 	}

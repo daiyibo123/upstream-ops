@@ -208,10 +208,11 @@ func (s *Service) RefreshRates(ctx context.Context, c *storage.Channel) error {
 		if prev == nil {
 			if !isFirstSync {
 				added = append(added, notify.RateChange{
-					GroupName: r.ModelName,
-					NewRatio:  r.Ratio,
-					NewComp:   r.CompletionRatio,
-					ChangedAt: now,
+					GroupName:   r.ModelName,
+					Description: r.Description,
+					NewRatio:    r.Ratio,
+					NewComp:     r.CompletionRatio,
+					ChangedAt:   now,
 				})
 			}
 			continue
@@ -221,6 +222,10 @@ func (s *Service) RefreshRates(ctx context.Context, c *storage.Channel) error {
 		}
 		oldRatio := prev.Ratio
 		oldComp := prev.CompletionRatio
+		description := strings.TrimSpace(r.Description)
+		if description == "" {
+			description = prev.Description
+		}
 		_ = s.rates.AppendChange(&storage.RateChangeLog{
 			ChannelID:          c.ID,
 			ModelName:          r.ModelName,
@@ -231,12 +236,13 @@ func (s *Service) RefreshRates(ctx context.Context, c *storage.Channel) error {
 			ChangedAt:          now,
 		})
 		changes = append(changes, notify.RateChange{
-			GroupName: r.ModelName,
-			OldRatio:  oldRatio,
-			NewRatio:  r.Ratio,
-			OldComp:   oldComp,
-			NewComp:   r.CompletionRatio,
-			ChangedAt: now,
+			GroupName:   r.ModelName,
+			Description: description,
+			OldRatio:    oldRatio,
+			NewRatio:    r.Ratio,
+			OldComp:     oldComp,
+			NewComp:     r.CompletionRatio,
+			ChangedAt:   now,
 		})
 	}
 	removed := make([]notify.RateChange, 0)
@@ -249,10 +255,11 @@ func (s *Service) RefreshRates(ctx context.Context, c *storage.Channel) error {
 			continue
 		}
 		removed = append(removed, notify.RateChange{
-			GroupName: snapshot.ModelName,
-			OldRatio:  snapshot.Ratio,
-			OldComp:   snapshot.CompletionRatio,
-			ChangedAt: now,
+			GroupName:   snapshot.ModelName,
+			Description: snapshot.Description,
+			OldRatio:    snapshot.Ratio,
+			OldComp:     snapshot.CompletionRatio,
+			ChangedAt:   now,
 		})
 	}
 	// 一次扫描的所有变化打包推送：去抖策略（合并 / 涨跌幅过滤）由 Dispatcher.Policy 决定。
