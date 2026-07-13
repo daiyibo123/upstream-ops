@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/bejix/upstream-ops/backend/notify"
 	"github.com/bejix/upstream-ops/backend/storage"
@@ -125,7 +126,8 @@ func createNotifyChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusBadRequest, err)
 		return
 	}
-	if in.Config == "" {
+	configJSON := strings.TrimSpace(in.Config)
+	if configJSON == "" {
 		fail(c, http.StatusBadRequest, errors.New("config is required"))
 		return
 	}
@@ -133,12 +135,16 @@ func createNotifyChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusBadRequest, errors.New("notification type is disabled"))
 		return
 	}
+	if err := validateNotifyConfig(in.Type, configJSON); err != nil {
+		fail(c, http.StatusBadRequest, err)
+		return
+	}
 	subs, err := normalizeSubscriptions(in.Subscriptions)
 	if err != nil {
 		fail(c, http.StatusBadRequest, err)
 		return
 	}
-	cipherCfg, err := d.Cipher.Encrypt(in.Config)
+	cipherCfg, err := d.Cipher.Encrypt(configJSON)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, err)
 		return
@@ -169,6 +175,7 @@ func updateNotifyChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusNotFound, err)
 		return
 	}
+	oldType := ch.Type
 	var in notifyChannelInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		fail(c, http.StatusBadRequest, err)
@@ -176,6 +183,11 @@ func updateNotifyChannel(c *gin.Context, d *Deps) {
 	}
 	if !allowedNotifyType(in.Type) {
 		fail(c, http.StatusBadRequest, errors.New("notification type is disabled"))
+		return
+	}
+	configPatch := strings.TrimSpace(in.Config)
+	if in.Type != ch.Type && configPatch == "" {
+		fail(c, http.StatusBadRequest, errors.New("config is required when changing notification type"))
 		return
 	}
 	subs, err := normalizeSubscriptions(in.Subscriptions)
@@ -188,8 +200,21 @@ func updateNotifyChannel(c *gin.Context, d *Deps) {
 	ch.Enabled = in.Enabled
 	ch.ProxyEnabled = in.ProxyEnabled
 	ch.Subscriptions = subs
-	if in.Config != "" {
-		cipherCfg, err := d.Cipher.Encrypt(in.Config)
+	if configPatch != "" {
+		configJSON := configPatch
+		var err error
+		if in.Type == oldType {
+			configJSON, err = mergeNotifyConfig(d, ch, configPatch)
+		}
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		if err := validateNotifyConfig(in.Type, configJSON); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		cipherCfg, err := d.Cipher.Encrypt(configJSON)
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
@@ -210,6 +235,54 @@ func allowedNotifyType(t storage.NotificationChannelType) bool {
 	default:
 		return false
 	}
+}
+
+func validateNotifyConfig(t storage.NotificationChannelType, cfg string) error {
+	if strings.TrimSpace(cfg) == "" {
+		return errors.New("config is required")
+	}
+	_, err := notify.Build(&storage.NotificationChannel{Type: t}, cfg)
+	if err != nil {
+		return fmt.Errorf("invalid notification config: %w", err)
+	}
+	return nil
+}
+
+func mergeNotifyConfig(d *Deps, ch *storage.NotificationChannel, patchJSON string) (string, error) {
+	if strings.TrimSpace(patchJSON) == "" {
+		return "", errors.New("config is required")
+	}
+	var patch map[string]any
+	if err := json.Unmarshal([]byte(patchJSON), &patch); err != nil {
+		return "", fmt.Errorf("invalid notification config: %w", err)
+	}
+	if len(patch) == 0 {
+		return "", errors.New("notification config is empty")
+	}
+	if d.Cipher == nil || ch == nil || ch.ConfigCipher == "" {
+		return patchJSON, nil
+	}
+	existingJSON, err := d.Cipher.Decrypt(ch.ConfigCipher)
+	if err != nil {
+		return "", fmt.Errorf("decrypt existing notification config: %w", err)
+	}
+	var merged map[string]any
+	if strings.TrimSpace(existingJSON) != "" {
+		if err := json.Unmarshal([]byte(existingJSON), &merged); err != nil {
+			return "", fmt.Errorf("invalid existing notification config: %w", err)
+		}
+	}
+	if merged == nil {
+		merged = map[string]any{}
+	}
+	for key, value := range patch {
+		merged[key] = value
+	}
+	out, err := json.Marshal(merged)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 func testNotify(c *gin.Context, d *Deps) {

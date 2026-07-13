@@ -70,22 +70,27 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			}
 		}
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{
-			"title":              title,
-			"total_channels":     len(channels),
-			"active_channels":    gateway.AliveGroups,
-			"upstream_groups":    gateway.TotalGroups,
-			"available_groups":   gateway.AliveGroups + gateway.UnknownGroups,
-			"openai_groups":      openaiCount,
-			"claude_groups":      claudeCount,
-			"grok_groups":        grokCount,
-			"today_tokens":       gateway.TodayTokens,
-			"total_tokens":       gateway.TotalTokens,
-			"cheapest":           gateway.Cheapest,
-			"dispatch_preview":   publicGroups,
-			"supported_formats":  []string{"OpenAI /v1/chat/completions", "OpenAI /v1/responses", "Claude Messages 自动转 Responses"},
-			"gateway_status":     "online",
-			"public_key":         publicKey,
-			"public_key_enabled": publicKey.Enabled,
+			"title":                 title,
+			"total_channels":        len(channels),
+			"active_channels":       gateway.AliveGroups,
+			"upstream_groups":       gateway.TotalGroups,
+			"available_groups":      gateway.AliveGroups + gateway.UnknownGroups,
+			"zero_balance_groups":   gateway.ZeroBalanceGroups,
+			"rate_limited_groups":   gateway.RateLimitedGroups,
+			"forbidden_groups":      gateway.ForbiddenGroups,
+			"non_generation_groups": gateway.NonGenerationGroups,
+			"error_groups":          gateway.ErrorGroups,
+			"openai_groups":         openaiCount,
+			"claude_groups":         claudeCount,
+			"grok_groups":           grokCount,
+			"today_tokens":          gateway.TodayTokens,
+			"total_tokens":          gateway.TotalTokens,
+			"cheapest":              gateway.Cheapest,
+			"dispatch_preview":      publicGroups,
+			"supported_formats":     []string{"OpenAI /v1/chat/completions", "OpenAI /v1/responses", "Claude Messages 自动转 Responses"},
+			"gateway_status":        "online",
+			"public_key":            publicKey,
+			"public_key_enabled":    publicKey.Enabled,
 		}})
 	})
 	g.POST("/key/reveal", func(c *gin.Context) {
@@ -136,6 +141,8 @@ func publicDashboardTitle(d *Deps) string {
 type publicKeyStat struct {
 	Enabled          bool       `json:"enabled"`
 	Name             string     `json:"name"`
+	KeyPrefix        string     `json:"key_prefix,omitempty"`
+	MaskedKey        string     `json:"masked_key,omitempty"`
 	PasswordRequired bool       `json:"password_required"`
 	PasswordHint     string     `json:"password_hint,omitempty"`
 	ExpiresAt        string     `json:"expires_at,omitempty"`
@@ -156,6 +163,8 @@ func publicKeySummary(d *Deps) publicKeyStat {
 	stat := publicKeyStat{
 		Enabled:          key.Enabled,
 		Name:             key.Name,
+		KeyPrefix:        key.KeyPrefix,
+		MaskedKey:        key.MaskedKey,
 		PasswordRequired: key.PasswordRequired,
 		PasswordHint:     key.PasswordHint,
 		Status:           "disabled",
@@ -211,19 +220,24 @@ type dashboardChannelStat struct {
 }
 
 type dashboardGatewayStat struct {
-	TotalKeys        int64                   `json:"total_keys"`
-	EnabledKeys      int64                   `json:"enabled_keys"`
-	TotalGroups      int                     `json:"total_groups"`
-	AliveGroups      int                     `json:"alive_groups"`
-	DeadGroups       int                     `json:"dead_groups"`
-	UnknownGroups    int                     `json:"unknown_groups"`
-	TodayTokens      int64                   `json:"today_tokens"`
-	TotalTokens      int64                   `json:"total_tokens"`
-	PromptTokens     int64                   `json:"prompt_tokens"`
-	CompletionTokens int64                   `json:"completion_tokens"`
-	Cheapest         *dashboardGatewayGroup  `json:"cheapest,omitempty"`
-	Groups           []dashboardGatewayGroup `json:"groups"`
-	Keys             []dashboardGatewayKey   `json:"keys"`
+	TotalKeys           int64                   `json:"total_keys"`
+	EnabledKeys         int64                   `json:"enabled_keys"`
+	TotalGroups         int                     `json:"total_groups"`
+	AliveGroups         int                     `json:"alive_groups"`
+	DeadGroups          int                     `json:"dead_groups"`
+	ZeroBalanceGroups   int                     `json:"zero_balance_groups"`
+	RateLimitedGroups   int                     `json:"rate_limited_groups"`
+	ForbiddenGroups     int                     `json:"forbidden_groups"`
+	NonGenerationGroups int                     `json:"non_generation_groups"`
+	ErrorGroups         int                     `json:"error_groups"`
+	UnknownGroups       int                     `json:"unknown_groups"`
+	TodayTokens         int64                   `json:"today_tokens"`
+	TotalTokens         int64                   `json:"total_tokens"`
+	PromptTokens        int64                   `json:"prompt_tokens"`
+	CompletionTokens    int64                   `json:"completion_tokens"`
+	Cheapest            *dashboardGatewayGroup  `json:"cheapest,omitempty"`
+	Groups              []dashboardGatewayGroup `json:"groups"`
+	Keys                []dashboardGatewayKey   `json:"keys"`
 }
 
 type dashboardGatewayGroup struct {
@@ -246,16 +260,22 @@ type dashboardGatewayGroup struct {
 }
 
 type dashboardGatewayKey struct {
-	ID          uint       `json:"id"`
-	Name        string     `json:"name"`
-	KeyPrefix   string     `json:"key_prefix"`
-	Enabled     bool       `json:"enabled"`
-	DailyLimit  int64      `json:"daily_limit"`
-	TotalLimit  int64      `json:"total_limit"`
-	TodayTokens int64      `json:"today_tokens"`
-	TotalTokens int64      `json:"total_tokens"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	LastUsedAt  *time.Time `json:"last_used_at,omitempty"`
+	ID               uint       `json:"id"`
+	Name             string     `json:"name"`
+	KeyPrefix        string     `json:"key_prefix"`
+	Enabled          bool       `json:"enabled"`
+	DailyLimit       int64      `json:"daily_limit"`
+	TotalLimit       int64      `json:"total_limit"`
+	TodayTokens      int64      `json:"today_tokens"`
+	TotalTokens      int64      `json:"total_tokens"`
+	CostPerMillion   float64    `json:"cost_per_million"`
+	BalanceLimit     float64    `json:"balance_limit"`
+	ConcurrencyLimit int        `json:"concurrency_limit"`
+	BalanceRemaining float64    `json:"balance_remaining"`
+	TodayCost        float64    `json:"today_cost"`
+	TotalCost        float64    `json:"total_cost"`
+	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
 }
 
 type dashboardServerStat struct {
@@ -367,16 +387,22 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 		stat.TodayTokens += todayTokens
 		stat.TotalTokens += key.TotalTokens
 		stat.Keys = append(stat.Keys, dashboardGatewayKey{
-			ID:          key.ID,
-			Name:        key.Name,
-			KeyPrefix:   key.KeyPrefix,
-			Enabled:     key.Enabled,
-			DailyLimit:  key.DailyLimit,
-			TotalLimit:  key.TotalLimit,
-			TodayTokens: todayTokens,
-			TotalTokens: key.TotalTokens,
-			ExpiresAt:   key.ExpiresAt,
-			LastUsedAt:  key.LastUsedAt,
+			ID:               key.ID,
+			Name:             key.Name,
+			KeyPrefix:        key.KeyPrefix,
+			Enabled:          key.Enabled,
+			DailyLimit:       key.DailyLimit,
+			TotalLimit:       key.TotalLimit,
+			TodayTokens:      todayTokens,
+			TotalTokens:      key.TotalTokens,
+			CostPerMillion:   key.CostPerMillion,
+			BalanceLimit:     key.BalanceLimit,
+			ConcurrencyLimit: key.ConcurrencyLimit,
+			BalanceRemaining: key.BalanceRemaining,
+			TodayCost:        key.TodayCost,
+			TotalCost:        key.TotalCost,
+			ExpiresAt:        key.ExpiresAt,
+			LastUsedAt:       key.LastUsedAt,
 		})
 	}
 	stat.TotalGroups = len(groups)
@@ -391,6 +417,16 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			stat.AliveGroups++
 		case "dead":
 			stat.DeadGroups++
+		case "zero_balance":
+			stat.ZeroBalanceGroups++
+		case "rate_limited":
+			stat.RateLimitedGroups++
+		case "forbidden":
+			stat.ForbiddenGroups++
+		case "non_generation":
+			stat.NonGenerationGroups++
+		case "auth_failed", "timeout", "network_error", "upstream_error", "model_error", "invalid_request", "server_error":
+			stat.ErrorGroups++
 		default:
 			stat.UnknownGroups++
 		}
@@ -461,10 +497,14 @@ func dashboardStatusRank(status string) int {
 		return 0
 	case "unknown":
 		return 1
-	case "dead":
+	case "rate_limited":
 		return 2
-	default:
+	case "dead", "server_error", "timeout", "network_error", "upstream_error":
 		return 3
+	case "zero_balance", "forbidden", "auth_failed", "model_error", "invalid_request", "non_generation":
+		return 4
+	default:
+		return 5
 	}
 }
 

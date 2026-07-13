@@ -23,6 +23,7 @@ type Scheduler struct {
 	rates         *storage.Rates
 	notifies      *storage.Notifications
 	announcements *storage.UpstreamAnnouncements
+	usageLogs     *storage.UsageLogs
 	captchas      *storage.Captchas
 	cipher        *crypto.Cipher
 	proxy         config.ProxyConfig
@@ -36,6 +37,7 @@ func New(
 	rates *storage.Rates,
 	notifies *storage.Notifications,
 	announcements *storage.UpstreamAnnouncements,
+	usageLogs *storage.UsageLogs,
 	captchas *storage.Captchas,
 	cipher *crypto.Cipher,
 	proxy config.ProxyConfig,
@@ -51,6 +53,7 @@ func New(
 		rates:         rates,
 		notifies:      notifies,
 		announcements: announcements,
+		usageLogs:     usageLogs,
 		captchas:      captchas,
 		cipher:        cipher,
 		proxy:         proxy,
@@ -127,7 +130,8 @@ func (s *Scheduler) hasRetention() bool {
 	return r.MonitorLogsDays > 0 ||
 		r.BalanceSnapshotsDays > 0 ||
 		r.NotificationLogsDays > 0 ||
-		r.AnnouncementsDays > 0
+		r.AnnouncementsDays > 0 ||
+		r.UsageLogsDays > 0
 }
 
 // runRetention 按配置删除过期历史。任一表失败不影响其它，全部错误写日志。
@@ -179,6 +183,16 @@ func (s *Scheduler) runRetention() {
 			s.log.Warn("retention announcements failed", "err", err)
 		} else if n > 0 {
 			s.log.Info("retention announcements deleted", "rows", n, "before", cutoff)
+		}
+	}
+
+	if r.UsageLogsDays > 0 && s.usageLogs != nil {
+		cutoff := now.AddDate(0, 0, -r.UsageLogsDays)
+		n, err := s.usageLogs.DeleteOlderThan(cutoff)
+		if err != nil {
+			s.log.Warn("retention usage_logs failed", "err", err)
+		} else if n > 0 {
+			s.log.Info("retention usage_logs deleted", "rows", n, "before", cutoff)
 		}
 	}
 }

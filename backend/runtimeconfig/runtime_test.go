@@ -52,7 +52,7 @@ func TestApplyFromFileUpdatesUpstreamConfig(t *testing.T) {
 		config.ProxyConfig{},
 		config.UpstreamConfig{},
 		func(scfg config.SchedulerConfig, pcfg config.ProxyConfig) *scheduler.Scheduler {
-			return scheduler.New(scfg, nil, nil, nil, nil, nil, nil, nil, pcfg, nil, log)
+			return scheduler.New(scfg, nil, nil, nil, nil, nil, nil, nil, nil, pcfg, nil, log)
 		},
 	)
 

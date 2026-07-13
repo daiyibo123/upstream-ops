@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useState } from "react"
 import { Link } from "react-router-dom"
 import {
   Activity,
@@ -32,13 +32,15 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { apiFetch } from "@/lib/api"
-import { dateTime, formatRatio, formatTokens, relativeTime } from "@/lib/format"
+import { dateTime, formatRatio, formatTokens } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { DashboardGatewayGroup } from "@/lib/api-types"
 
 interface PublicKeyStat {
   enabled: boolean
   name: string
+  key_prefix?: string
+  masked_key?: string
   password_required: boolean
   password_hint?: string
   expires_at?: string
@@ -54,13 +56,17 @@ interface PublicSummary {
   active_channels: number
   upstream_groups: number
   available_groups: number
+  zero_balance_groups?: number
+  rate_limited_groups?: number
+  forbidden_groups?: number
+  non_generation_groups?: number
+  error_groups?: number
   openai_groups: number
   claude_groups: number
   grok_groups: number
   today_tokens: number
   total_tokens: number
   cheapest?: DashboardGatewayGroup | null
-  dispatch_preview: DashboardGatewayGroup[]
   supported_formats: string[]
   gateway_status: string
   public_key?: PublicKeyStat
@@ -88,7 +94,7 @@ function publicKeyErrorMessage(message: string, action: "copy" | "view") {
   if (message === "public key expired") {
     return action === "copy" ? "Key 已过期，无法复制" : "Key 已过期，无法查看"
   }
-  if (message === "public key password mismatch") return "复制密码不正确"
+  if (message === "public key password mismatch") return "密码不正确"
   if (message === "public key is not available") return "暂无可用的公益 Key"
   return message
 }
@@ -130,10 +136,8 @@ function StatusMetric({
 
 function PublicGatewayStatusCard({
   summary,
-  preview,
 }: {
   summary: PublicSummary | null
-  preview: DashboardGatewayGroup[]
 }) {
   const totalGroups = summary?.upstream_groups ?? 0
   const availableGroups = summary?.available_groups ?? 0
@@ -142,13 +146,13 @@ function PublicGatewayStatusCard({
   const cheapest = summary?.cheapest ?? null
 
   return (
-    <Card className="border-border/80 bg-card/90 p-4 shadow-sm backdrop-blur">
+    <Card className="app-card p-4">
       <div className="mb-4 flex items-start justify-between gap-3">
         <div>
           <p className="text-base font-semibold text-foreground">实时调度状态</p>
           <p className="mt-1 text-xs text-muted-foreground">公开展示网关、分组和 Token 用量，不暴露敏感配置。</p>
         </div>
-        <Badge variant="outline" className="border-success/20 bg-success/10 text-success">
+        <Badge variant="outline" className="soft-success">
           {summary?.gateway_status ?? "online"}
         </Badge>
       </div>
@@ -195,33 +199,6 @@ function PublicGatewayStatusCard({
           />
         </div>
       </div>
-
-      <div className="mt-4 space-y-2">
-        <div className="flex items-center justify-between gap-3">
-          <p className="text-sm font-medium text-foreground">调度预览</p>
-          <p className="text-xs text-muted-foreground">低倍率优先展示</p>
-        </div>
-        {preview.slice(0, 4).map((group) => (
-          <div key={group.id} className="flex items-center justify-between gap-3 rounded-md border border-border bg-background/70 px-3 py-2">
-            <div className="min-w-0">
-              <p className="truncate text-xs font-medium text-foreground">
-                {group.site_domain || group.channel_name} / {group.group_name}
-              </p>
-              <p className="truncate text-[11px] text-muted-foreground">
-                {group.charity ? "公益 · " : ""}优先级 {group.priority || 0} · {group.last_used_at ? relativeTime(group.last_used_at) : "未使用"}
-              </p>
-            </div>
-            <span className="rounded bg-brand/10 px-2 py-1 font-mono text-xs text-brand">
-              {formatRatio(group.ratio)}
-            </span>
-          </div>
-        ))}
-        {preview.length === 0 ? (
-          <div className="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-muted-foreground">
-            暂无可展示分组
-          </div>
-        ) : null}
-      </div>
     </Card>
   )
 }
@@ -247,26 +224,18 @@ export default function HomePage() {
       .catch((e: Error) => setError(e.message))
   }, [])
 
-  const preview = useMemo(
-    () => {
-      return (summary?.dispatch_preview ?? [])
-        .slice()
-        .sort((a, b) => a.ratio - b.ratio || a.id - b.id)
-        .slice(0, 10)
-    },
-    [summary],
-  )
   const publicKey = summary?.public_key
   const publicKeyAvailable = Boolean(summary?.public_key_enabled && publicKey?.status === "available")
   const publicKeyExpired = Boolean(summary?.public_key_enabled && publicKey?.status === "expired")
+  const publicKeyMaskedText = publicKey?.masked_key || (publicKey?.key_prefix ? maskPublicKey(publicKey.key_prefix) : "")
   const publicKeyFieldText = publicKeyAvailable
-    ? revealedPublicKey
-      ? publicKeyVisible
-        ? revealedPublicKey
-        : maskPublicKey(revealedPublicKey)
-      : publicKey?.password_required
-        ? "输入密码后显示或复制"
-        : "点击复制或小眼睛获取"
+    ? publicKeyVisible && revealedPublicKey
+      ? revealedPublicKey
+      : revealedPublicKey
+        ? maskPublicKey(revealedPublicKey)
+        : publicKey?.password_required
+          ? "输入密码后显示或复制"
+          : publicKeyMaskedText || "******"
     : publicKeyExpired
       ? "Key 已过期"
       : "暂无可用"
@@ -353,12 +322,12 @@ export default function HomePage() {
   }
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-background text-foreground">
-      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_8%,rgba(34,211,238,0.14),transparent_32%),radial-gradient(circle_at_85%_20%,rgba(16,185,129,0.10),transparent_28%)] dark:bg-[radial-gradient(circle_at_18%_8%,rgba(34,211,238,0.18),transparent_34%),radial-gradient(circle_at_85%_20%,rgba(16,185,129,0.14),transparent_30%),linear-gradient(135deg,#071018_0%,#0f172a_52%,#111827_100%)]" />
+    <main className="app-page">
+      <div className="app-ambient" />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-linear-to-r from-transparent via-brand/40 to-transparent" />
 
       <div className="relative mx-auto flex min-h-screen max-w-7xl flex-col px-4 py-5 sm:px-6 lg:px-8">
-        <header className="flex items-center justify-between gap-4">
+        <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-3">
             <span className="flex size-9 items-center justify-center rounded-md bg-brand/10 text-brand ring-1 ring-brand/20">
               <Route className="size-5" />
@@ -379,14 +348,10 @@ export default function HomePage() {
           </div>
         </header>
 
-        <section className="grid flex-1 gap-6 py-8 lg:grid-cols-[0.92fr_1.08fr] lg:items-start">
+        <section className="grid flex-1 gap-6 py-6 sm:py-8 lg:grid-cols-[0.92fr_1.08fr] lg:items-start">
           <aside className="space-y-4 lg:sticky lg:top-5">
             <Card
-              className={cn(
-                "border-border/80 bg-card/90 p-4 shadow-sm backdrop-blur",
-                publicKeyAvailable && "border-success/30",
-                publicKeyExpired && "border-danger/30",
-              )}
+              className={cn("app-card p-4", publicKeyAvailable && "border-success/30", publicKeyExpired && "border-danger/30")}
             >
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div className="min-w-0">
@@ -402,8 +367,8 @@ export default function HomePage() {
                 <Badge
                   variant="outline"
                   className={cn(
-                    publicKeyAvailable && "border-success/20 bg-success/10 text-success",
-                    publicKeyExpired && "border-danger/20 bg-danger/10 text-danger",
+                    publicKeyAvailable && "soft-success",
+                    publicKeyExpired && "soft-danger",
                   )}
                 >
                   {publicKeyAvailable ? (publicKey?.password_required ? "需密码" : "可直接复制") : publicKeyExpired ? "已过期" : "暂无可用"}
@@ -444,11 +409,11 @@ export default function HomePage() {
               </div>
             </Card>
 
-            <PublicGatewayStatusCard summary={summary} preview={preview} />
+            <PublicGatewayStatusCard summary={summary} />
           </aside>
 
           <div className="space-y-4">
-            <Card className="border-border/80 bg-card/90 p-6 shadow-sm backdrop-blur sm:p-8">
+            <Card className="app-card p-6 sm:p-8">
               <Badge className="mb-5 border-brand/20 bg-brand/10 text-brand hover:bg-brand/10">
                 <Sparkles className="size-3.5" />
                 实时调度状态公开页
@@ -467,41 +432,17 @@ export default function HomePage() {
               </div>
             </Card>
 
-            <Card className="border-border/80 bg-card/90 p-4 shadow-sm backdrop-blur">
+            <Card className="app-card p-4">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold text-foreground">省钱调度顺序</p>
-                  <p className="text-xs text-muted-foreground">优先级优先，同级低倍率优先</p>
+                  <p className="text-sm font-semibold text-foreground">格式覆盖</p>
+                  <p className="text-xs text-muted-foreground">公开页仅展示分组数量概览，不展示具体调度列表。</p>
                 </div>
-                <Badge variant="outline" className="border-success/20 bg-success/10 text-success">
+                <Badge variant="outline" className="soft-success">
                   {summary?.gateway_status ?? "online"}
                 </Badge>
               </div>
-              <div className="h-80 overflow-hidden">
-                <div className={preview.length > 3 ? "public-dispatch-scroll space-y-2" : "space-y-2"}>
-                  {[...preview, ...(preview.length > 3 ? preview : [])].map((group, index) => (
-                    <div key={`${group.id}-${index}`} className="rounded-md border border-border bg-background/70 px-3 py-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="min-w-0 truncate text-sm font-medium text-foreground">
-                          {group.site_domain || group.channel_name} / {group.group_name}
-                        </p>
-                        <span className="rounded bg-brand/10 px-2 py-1 font-mono text-xs text-brand">
-                          {formatRatio(group.ratio)}
-                        </span>
-                      </div>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {group.charity ? "公益 · " : ""}优先级 {group.priority || 0} · {group.status} · {group.last_used_at ? relativeTime(group.last_used_at) : "未使用"}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-                {preview.length === 0 ? (
-                  <div className="rounded-md border border-dashed border-border px-3 py-8 text-center text-sm text-muted-foreground">
-                    暂无可展示分组
-                  </div>
-                ) : null}
-              </div>
-              <div className="mt-4 grid grid-cols-3 gap-2 text-xs text-muted-foreground">
+              <div className="grid grid-cols-1 gap-2 text-xs text-muted-foreground sm:grid-cols-3">
                 <div className="rounded-md bg-muted/50 p-3">
                   OpenAI 分组
                   <span className="mt-1 block text-lg font-semibold text-foreground">{summary?.openai_groups ?? 0}</span>
@@ -522,30 +463,35 @@ export default function HomePage() {
       </div>
 
       <Dialog open={publicKeyOpen} onOpenChange={setPublicKeyOpen}>
-        <DialogContent>
-          <DialogHeader>
+        <DialogContent className="w-[calc(100vw-1.5rem)] max-w-[calc(100vw-1.5rem)] gap-5 rounded-xl p-5 sm:max-w-xl sm:p-6">
+          <DialogHeader className="pr-8 text-left">
             <DialogTitle>{publicKeyIntent === "copy" ? "复制公益 Key" : "查看公益 Key"}</DialogTitle>
-            <DialogDescription>
+            <DialogDescription className="leading-6">
               {publicKey?.password_hint || "请输入后台设置的复制密码。"}
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-2">
+          <div className="space-y-3 rounded-lg border border-border bg-muted/20 p-4">
             <Label htmlFor="public-key-password">复制密码</Label>
             <Input
               id="public-key-password"
               type="password"
+              className="h-11 text-base sm:text-sm"
+              placeholder="请输入复制密码"
               value={publicKeyPassword}
               onChange={(event) => setPublicKeyPassword(event.target.value)}
               onKeyDown={(event) => {
                 if (event.key === "Enter") void revealPublicKey(publicKeyPassword, publicKeyIntent === "copy")
               }}
             />
+            <p className="text-xs leading-5 text-muted-foreground">
+              密码只用于本次{publicKeyIntent === "copy" ? "复制" : "查看"}，验证通过后会获取完整公益 Key。
+            </p>
           </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setPublicKeyOpen(false)} disabled={copyingPublicKey}>
+          <DialogFooter className="gap-2">
+            <Button className="w-full sm:w-auto" variant="outline" onClick={() => setPublicKeyOpen(false)} disabled={copyingPublicKey}>
               取消
             </Button>
-            <Button onClick={() => void revealPublicKey(publicKeyPassword, publicKeyIntent === "copy")} disabled={copyingPublicKey}>
+            <Button className="w-full sm:w-auto" onClick={() => void revealPublicKey(publicKeyPassword, publicKeyIntent === "copy")} disabled={copyingPublicKey}>
               {copyingPublicKey ? (publicKeyIntent === "copy" ? "复制中..." : "查看中...") : publicKeyIntent === "copy" ? "复制" : "查看"}
             </Button>
           </DialogFooter>

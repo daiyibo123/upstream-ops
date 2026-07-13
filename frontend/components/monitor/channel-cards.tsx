@@ -61,6 +61,7 @@ import type { Channel, ChannelRedeemResult, RateSnapshot } from "@/lib/api-types
 import { ChannelFormDialog } from "@/components/monitor/channel-form-dialog"
 import { ChannelRedeemDialog } from "@/components/monitor/channel-redeem-dialog"
 import { ChannelAPIKeysDialog } from "@/components/monitor/channel-api-keys-dialog"
+import { ManualGroupKeyDialog } from "@/components/monitor/manual-group-key-dialog"
 import {
   ChannelSubscriptionUsageMetricTiles,
 } from "@/components/monitor/channel-subscription-usage-dialog"
@@ -379,7 +380,7 @@ function ChannelGroupsDialog({
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-normal ring-1 ring-inset",
                           channel.type === "newapi"
                             ? "bg-brand/10 text-brand ring-brand/20"
-                            : "bg-sky-500/10 text-sky-700 ring-sky-500/25 dark:text-sky-300",
+                            : "bg-brand/10 text-brand ring-brand/20",
                         )}
                       >
                         {channelTypeLabel(channel.type)}
@@ -533,6 +534,7 @@ export function ChannelCards() {
   const [editing, setEditing] = useState<Channel | null>(null)
   const [creating, setCreating] = useState(false)
   const [groupsOpen, setGroupsOpen] = useState(false)
+  const [manualOpen, setManualOpen] = useState(false)
   const [redeeming, setRedeeming] = useState<Channel | null>(null)
   const [managingKeys, setManagingKeys] = useState<Channel | null>(null)
   const [busyAction, setBusyAction] = useState<string | null>(null)
@@ -765,6 +767,15 @@ export function ChannelCards() {
             variant="outline"
             size="sm"
             className="gap-1.5 text-xs"
+            onClick={() => setManualOpen(true)}
+          >
+            <Plus className="size-3.5" />
+            {"手动添加"}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-1.5 text-xs"
             disabled={channelsLoading || totalChannels === 0}
             onClick={() => setGroupsOpen(true)}
           >
@@ -830,7 +841,7 @@ export function ChannelCards() {
                     <div className="flex min-w-0 flex-wrap items-center gap-2">
                       <span className="truncate text-sm font-semibold text-foreground">{c.name}</span>
                       {c.pinned ? (
-                        <span className="inline-flex items-center gap-1 rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-500/20 dark:text-amber-300">
+                        <span className="inline-flex items-center gap-1 rounded bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium text-warning ring-1 ring-inset ring-warning/20">
                           <Pin className="size-2.5 fill-current" />
                           置顶
                         </span>
@@ -840,7 +851,7 @@ export function ChannelCards() {
                           "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset",
                           c.type === "newapi"
                             ? "bg-brand/10 text-brand ring-brand/20"
-                            : "bg-sky-500/10 text-sky-700 ring-sky-500/25 dark:text-sky-300",
+                            : "bg-brand/10 text-brand ring-brand/20",
                         )}
                       >
                         {channelTypeLabel(c.type)}
@@ -997,7 +1008,7 @@ export function ChannelCards() {
                         )
                       }
                     >
-                      <Pin className={cn("size-3", c.pinned && "fill-current text-amber-500")} />
+                      <Pin className={cn("size-3", c.pinned && "fill-current text-warning")} />
                       {c.pinned ? "取消置顶" : "置顶"}
                     </Button>
                     <Button
@@ -1199,6 +1210,15 @@ export function ChannelCards() {
         open={groupsOpen}
         onOpenChange={setGroupsOpen}
         channels={channels ?? []}
+      />
+
+      <ManualGroupKeyDialog
+        open={manualOpen}
+        onOpenChange={setManualOpen}
+        channels={channels ?? []}
+        onCreated={() => {
+          refresh()
+        }}
       />
 
       <ChannelRedeemDialog

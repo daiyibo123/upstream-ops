@@ -121,7 +121,12 @@ export function testLoginStream(channelID: number, options: SyncOptions) {
   return streamSSE(`/api/channels/${channelID}/test-login`, options)
 }
 
-/** 触发 /api/gateway/group-keys/test（按批次一键测活）。 */
-export function testGatewayHealthStream(options: SyncOptions) {
-  return streamSSE("/api/gateway/group-keys/test?stream=1&batch_size=30", options)
+/** 触发 /api/gateway/group-keys/test（按批次测活指定分组）。 */
+export function testGatewayHealthStream(options: SyncOptions, groupIds: number[] = []) {
+  const params = new URLSearchParams({ stream: "1", batch_size: "30" })
+  const ids = Array.from(new Set(groupIds.filter((id) => Number.isFinite(id) && id > 0)))
+  if (ids.length > 0) {
+    params.set("ids", ids.join(","))
+  }
+  return streamSSE(`/api/gateway/group-keys/test?${params.toString()}`, options)
 }

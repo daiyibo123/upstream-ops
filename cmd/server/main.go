@@ -127,7 +127,7 @@ func main() {
 	gatewaySvc.SetUsageLogs(usageLogs)
 
 	schedulerFactory := func(scfg config.SchedulerConfig, pcfg config.ProxyConfig) *scheduler.Scheduler {
-		return scheduler.New(scfg, monitorSvc, monLogs, rates, notifies, announcements, captchas, cipher, pcfg, gatewaySvc, log)
+		return scheduler.New(scfg, monitorSvc, monLogs, rates, notifies, announcements, usageLogs, captchas, cipher, pcfg, gatewaySvc, log)
 	}
 	sch := schedulerFactory(cfg.Scheduler, cfg.Proxy)
 	if err := sch.Start(); err != nil {

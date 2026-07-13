@@ -22,6 +22,7 @@ export function PublicKeyConfigCard() {
   const [name, setName] = useState("")
   const [password, setPassword] = useState("")
   const [passwordTouched, setPasswordTouched] = useState(false)
+  const [passwordRequired, setPasswordRequired] = useState(false)
   const [passwordHint, setPasswordHint] = useState("")
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -41,6 +42,7 @@ export function PublicKeyConfigCard() {
         setSelectedKeyId(current?.id ? String(current.id) : "")
         setEnabled(current?.enabled ?? true)
         setName(current?.name ?? "")
+        setPasswordRequired(Boolean(current?.password_required))
         setPasswordHint(current?.password_hint ?? "")
         setPassword("")
         setPasswordTouched(false)
@@ -77,6 +79,16 @@ export function PublicKeyConfigCard() {
     }
   }
 
+  const passwordStatus = passwordTouched
+    ? password
+      ? "保存后将更新复制密码。"
+      : passwordRequired
+        ? "保存后将清空复制密码，首页可直接复制完整 Key。"
+        : "保存后仍不设置复制密码。"
+    : passwordRequired
+      ? "当前已设置复制密码；留空保存会保持不变。"
+      : "当前未设置复制密码，首页可直接复制。"
+
   return <>
     <Button variant="outline" size="sm" className="gap-1.5 text-xs" onClick={() => setOpen(true)}>
       <HeartHandshake className="size-3.5 text-success" />
@@ -96,7 +108,29 @@ export function PublicKeyConfigCard() {
           <div className="space-y-1.5"><Label>调用 Key</Label><Select value={selectedKeyId} onValueChange={setSelectedKeyId}><SelectTrigger><SelectValue placeholder="选择已创建的调用 Key" /></SelectTrigger><SelectContent>{keys.map((key) => <SelectItem key={key.id} value={String(key.id)}>{key.name}（{key.key_prefix}***）</SelectItem>)}</SelectContent></Select></div>
           <div className="grid gap-3 sm:grid-cols-2">
             <div className="space-y-1.5"><Label>展示名称</Label><Input value={name} onChange={(event) => setName(event.target.value)} placeholder="公益 OpenAI Key" /></div>
-            <div className="space-y-1.5"><Label>复制密码</Label><Input type="password" value={password} onChange={(event) => { setPasswordTouched(true); setPassword(event.target.value) }} placeholder="留空表示不设密码" /></div>
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <Label>复制密码</Label>
+                {passwordRequired ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-xs text-destructive hover:text-destructive"
+                    onClick={() => { setPasswordTouched(true); setPassword("") }}
+                  >
+                    清空密码
+                  </Button>
+                ) : null}
+              </div>
+              <Input
+                type="password"
+                value={password}
+                onChange={(event) => { setPasswordTouched(true); setPassword(event.target.value) }}
+                placeholder={passwordRequired ? "留空不修改，输入新密码可替换" : "留空表示不设密码"}
+              />
+              <p className="text-xs leading-5 text-muted-foreground">{passwordStatus}</p>
+            </div>
             <div className="space-y-1.5 sm:col-span-2"><Label>密码提示</Label><Input value={passwordHint} onChange={(event) => setPasswordHint(event.target.value)} placeholder="例如：关注公告获取复制密码" /></div>
           </div>
         </div>}

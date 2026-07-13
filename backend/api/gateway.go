@@ -90,6 +90,19 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{"key": key}})
 	})
+	gp.GET("/keys/:id/usage", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		usage, err := d.Gateway.GatewayKeyUsage(id)
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": usage})
+	})
 	gp.DELETE("/keys/:id", func(c *gin.Context) {
 		id, err := uintParam(c, "id")
 		if err != nil {
@@ -221,17 +234,19 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 	})
 	gp.POST("/group-keys/test", func(c *gin.Context) {
 		batchSize := atoiDefault(c.Query("batch_size"), 0)
+		groupIDs := parseUintCSV(c.Query("ids"))
+		opts := gatewaySvc.HealthTestOptions{BatchSize: batchSize, GroupIDs: groupIDs}
 		if wantsSSE(c) {
 			obs := setupSSE(c)
 			ctx := progress.WithObserver(context.Background(), obs)
-			_, err := d.Gateway.TestAllGroupKeys(ctx, batchSize)
+			_, err := d.Gateway.TestGroupKeys(ctx, opts)
 			if err != nil {
 				progress.Fail(ctx, progress.StageError, err.Error())
 				return
 			}
 			return
 		}
-		result, err := d.Gateway.TestAllGroupKeys(context.Background(), batchSize)
+		result, err := d.Gateway.TestGroupKeys(context.Background(), opts)
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
@@ -259,6 +274,29 @@ func atoiDefault(s string, def int) int {
 		return def
 	}
 	return n
+}
+
+func parseUintCSV(raw string) []uint {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]uint, 0, len(parts))
+	seen := map[uint]bool{}
+	for _, part := range parts {
+		n, err := strconv.ParseUint(strings.TrimSpace(part), 10, 64)
+		if err != nil || n == 0 {
+			continue
+		}
+		id := uint(n)
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }
 
 func wantsSSE(c *gin.Context) bool {

@@ -40,16 +40,14 @@ const (
 	proxyAttemptTimeout       = 60 * time.Second
 	healthProbeTimeout        = 15 * time.Second
 	healthProbeRetryJitterMax = 15 * time.Second
-	// streamFirstEventTimeout 是"等上游吐出第一个 SSE 事件"的最长等待。
-	// 这里必须给足：Codex / o1 / o3 这类带 reasoning 的请求，首个可见事件
-	// （first token）常常要十几秒甚至更久才出来。之前设 8s 会在慢模型刚开始
-	// 思考时就把上游连接 Close 掉，客户端随即报
-	// "stream closed before response.completed"。放宽到 90s 覆盖绝大多数推理场景；
-	// 真卡死的连接由 preflight 的字节/事件上限和上游自身超时兜底。
-	streamFirstEventTimeout = 90 * time.Second
-	// streamIdleTimeout 是正式转发阶段"两个事件之间"的最长间隔。给得比首事件更宽，
-	// 因为推理模型 token 之间可能有较长停顿；超过则判上游卡死，主动断开让客户端收到错误。
-	streamIdleTimeout        = 120 * time.Second
+	// streamFirstEventTimeout 是"等上游吐出第一个有效 SSE 事件"的最长等待。
+	// Codex / o1 / o3 这类带 reasoning 的请求可能长时间没有可见文本；部分
+	// 中转站还会缓冲 response.created。这里给到 5 分钟，避免在上游仍在推理时
+	// 主动 Close，导致客户端报 "stream closed before response.completed"。
+	streamFirstEventTimeout = 5 * time.Minute
+	// streamIdleTimeout 是正式转发阶段"两个事件之间"的最长间隔。推理模型两次事件
+	// 之间可能有较长停顿；超过后才认为上游卡死，并由 Responses 兜底逻辑补 completed。
+	streamIdleTimeout        = 5 * time.Minute
 	streamPreflightMaxEvents = 16
 	streamPreflightMaxBytes  = 64 << 10
 	// proxyFailureCooldown 是"请求失败后该候选临时不可调度"的固定时长。
@@ -68,6 +66,7 @@ type Service struct {
 	log        *slog.Logger
 	clients    sync.Map
 	runtime    sync.Map
+	keyRuntime sync.Map
 	configMu   sync.RWMutex
 	upstream   config.UpstreamConfig
 }
@@ -79,6 +78,8 @@ type CreateGatewayKeyInput struct {
 	DailyLimit      int64  `json:"daily_limit"`
 	TotalLimit      int64  `json:"total_limit"`
 	CostPerMillion  float64 `json:"cost_per_million"`
+	BalanceLimit    float64 `json:"balance_limit"`
+	ConcurrencyLimit int    `json:"concurrency_limit"`
 	ExpiresInDays   int    `json:"expires_in_days"`
 }
 
@@ -90,42 +91,61 @@ type UpdateGatewayKeyInput struct {
 	DailyLimit      *int64     `json:"daily_limit"`
 	TotalLimit      *int64     `json:"total_limit"`
 	CostPerMillion  *float64   `json:"cost_per_million"`
+	BalanceLimit    *float64   `json:"balance_limit"`
+	ConcurrencyLimit *int      `json:"concurrency_limit"`
 	ExpiresInDays   *int       `json:"expires_in_days"`
 	ExpiresAt       *time.Time `json:"expires_at"`
 }
 
 type GatewayKeyOutput struct {
-	ID              uint       `json:"id"`
-	Name            string     `json:"name"`
-	KeyPrefix       string     `json:"key_prefix"`
-	Key             string     `json:"key,omitempty"`
-	Enabled         bool       `json:"enabled"`
-	ClientFormat    string     `json:"client_format"`
-	AllowedGroupIDs []uint     `json:"allowed_group_ids,omitempty"`
-	DailyLimit      int64      `json:"daily_limit"`
-	TotalLimit      int64      `json:"total_limit"`
-	TodayTokens     int64      `json:"today_tokens"`
-	TotalTokens     int64      `json:"total_tokens"`
-	CostPerMillion  float64    `json:"cost_per_million"`
-	TodayCost       float64    `json:"today_cost"`
-	TotalCost       float64    `json:"total_cost"`
-	UsageDate       string     `json:"usage_date,omitempty"`
-	ExpiresAt       *time.Time `json:"expires_at,omitempty"`
-	IsPublic        bool       `json:"is_public"`
-	PublicName      string     `json:"public_name,omitempty"`
-	PublicPasswordHint string  `json:"public_password_hint,omitempty"`
-	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
-	LastUsedIP      string     `json:"last_used_ip,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID                 uint       `json:"id"`
+	Name               string     `json:"name"`
+	KeyPrefix          string     `json:"key_prefix"`
+	Key                string     `json:"key,omitempty"`
+	Enabled            bool       `json:"enabled"`
+	ClientFormat       string     `json:"client_format"`
+	AllowedGroupIDs    []uint     `json:"allowed_group_ids,omitempty"`
+	DailyLimit         int64      `json:"daily_limit"`
+	TotalLimit         int64      `json:"total_limit"`
+	TodayTokens        int64      `json:"today_tokens"`
+	TotalTokens        int64      `json:"total_tokens"`
+	CostPerMillion     float64    `json:"cost_per_million"`
+	BalanceLimit       float64    `json:"balance_limit"`
+	ConcurrencyLimit   int        `json:"concurrency_limit"`
+	BalanceRemaining   float64    `json:"balance_remaining"`
+	TodayCost          float64    `json:"today_cost"`
+	TotalCost          float64    `json:"total_cost"`
+	UsageDate          string     `json:"usage_date,omitempty"`
+	ExpiresAt          *time.Time `json:"expires_at,omitempty"`
+	IsPublic           bool       `json:"is_public"`
+	PublicName         string     `json:"public_name,omitempty"`
+	PublicPasswordHint string     `json:"public_password_hint,omitempty"`
+	LastUsedAt         *time.Time `json:"last_used_at,omitempty"`
+	LastUsedIP         string     `json:"last_used_ip,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+}
+
+type GatewayKeyUsageOutput struct {
+	ID               uint    `json:"id"`
+	Name             string  `json:"name"`
+	KeyPrefix        string  `json:"key_prefix"`
+	TodayTokens      int64   `json:"today_tokens"`
+	TodayCost        float64 `json:"today_cost"`
+	TotalTokens      int64   `json:"total_tokens"`
+	TotalCost        float64 `json:"total_cost"`
+	CostPerMillion   float64 `json:"cost_per_million"`
+	BalanceLimit     float64 `json:"balance_limit"`
+	BalanceRemaining float64 `json:"balance_remaining"`
+	UsageDate        string  `json:"usage_date,omitempty"`
 }
 
 type ConfigurePublicGatewayKeyInput struct {
-	GatewayKeyID uint   `json:"gateway_key_id"`
-	Enabled      bool   `json:"enabled"`
-	Name         string `json:"name"`
+	GatewayKeyID uint    `json:"gateway_key_id"`
+	Enabled      bool    `json:"enabled"`
+	Name         string  `json:"name"`
 	Password     *string `json:"password"`
-	PasswordHint string `json:"password_hint"`
+	PasswordHint string  `json:"password_hint"`
 }
 
 type PublicGatewayKeyOutput struct {
@@ -133,6 +153,7 @@ type PublicGatewayKeyOutput struct {
 	Enabled          bool       `json:"enabled"`
 	Name             string     `json:"name"`
 	KeyPrefix        string     `json:"key_prefix"`
+	MaskedKey        string     `json:"masked_key,omitempty"`
 	PasswordRequired bool       `json:"password_required"`
 	PasswordHint     string     `json:"password_hint,omitempty"`
 	ExpiresAt        *time.Time `json:"expires_at,omitempty"`
@@ -161,14 +182,41 @@ type BootstrapItem struct {
 	Error       string  `json:"error,omitempty"`
 }
 
+var bootstrapKeyBlockKeywords = []string{"图", "img", "ban"}
+
+func blockedBootstrapKeyKeyword(ch storage.Channel, group connector.APIKeyGroup) (string, bool) {
+	text := strings.ToLower(strings.Join([]string{
+		ch.Name,
+		group.Name,
+		group.Description,
+	}, " "))
+	for _, keyword := range bootstrapKeyBlockKeywords {
+		if strings.Contains(text, strings.ToLower(keyword)) {
+			return keyword, true
+		}
+	}
+	return "", false
+}
+
 type HealthResult struct {
-	Total   int                `json:"total"`
-	Checked int                `json:"checked"`
-	Alive   int                `json:"alive"`
-	Dead    int                `json:"dead"`
-	BatchSize int              `json:"batch_size"`
-	Batches int                `json:"batches"`
-	Items   []HealthResultItem `json:"items"`
+	Total         int                `json:"total"`
+	Checked       int                `json:"checked"`
+	Alive         int                `json:"alive"`
+	Dead          int                `json:"dead"`
+	ZeroBalance   int                `json:"zero_balance"`
+	RateLimited   int                `json:"rate_limited"`
+	Forbidden     int                `json:"forbidden"`
+	NonGeneration int                `json:"non_generation"`
+	AuthFailed    int                `json:"auth_failed"`
+	Timeout       int                `json:"timeout"`
+	NetworkError  int                `json:"network_error"`
+	UpstreamError int                `json:"upstream_error"`
+	ModelError    int                `json:"model_error"`
+	InvalidRequest int                `json:"invalid_request"`
+	ServerError     int                `json:"server_error"`
+	BatchSize       int                `json:"batch_size"`
+	Batches         int                `json:"batches"`
+	Items           []HealthResultItem `json:"items"`
 }
 
 type HealthResultItem struct {
@@ -179,10 +227,16 @@ type HealthResultItem struct {
 	GroupName   string     `json:"group_name"`
 	Ratio       float64    `json:"ratio"`
 	Status      string     `json:"status"`
+	ErrorType   string     `json:"error_type,omitempty"`
 	LatencyMS   int64      `json:"latency_ms"`
 	Error       string     `json:"error,omitempty"`
 	CheckedAt   *time.Time `json:"checked_at,omitempty"`
 	Batch       int        `json:"batch,omitempty"`
+}
+
+type HealthTestOptions struct {
+	BatchSize int
+	GroupIDs  []uint
 }
 
 type UpdateGroupKeyInput struct {
@@ -221,6 +275,13 @@ type groupRuntimeState struct {
 	disabledUntil  time.Time
 	avgLatencyMS   float64
 	inFlight       int
+	lastObservedAt time.Time
+}
+
+type keyRuntimeState struct {
+	mu             sync.Mutex
+	inFlight       int
+	queue          []chan struct{}
 	lastObservedAt time.Time
 }
 
@@ -358,6 +419,15 @@ func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutp
 	if err != nil {
 		return nil, err
 	}
+	costPerMillion := math.Max(0, input.CostPerMillion)
+	balanceLimit := math.Max(0, input.BalanceLimit)
+	concurrencyLimit := input.ConcurrencyLimit
+	if concurrencyLimit < 0 {
+		concurrencyLimit = 0
+	}
+	if balanceLimit > 0 && costPerMillion <= 0 {
+		return nil, errors.New("设置余额上限时需要填写每百万 Token 费用")
+	}
 	rec := &storage.GatewayKey{
 		Name:            name,
 		KeyPrefix:       visiblePrefix(key),
@@ -368,7 +438,9 @@ func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutp
 		AllowedGroupIDs: encodeUintList(input.AllowedGroupIDs),
 		DailyLimit:      maxInt64(0, input.DailyLimit),
 		TotalLimit:      maxInt64(0, input.TotalLimit),
-		CostPerMillion:  math.Max(0, input.CostPerMillion),
+		CostPerMillion:  costPerMillion,
+		BalanceLimit:    balanceLimit,
+		ConcurrencyLimit: concurrencyLimit,
 	}
 	if input.ExpiresInDays > 0 {
 		expiresAt := time.Now().AddDate(0, 0, input.ExpiresInDays)
@@ -392,6 +464,15 @@ func (s *Service) ListGatewayKeys() ([]GatewayKeyOutput, error) {
 		out = append(out, gatewayKeyOutput(item))
 	}
 	return out, nil
+}
+
+func (s *Service) GatewayKeyUsage(id uint) (*GatewayKeyUsageOutput, error) {
+	key, err := s.gateway.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	out := gatewayKeyUsageOutput(*key)
+	return &out, nil
 }
 
 func (s *Service) FindGatewayKeyByRaw(raw string) (*GatewayKeyOutput, error) {
@@ -437,6 +518,21 @@ func (s *Service) UpdateGatewayKey(id uint, input UpdateGatewayKeyInput) (*Gatew
 	if input.CostPerMillion != nil {
 		key.CostPerMillion = math.Max(0, *input.CostPerMillion)
 	}
+	if input.BalanceLimit != nil {
+		key.BalanceLimit = math.Max(0, *input.BalanceLimit)
+		if key.BalanceLimit > 0 && key.TotalCost >= key.BalanceLimit {
+			key.Enabled = false
+		}
+	}
+	if input.ConcurrencyLimit != nil {
+		key.ConcurrencyLimit = *input.ConcurrencyLimit
+		if key.ConcurrencyLimit < 0 {
+			key.ConcurrencyLimit = 0
+		}
+	}
+	if key.BalanceLimit > 0 && key.CostPerMillion <= 0 {
+		return nil, errors.New("设置余额上限时需要填写每百万 Token 费用")
+	}
 	if input.ExpiresInDays != nil {
 		days := *input.ExpiresInDays
 		if days > 0 {
@@ -472,7 +568,7 @@ func (s *Service) GetPublicGatewayKey() (*PublicGatewayKeyOutput, error) {
 	if err != nil || key == nil {
 		return nil, err
 	}
-	return publicGatewayKeyOutput(key), nil
+	return s.publicGatewayKeyOutput(key), nil
 }
 
 func (s *Service) ConfigurePublicGatewayKey(input ConfigurePublicGatewayKeyInput) (*PublicGatewayKeyOutput, error) {
@@ -507,12 +603,12 @@ func (s *Service) ConfigurePublicGatewayKey(input ConfigurePublicGatewayKeyInput
 		if err := s.gateway.Update(key); err != nil {
 			return nil, err
 		}
-		return publicGatewayKeyOutput(key), nil
+		return s.publicGatewayKeyOutput(key), nil
 	}
 	if err := s.gateway.SetPublic(key); err != nil {
 		return nil, err
 	}
-	return publicGatewayKeyOutput(key), nil
+	return s.publicGatewayKeyOutput(key), nil
 }
 
 func (s *Service) RevealPublicGatewayKey(password string) (string, *PublicGatewayKeyOutput, error) {
@@ -536,7 +632,7 @@ func (s *Service) RevealPublicGatewayKey(password string) (string, *PublicGatewa
 	if err != nil {
 		return "", nil, err
 	}
-	return raw, publicGatewayKeyOutput(key), nil
+	return raw, s.publicGatewayKeyOutput(key), nil
 }
 
 func (s *Service) DeleteGatewayKey(id uint) error {
@@ -557,6 +653,10 @@ func (s *Service) Authenticate(raw string, ip string) (*storage.GatewayKey, erro
 	}
 	if rec.ExpiresAt != nil && time.Now().After(*rec.ExpiresAt) {
 		return nil, errors.New("gateway key expired")
+	}
+	if rec.BalanceLimit > 0 && rec.TotalCost >= rec.BalanceLimit {
+		_ = s.gateway.Disable(rec.ID)
+		return nil, errors.New("gateway key balance exhausted")
 	}
 	_ = s.gateway.Touch(rec.ID, ip)
 	return rec, nil
@@ -772,6 +872,12 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 				continue
 			}
 			upstreamRefs[groupRef] = struct{}{}
+			if keyword, blocked := blockedBootstrapKeyKeyword(ch, group); blocked {
+				result.Skipped++
+				item.Error = fmt.Sprintf("命中关键词 %q，已跳过创建 Key", keyword)
+				result.Items = append(result.Items, item)
+				continue
+			}
 			existing, err := s.groupKeys.FindByChannelGroup(ch.ID, groupRef)
 			if err != nil {
 				result.Failed++
@@ -837,15 +943,21 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 }
 
 func (s *Service) TestAllGroupKeys(ctx context.Context, batchSizes ...int) (*HealthResult, error) {
+	batchSize := 0
+	if len(batchSizes) > 0 {
+		batchSize = batchSizes[0]
+	}
+	return s.TestGroupKeys(ctx, HealthTestOptions{BatchSize: batchSize})
+}
+
+func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*HealthResult, error) {
 	list, err := s.groupKeys.List()
 	if err != nil {
 		return nil, err
 	}
+	list = filterHealthTestGroupKeys(list, opts.GroupIDs)
 
-	batchSize := normalizeHealthProbeBatchSize(0)
-	if len(batchSizes) > 0 {
-		batchSize = normalizeHealthProbeBatchSize(batchSizes[0])
-	}
+	batchSize := normalizeHealthProbeBatchSize(opts.BatchSize)
 	observer := progress.FromContext(ctx)
 	probeCtx := context.Background()
 
@@ -960,14 +1072,49 @@ func (s *Service) TestAllGroupKeys(ctx context.Context, batchSizes ...int) (*Hea
 		case "dead":
 			result.Checked++
 			result.Dead++
+		case "zero_balance":
+			result.Checked++
+			result.ZeroBalance++
+		case "rate_limited":
+			result.Checked++
+			result.RateLimited++
+		case "forbidden":
+			result.Checked++
+			result.Forbidden++
+		case "non_generation":
+			result.Checked++
+			result.NonGeneration++
+		case "auth_failed":
+			result.Checked++
+			result.AuthFailed++
+		case "timeout":
+			result.Checked++
+			result.Timeout++
+		case "network_error":
+			result.Checked++
+			result.NetworkError++
+		case "upstream_error":
+			result.Checked++
+			result.UpstreamError++
+		case "model_error":
+			result.Checked++
+			result.ModelError++
+		case "invalid_request":
+			result.Checked++
+			result.InvalidRequest++
+		case "server_error":
+			result.Checked++
+			result.ServerError++
 		case "disabled":
 		default:
 			result.Checked++
 		}
 	}
+	summary := fmt.Sprintf("测活完成：%d/%d 存活", result.Alive, result.Checked)
+	summary = appendHealthResultSummary(summary, result)
 	observer.Emit(progress.Event{
 		Stage: progress.StageDone,
-		Message: fmt.Sprintf("测活完成：%d/%d 存活", result.Alive, result.Checked),
+		Message: summary,
 		OK: ptrBool(true),
 		Data: result,
 		Time: time.Now(),
@@ -975,6 +1122,28 @@ func (s *Service) TestAllGroupKeys(ctx context.Context, batchSizes ...int) (*Hea
 		Total: result.Total,
 	})
 	return result, nil
+}
+
+func filterHealthTestGroupKeys(list []storage.UpstreamGroupKey, ids []uint) []storage.UpstreamGroupKey {
+	if len(ids) == 0 {
+		return list
+	}
+	allowed := make(map[uint]bool, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			allowed[id] = true
+		}
+	}
+	if len(allowed) == 0 {
+		return []storage.UpstreamGroupKey{}
+	}
+	out := make([]storage.UpstreamGroupKey, 0, minInt(len(list), len(allowed)))
+	for _, key := range list {
+		if allowed[key.ID] {
+			out = append(out, key)
+		}
+	}
+	return out
 }
 
 func normalizeHealthProbeBatchSize(size int) int {
@@ -1020,12 +1189,61 @@ func healthProgressPayload(status string, item HealthResultItem, batch, batchSiz
 	}
 }
 
+func appendHealthResultSummary(summary string, result *HealthResult) string {
+	if result == nil {
+		return summary
+	}
+	parts := make([]string, 0, 10)
+	add := func(count int, label string) {
+		if count > 0 {
+			parts = append(parts, fmt.Sprintf("%d 个%s", count, label))
+		}
+	}
+	add(result.ZeroBalance, "零余额/额度不足")
+	add(result.RateLimited, "限流/额度限制")
+	add(result.Forbidden, "403 拒绝访问")
+	add(result.NonGeneration, "非生成返回")
+	add(result.AuthFailed, "认证失败")
+	add(result.Timeout, "超时")
+	add(result.NetworkError, "网络错误")
+	add(result.UpstreamError, "上游错误")
+	add(result.ModelError, "模型错误")
+	add(result.InvalidRequest, "请求格式错误")
+	add(result.ServerError, "上游 5xx")
+	if len(parts) == 0 {
+		return summary
+	}
+	return summary + "，" + strings.Join(parts, "，")
+}
+
 func statusTextForHealth(status string) string {
 	switch status {
 	case "alive":
 		return "存活"
 	case "dead":
 		return "死亡"
+	case "zero_balance":
+		return "零余额/额度不足"
+	case "rate_limited":
+		return "限流/额度限制"
+	case "forbidden":
+		return "403 拒绝访问"
+	case "non_generation":
+		return "非生成返回"
+	case "auth_failed":
+		return "认证失败"
+	case "timeout":
+		return "超时"
+	case "network_error":
+		return "网络错误"
+	case "upstream_error":
+		return "上游错误"
+	case "model_error":
+		return "模型错误"
+	case "invalid_request":
+		return "请求格式错误"
+	case "server_error":
+		return "上游 5xx"
 	case "disabled":
 		return "停用"
 	default:
@@ -1057,14 +1275,29 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	if err != nil {
 		return &GatewayError{Status: http.StatusUnauthorized, Body: jsonError(err.Error())}
 	}
+	releaseKeySlot, err := s.acquireGatewayKeySlot(r.Context(), gatewayKey)
+	if err != nil {
+		return &GatewayError{Status: http.StatusRequestTimeout, Body: jsonError("gateway key concurrency queue canceled: " + err.Error())}
+	}
+	defer releaseKeySlot()
+
+	refreshedKey, err := s.gateway.FindByID(gatewayKey.ID)
+	if err != nil {
+		return err
+	}
+	gatewayKey = refreshedKey
+	if !gatewayKey.Enabled {
+		return &GatewayError{Status: http.StatusUnauthorized, Body: jsonError("invalid gateway key")}
+	}
+	if err := enforceGatewayQuota(gatewayKey); err != nil {
+		return &GatewayError{Status: http.StatusTooManyRequests, Body: jsonError(err.Error())}
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		return &GatewayError{Status: http.StatusBadRequest, Body: jsonError("read request body: " + err.Error())}
 	}
 	_ = r.Body.Close()
-	if err := enforceGatewayQuota(gatewayKey); err != nil {
-		return &GatewayError{Status: http.StatusTooManyRequests, Body: jsonError(err.Error())}
-	}
 
 	normalized, err := normalizeProxyRequest(r, path, body)
 	if err != nil {
@@ -1418,6 +1651,10 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			if isUpstreamErrorBody(respBody) {
 				return true, usageTokens{}, fmt.Errorf("upstream returned error payload: %s", truncateBody(respBody, 240))
 			}
+			if request.Stream && (request.ResponseMode == "responses" || request.ResponseMode == "responses_from_chat") {
+				usage, err := streamNonSSEAsResponsesEvents(w, resp.StatusCode, header, respBody, key, request.ResponseMode)
+				return false, usage, err
+			}
 			writeProxyResponse(w, resp.StatusCode, header, respBody, key, request.ResponseMode)
 			return false, extractUsage(respBody), nil
 		}
@@ -1443,6 +1680,10 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		case "responses_from_chat":
 			// 降级路径：客户端发的是 responses，但这个上游只支持 chat，我们已把请求转成
 			// chat/completions 发出去，此处再把上游的 chat SSE 流转回 responses 事件给客户端。
+			usage, err := streamChatAsResponsesEvents(w, buffered, reader)
+			return false, usage, err
+		}
+		if request.ResponseMode == "responses" && bufferedSSELooksLikeChatCompletion(buffered) {
 			usage, err := streamChatAsResponsesEvents(w, buffered, reader)
 			return false, usage, err
 		}
@@ -1566,6 +1807,14 @@ func (s *Service) testGroupKey(ctx context.Context, key *storage.UpstreamGroupKe
 	}
 
 	firstErr := healthProbeError(status, body, err)
+	firstFailureStatus := healthFailureStatus(status, body, err)
+	if shouldSkipHealthRetry(firstFailureStatus) {
+		item.Status = firstFailureStatus
+		item.ErrorType = firstFailureStatus
+		item.Error = firstErr.Error()
+		s.markHealthFailureWithStatus(key.ID, item.Status, item.Error, item.LatencyMS)
+		return item
+	}
 	delay := healthRetryDelay(key.ID)
 	if waitHealthRetry(ctx, delay) {
 		status, body, retryLatencyMS, err := s.healthProbeCandidate(ctx, key)
@@ -1577,6 +1826,8 @@ func (s *Service) testGroupKey(ctx context.Context, key *storage.UpstreamGroupKe
 			_ = s.groupKeys.MarkHealthSuccess(key.ID, item.LatencyMS)
 			return item
 		}
+		item.Status = healthFailureStatus(status, body, err)
+		item.ErrorType = item.Status
 		item.Error = fmt.Sprintf("first probe failed: %v; retry after %s failed: %v", firstErr, delay, healthProbeError(status, body, err))
 	} else {
 		// 首探已经明确失败，只是"抖动重试的等待"被 ctx 取消（批量扫描超时 / 关机）。
@@ -1585,13 +1836,59 @@ func (s *Service) testGroupKey(ctx context.Context, key *storage.UpstreamGroupKe
 		// 首探失败本身就是可信的失败信号，直接落 dead；下一轮 cron 会用退避后重新复活探测，
 		// 真的活着会在下轮转回 alive，代价只是一轮的延迟，远好过僵尸绿。
 		item.Status = "dead"
+		item.ErrorType = item.Status
 		item.Error = fmt.Sprintf("first probe failed: %v; retry wait canceled: %v", firstErr, ctx.Err())
-		s.markHealthFailure(key.ID, item.Error, item.LatencyMS)
+		s.markHealthFailureWithStatus(key.ID, item.Status, item.Error, item.LatencyMS)
 		return item
 	}
-	item.Status = "dead"
-	s.markHealthFailure(key.ID, item.Error, item.LatencyMS)
+	if item.Status == "" {
+		item.Status = "dead"
+	}
+	if item.ErrorType == "" && item.Status != "alive" {
+		item.ErrorType = item.Status
+	}
+	s.markHealthFailureWithStatus(key.ID, item.Status, item.Error, item.LatencyMS)
 	return item
+}
+
+func healthFailureStatus(status int, body []byte, err error) string {
+	text := healthFailureText(body, err)
+	switch {
+	case looksLikeZeroBalanceFailure(status, text):
+		return "zero_balance"
+	case looksLikeRateLimitedFailure(status, text):
+		return "rate_limited"
+	case looksLikeForbiddenFailure(status, text):
+		return "forbidden"
+	case looksLikeAuthFailure(status, text):
+		return "auth_failed"
+	case looksLikeUnsupportedModelError(text):
+		return "model_error"
+	case looksLikeClientRequestError(text) || status == http.StatusUnprocessableEntity:
+		return "invalid_request"
+	case looksLikeNonGenerationFailure(text):
+		return "non_generation"
+	case looksLikeTimeoutFailure(err, text):
+		return "timeout"
+	case looksLikeNetworkFailure(status, err, text):
+		return "network_error"
+	case looksLikeUpstreamErrorFailure(text):
+		return "upstream_error"
+	case status >= 500 && status < 600:
+		return "server_error"
+	case status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout:
+		return "server_error"
+	}
+	return "dead"
+}
+
+func shouldSkipHealthRetry(status string) bool {
+	switch status {
+	case "zero_balance", "rate_limited", "forbidden", "auth_failed", "model_error", "invalid_request", "non_generation":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.UpstreamGroupKey) (int, []byte, int64, error) {
@@ -1914,6 +2211,198 @@ func healthProbeError(status int, body []byte, err error) error {
 	return fmt.Errorf("HTTP %d: %s", status, truncateBody(body, 240))
 }
 
+func healthFailureText(body []byte, err error) string {
+	text := strings.ToLower(strings.TrimSpace(string(body)))
+	if err != nil {
+		text = strings.TrimSpace(text + " " + strings.ToLower(err.Error()))
+	}
+	return text
+}
+
+func looksLikeZeroBalanceFailure(status int, text string) bool {
+	if status == http.StatusPaymentRequired {
+		return true
+	}
+	if text == "" {
+		return false
+	}
+	if strings.Contains(text, "rate_limit") || strings.Contains(text, "rate limit") || strings.Contains(text, "too many requests") {
+		return false
+	}
+	markers := []string{
+		"insufficient_quota",
+		"insufficient quota",
+		"quota_exhausted",
+		"quota exhausted",
+		"quota exceeded",
+		"exceeded your current quota",
+		"额度不足",
+		"额度已用尽",
+		"余额不足",
+		"余额已用尽",
+		"欠费",
+		"insufficient_balance",
+		"insufficient balance",
+		"balance not enough",
+		"balance is not enough",
+		"not enough balance",
+		"out of credit",
+		"out of credits",
+		"insufficient credit",
+		"insufficient credits",
+		"no credit",
+		"no credits",
+		"credit exhausted",
+		"credits exhausted",
+		"billing hard limit",
+		"billing quota",
+		"payment required",
+		"plan expired",
+		"subscription expired",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeRateLimitedFailure(status int, text string) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	if text == "" {
+		return false
+	}
+	markers := []string{
+		"codex_rate_limits",
+		"rate_limits",
+		"rate_limit",
+		"rate limit",
+		"rate-limit",
+		"too many requests",
+		"limit_reached",
+		"limit reached",
+		"allowed\":false",
+		"allowed':false",
+		"reset_after_seconds",
+		"window_minutes",
+		"used_percent",
+		"requests per",
+		"tokens per",
+		"temporarily rate limited",
+		"concurrency limit",
+		"限流",
+		"速率限制",
+		"频率限制",
+		"请求过快",
+		"达到限制",
+		"额度限制",
+		"用量限制",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeForbiddenFailure(status int, text string) bool {
+	return status == http.StatusForbidden || strings.Contains(text, "403 forbidden") || strings.Contains(text, "http 403")
+}
+
+func looksLikeAuthFailure(status int, text string) bool {
+	if status == http.StatusUnauthorized {
+		return true
+	}
+	markers := []string{
+		"invalid api key",
+		"incorrect api key",
+		"invalid x-api-key",
+		"unauthorized",
+		"authentication failed",
+		"authentication error",
+		"auth failed",
+		"api key is invalid",
+		"api key invalid",
+		"无效的 api key",
+		"无效api key",
+		"认证失败",
+		"鉴权失败",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeNonGenerationFailure(text string) bool {
+	return strings.Contains(text, "upstream returned non-generation payload") ||
+		strings.Contains(text, "upstream returned non-message payload")
+}
+
+func looksLikeTimeoutFailure(err error, text string) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	for _, marker := range []string{
+		"context deadline exceeded",
+		"client.timeout",
+		"timeout awaiting response",
+		"i/o timeout",
+		"timed out",
+		"超时",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeNetworkFailure(status int, err error, text string) bool {
+	if err != nil && status == 0 {
+		return true
+	}
+	for _, marker := range []string{
+		"no such host",
+		"connection refused",
+		"connection reset",
+		"connection closed",
+		"tls handshake",
+		"certificate",
+		"eof",
+		"broken pipe",
+		"network is unreachable",
+		"proxyconnect",
+		"server misbehaving",
+		"连接被拒绝",
+		"连接重置",
+		"网络不可达",
+	} {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeUpstreamErrorFailure(text string) bool {
+	return strings.Contains(text, "upstream returned error payload") ||
+		strings.Contains(text, "model discovery returned error payload") ||
+		strings.Contains(text, "upstream returned success=false") ||
+		strings.Contains(text, "upstream returned code ") ||
+		strings.Contains(text, "upstream stream event")
+}
+
 func healthRetryDelay(keyID uint) time.Duration {
 	if healthProbeRetryJitterMax <= 0 {
 		return 0
@@ -2094,7 +2583,11 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 	transport.IdleConnTimeout = 90 * time.Second
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	transport.ExpectContinueTimeout = time.Second
-	transport.ResponseHeaderTimeout = proxyAttemptTimeout
+	// 流式推理请求可能在上游完成较长 reasoning 后才返回响应头；如果这里仍用
+	// 60s，会早于 streamFirstEventTimeout 断开，Codex 直连仍会看到
+	// "stream closed before response.completed"。非流请求有 requestCandidate 的
+	// per-request context 超时兜底，不会因为这个 transport 上限被无限拉长。
+	transport.ResponseHeaderTimeout = streamFirstEventTimeout
 	if proxyURL = strings.TrimSpace(proxyURL); proxyURL != "" {
 		if parsed, err := url.Parse(proxyURL); err == nil {
 			transport.Proxy = http.ProxyURL(parsed)
@@ -2116,6 +2609,13 @@ func (s *Service) markProxyFailure(id uint, msg string) {
 }
 
 func (s *Service) markHealthFailure(id uint, msg string, latencyMS int64) {
+	s.markHealthFailureWithStatus(id, "dead", msg, latencyMS)
+}
+
+func (s *Service) markHealthFailureWithStatus(id uint, status string, msg string, latencyMS int64) {
+	if strings.TrimSpace(status) == "" {
+		status = "dead"
+	}
 	delay := 30 * time.Second
 	if current, err := s.groupKeys.FindByID(id); err == nil && current != nil {
 		switch {
@@ -2131,7 +2631,7 @@ func (s *Service) markHealthFailure(id uint, msg string, latencyMS int64) {
 	}
 	until := time.Now().Add(delay)
 	s.recordRuntimeFailure(id, until)
-	if err := s.groupKeys.MarkHealthFailure(id, msg, until, latencyMS); err != nil && s.log != nil {
+	if err := s.groupKeys.MarkHealthFailureStatus(id, status, msg, until, latencyMS); err != nil && s.log != nil {
 		s.log.Warn("mark upstream health failed", "id", id, "err", err)
 	}
 }
@@ -2676,6 +3176,77 @@ func (s *Service) tryAcquireCandidate(id uint, limit int) (func(), bool) {
 	}, true
 }
 
+func (s *Service) keyRuntimeState(id uint) *keyRuntimeState {
+	actual, _ := s.keyRuntime.LoadOrStore(id, &keyRuntimeState{})
+	return actual.(*keyRuntimeState)
+}
+
+func (s *Service) acquireGatewayKeySlot(ctx context.Context, key *storage.GatewayKey) (func(), error) {
+	if key == nil || key.ConcurrencyLimit <= 0 {
+		return func() {}, nil
+	}
+	state := s.keyRuntimeState(key.ID)
+	state.mu.Lock()
+	if state.inFlight < key.ConcurrencyLimit && len(state.queue) == 0 {
+		state.inFlight++
+		state.lastObservedAt = time.Now()
+		state.mu.Unlock()
+		return s.gatewayKeySlotRelease(state), nil
+	}
+	wait := make(chan struct{})
+	state.queue = append(state.queue, wait)
+	state.lastObservedAt = time.Now()
+	state.mu.Unlock()
+
+	select {
+	case <-wait:
+		return s.gatewayKeySlotRelease(state), nil
+	case <-ctx.Done():
+		state.mu.Lock()
+		removed := false
+		for i, item := range state.queue {
+			if item == wait {
+				copy(state.queue[i:], state.queue[i+1:])
+				state.queue[len(state.queue)-1] = nil
+				state.queue = state.queue[:len(state.queue)-1]
+				removed = true
+				break
+			}
+		}
+		state.mu.Unlock()
+		if removed {
+			return nil, ctx.Err()
+		}
+		return s.gatewayKeySlotRelease(state), nil
+	}
+}
+
+func (s *Service) gatewayKeySlotRelease(state *keyRuntimeState) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.releaseGatewayKeySlot(state)
+		})
+	}
+}
+
+func (s *Service) releaseGatewayKeySlot(state *keyRuntimeState) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.lastObservedAt = time.Now()
+	if len(state.queue) > 0 {
+		wait := state.queue[0]
+		copy(state.queue[0:], state.queue[1:])
+		state.queue[len(state.queue)-1] = nil
+		state.queue = state.queue[:len(state.queue)-1]
+		close(wait)
+		return
+	}
+	if state.inFlight > 0 {
+		state.inFlight--
+	}
+}
+
 func (s *Service) recordRuntimeSuccess(id uint, duration time.Duration) {
 	state := s.runtimeState(id)
 	state.mu.Lock()
@@ -2798,6 +3369,13 @@ func writeProxyResponse(w http.ResponseWriter, status int, header http.Header, b
 				outBody = converted
 				outHeader.Set("Content-Type", "application/json")
 			}
+		case "responses":
+			if looksLikeChatCompletionResponse(body) {
+				if converted, err := chatToResponsesResponse(body); err == nil {
+					outBody = converted
+					outHeader.Set("Content-Type", "application/json")
+				}
+			}
 		}
 	}
 	copyResponseHeaders(w, outHeader, key)
@@ -2888,6 +3466,82 @@ func chatToResponsesResponse(body []byte) ([]byte, error) {
 		}
 	}
 	return json.Marshal(resp)
+}
+
+func streamNonSSEAsResponsesEvents(w http.ResponseWriter, status int, header http.Header, body []byte, key *storage.UpstreamGroupKey, mode string) (usageTokens, error) {
+	outBody := body
+	if mode == "responses_from_chat" || looksLikeChatCompletionResponse(body) {
+		if converted, err := chatToResponsesResponse(body); err == nil {
+			outBody = converted
+		}
+	}
+	response := completedResponseFromBody(outBody)
+	usage := extractUsage(outBody)
+	copyResponseHeaders(w, header, key)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(status)
+	payload, _ := json.Marshal(map[string]any{"type": "response.completed", "response": response})
+	if err := writeSSEEvent(w, sseEvent{Event: "response.completed", Data: string(payload)}); err != nil {
+		return usage, err
+	}
+	if err := writeSSEData(w, "[DONE]"); err != nil {
+		return usage, err
+	}
+	return usage, nil
+}
+
+func completedResponseFromBody(body []byte) map[string]any {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil || raw == nil {
+		return map[string]any{
+			"id":          "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36),
+			"object":      "response",
+			"created_at":  time.Now().Unix(),
+			"status":      "completed",
+			"output_text": strings.TrimSpace(string(body)),
+			"output": []map[string]any{{
+				"type":   "message",
+				"role":   "assistant",
+				"status": "completed",
+				"content": []map[string]any{{
+					"type": "output_text",
+					"text": strings.TrimSpace(string(body)),
+				}},
+			}},
+		}
+	}
+	if responseRaw, ok := raw["response"].(map[string]any); ok {
+		raw = responseRaw
+	}
+	if strings.TrimSpace(stringValue(raw["id"])) == "" {
+		raw["id"] = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	if strings.TrimSpace(stringValue(raw["object"])) == "" {
+		raw["object"] = "response"
+	}
+	raw["status"] = "completed"
+	if _, ok := raw["created_at"]; !ok {
+		raw["created_at"] = time.Now().Unix()
+	}
+	return raw
+}
+
+func looksLikeChatCompletionResponse(body []byte) bool {
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return false
+	}
+	obj := strings.ToLower(strings.TrimSpace(stringValue(raw["object"])))
+	if obj == "chat.completion" || obj == "chat.completion.chunk" {
+		return true
+	}
+	if _, ok := raw["choices"].([]any); ok {
+		if _, hasResponseObject := raw["output"].([]any); !hasResponseObject {
+			return true
+		}
+	}
+	return false
 }
 
 // chatCompletionText 从 chat.completion 响应里提取助手回复文本。
@@ -3623,7 +4277,17 @@ func readNextSSEWithTimeout(reader *sseStreamReader, closer io.Closer, timeout t
 }
 
 func streamEventReady(ev sseEvent) bool {
+	data := strings.TrimSpace(ev.Data)
+	if data == "[DONE]" {
+		return true
+	}
+	if sseEventLooksLikeChatCompletion(ev) {
+		return true
+	}
 	typ := sseEventType(ev)
+	if strings.HasPrefix(typ, "response.") {
+		return true
+	}
 	if typ == "response.completed" || typ == "response.output_text.done" {
 		return true
 	}
@@ -3638,7 +4302,7 @@ func streamEventReady(ev sseEvent) bool {
 	case "response.completed", "response.output_text.delta":
 		return true
 	default:
-		return false
+		return strings.TrimSpace(ev.Event) != "" || data != ""
 	}
 }
 
@@ -3654,6 +4318,35 @@ func streamEventFailure(ev sseEvent) (bool, string) {
 		return true, msg
 	}
 	return false, ""
+}
+
+func bufferedSSELooksLikeChatCompletion(events []sseEvent) bool {
+	for _, ev := range events {
+		if sseEventLooksLikeChatCompletion(ev) {
+			return true
+		}
+	}
+	return false
+}
+
+func sseEventLooksLikeChatCompletion(ev sseEvent) bool {
+	data := strings.TrimSpace(ev.Data)
+	if data == "" || data == "[DONE]" {
+		return false
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(stringValue(raw["object"])), "chat.completion.chunk") {
+		return true
+	}
+	if _, ok := raw["choices"].([]any); ok {
+		if _, hasResponseType := raw["type"].(string); !hasResponseType {
+			return true
+		}
+	}
+	return false
 }
 
 func sseEventType(ev sseEvent) string {
@@ -3928,6 +4621,9 @@ func enforceGatewayQuota(key *storage.GatewayKey) error {
 	if key.TotalLimit > 0 && key.TotalTokens >= key.TotalLimit {
 		return errors.New("gateway key total token limit exceeded")
 	}
+	if key.BalanceLimit > 0 && key.TotalCost >= key.BalanceLimit {
+		return errors.New("gateway key balance exhausted")
+	}
 	if key.ExpiresAt != nil && time.Now().After(*key.ExpiresAt) {
 		return errors.New("gateway key expired")
 	}
@@ -3936,8 +4632,14 @@ func enforceGatewayQuota(key *storage.GatewayKey) error {
 
 func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 	todayTokens := key.TodayTokens
+	todayCost := key.TodayCost
 	if key.UsageDate != "" && key.UsageDate != time.Now().Format("2006-01-02") {
 		todayTokens = 0
+		todayCost = 0
+	}
+	balanceRemaining := 0.0
+	if key.BalanceLimit > 0 {
+		balanceRemaining = math.Max(0, key.BalanceLimit-key.TotalCost)
 	}
 	return GatewayKeyOutput{
 		ID:              key.ID,
@@ -3949,7 +4651,10 @@ func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 		TodayTokens:     todayTokens,
 		TotalTokens:     key.TotalTokens,
 		CostPerMillion:  key.CostPerMillion,
-		TodayCost:       key.TodayCost,
+		BalanceLimit:    key.BalanceLimit,
+		ConcurrencyLimit: key.ConcurrencyLimit,
+		BalanceRemaining: balanceRemaining,
+		TodayCost:       todayCost,
 		TotalCost:       key.TotalCost,
 		UsageDate:       key.UsageDate,
 		ExpiresAt:       key.ExpiresAt,
@@ -3962,6 +4667,23 @@ func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 		AllowedGroupIDs: decodeUintList(key.AllowedGroupIDs),
 		CreatedAt:       key.CreatedAt,
 		UpdatedAt:       key.UpdatedAt,
+	}
+}
+
+func gatewayKeyUsageOutput(key storage.GatewayKey) GatewayKeyUsageOutput {
+	out := gatewayKeyOutput(key)
+	return GatewayKeyUsageOutput{
+		ID:               out.ID,
+		Name:             out.Name,
+		KeyPrefix:        out.KeyPrefix,
+		TodayTokens:      out.TodayTokens,
+		TodayCost:        out.TodayCost,
+		TotalTokens:      out.TotalTokens,
+		TotalCost:        out.TotalCost,
+		CostPerMillion:   out.CostPerMillion,
+		BalanceLimit:     out.BalanceLimit,
+		BalanceRemaining: out.BalanceRemaining,
+		UsageDate:        out.UsageDate,
 	}
 }
 
@@ -3989,6 +4711,29 @@ func publicGatewayKeyOutput(key *storage.GatewayKey) *PublicGatewayKeyOutput {
 		TotalTokens:      key.TotalTokens,
 		LastUsedAt:       key.LastUsedAt,
 	}
+}
+
+func (s *Service) publicGatewayKeyOutput(key *storage.GatewayKey) *PublicGatewayKeyOutput {
+	out := publicGatewayKeyOutput(key)
+	if out == nil || s == nil || s.cipher == nil {
+		return out
+	}
+	raw, err := s.cipher.Decrypt(key.KeyCipher)
+	if err != nil {
+		return out
+	}
+	out.MaskedKey = maskGatewayKey(raw)
+	return out
+}
+
+func maskGatewayKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 12 {
+		return "********"
+	}
+	return key[:6] + "******" + key[len(key)-4:]
 }
 
 func filterCandidatesForGatewayKey(key *storage.GatewayKey, candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
@@ -4769,8 +5514,12 @@ func statusRank(status string) int {
 		return 0
 	case "unknown":
 		return 1
-	case "dead":
+	case "rate_limited":
 		return 2
+	case "dead", "server_error", "timeout", "network_error", "upstream_error":
+		return 3
+	case "zero_balance", "forbidden", "auth_failed", "model_error", "invalid_request", "non_generation":
+		return 4
 	default:
 		return 1
 	}

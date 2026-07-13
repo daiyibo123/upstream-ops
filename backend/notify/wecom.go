@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/bejix/upstream-ops/backend/storage"
 	"github.com/go-resty/resty/v2"
@@ -27,10 +28,11 @@ func newWecom(raw string) (*wecom, error) {
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		return nil, err
 	}
+	cfg.WebhookURL = strings.TrimSpace(cfg.WebhookURL)
 	if cfg.WebhookURL == "" {
 		return nil, errors.New("wecom webhook_url is required")
 	}
-	return &wecom{cfg: cfg, http: resty.New()}, nil
+	return &wecom{cfg: cfg, http: newNotifyHTTPClient()}, nil
 }
 
 func (w *wecom) Type() storage.NotificationChannelType { return storage.NotifyWecom }
@@ -42,20 +44,22 @@ func (w *wecom) SetProxy(proxyURL string) {
 }
 
 func (w *wecom) Send(ctx context.Context, msg Message) error {
+	content := truncateUTF8Bytes(messageText(msg), 3900)
 	resp, err := w.http.R().
 		SetContext(ctx).
+		SetHeader("Content-Type", "application/json").
 		SetBody(map[string]any{
 			"msgtype": "markdown",
 			"markdown": map[string]string{
-				"content": "**" + msg.Subject + "**\n" + msg.Body,
+				"content": content,
 			},
 		}).
 		Post(w.cfg.WebhookURL)
 	if err != nil {
 		return err
 	}
-	if resp.IsError() {
-		return errors.New("wecom returned " + resp.Status())
+	if err := checkRobotResponse("wecom", resp, []string{"errcode"}, []string{"errmsg"}); err != nil {
+		return err
 	}
 	return nil
 }

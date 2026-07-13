@@ -61,7 +61,7 @@ func Build(c *storage.NotificationChannel, decryptedConfig string) (Notifier, er
 	f, ok := registry[c.Type]
 	mu.RUnlock()
 	if !ok {
-		return nil, fmt.Errorf("unknown notifier type: %s", c.Type)
+		return nil, fmt.Errorf("unsupported notification type %q; current version supports email, wecom and feishu", c.Type)
 	}
 	return f(decryptedConfig)
 }

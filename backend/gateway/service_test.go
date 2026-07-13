@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/bejix/upstream-ops/backend/config"
+	"github.com/bejix/upstream-ops/backend/connector"
 	appcrypto "github.com/bejix/upstream-ops/backend/crypto"
 	"github.com/bejix/upstream-ops/backend/storage"
 )
@@ -269,6 +271,178 @@ func TestProxyConvertsChatCompletionToResponses(t *testing.T) {
 	}
 	if updated.TotalTokens != 5 || updated.TodayTokens != 5 {
 		t.Fatalf("usage not recorded: %#v", updated)
+	}
+}
+
+func TestGatewayKeyBalanceLimitDisablesKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_balance","model":"gpt-test","output_text":"ok","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("q", 32))
+	costPerMillion := 500000.0
+	balanceLimit := 1.0
+	if _, err := env.svc.UpdateGatewayKey(env.localKey.ID, UpdateGatewayKeyInput{
+		CostPerMillion: &costPerMillion,
+		BalanceLimit:   &balanceLimit,
+	}); err != nil {
+		t.Fatalf("update gateway key balance: %v", err)
+	}
+
+	channel := &storage.Channel{Name: "balance", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-balance")
+	if err != nil {
+		t.Fatalf("encrypt upstream key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "balance", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	updated, err := env.svc.gateway.FindByID(env.localKey.ID)
+	if err != nil {
+		t.Fatalf("load gateway key: %v", err)
+	}
+	if updated.Enabled {
+		t.Fatalf("key should be disabled after balance exhausted: %#v", updated)
+	}
+	if updated.TodayTokens != 2 || updated.TotalTokens != 2 {
+		t.Fatalf("tokens = today %d total %d, want 2/2", updated.TodayTokens, updated.TotalTokens)
+	}
+	if updated.TodayCost != 1 || updated.TotalCost != 1 {
+		t.Fatalf("cost = today %.4f total %.4f, want 1/1", updated.TodayCost, updated.TotalCost)
+	}
+	if _, err := env.svc.Authenticate(env.localKey.Key, "127.0.0.1"); err == nil {
+		t.Fatal("exhausted key should not authenticate")
+	}
+}
+
+func TestGatewayKeyConcurrencyLimitQueuesRequests(t *testing.T) {
+	var active int64
+	var maxActive int64
+	hits := make(chan int64, 2)
+	releaseFirst := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() { close(releaseFirst) })
+	}
+	defer release()
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt64(&active, 1)
+		for {
+			observed := atomic.LoadInt64(&maxActive)
+			if current <= observed || atomic.CompareAndSwapInt64(&maxActive, observed, current) {
+				break
+			}
+		}
+		hits <- current
+		if current == 1 {
+			<-releaseFirst
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_queue","model":"gpt-test","output_text":"ok","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+		atomic.AddInt64(&active, -1)
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("r", 32))
+	concurrencyLimit := 1
+	if _, err := env.svc.UpdateGatewayKey(env.localKey.ID, UpdateGatewayKeyInput{
+		ConcurrencyLimit: &concurrencyLimit,
+	}); err != nil {
+		t.Fatalf("update gateway key concurrency: %v", err)
+	}
+
+	channel := &storage.Channel{Name: "queue", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-queue")
+	if err != nil {
+		t.Fatalf("encrypt upstream key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "queue", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	doRequest := func() error {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`))
+		req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+			return err
+		}
+		if rec.Code != http.StatusOK {
+			return fmt.Errorf("status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		return nil
+	}
+
+	firstDone := make(chan error, 1)
+	secondDone := make(chan error, 1)
+	go func() { firstDone <- doRequest() }()
+
+	select {
+	case <-hits:
+	case err := <-firstDone:
+		release()
+		t.Fatalf("first request finished before hitting upstream: %v", err)
+	case <-time.After(time.Second):
+		release()
+		t.Fatal("first request did not reach upstream")
+	}
+
+	go func() { secondDone <- doRequest() }()
+	select {
+	case hit := <-hits:
+		release()
+		t.Fatalf("second request reached upstream before first released; active=%d", hit)
+	case err := <-secondDone:
+		release()
+		t.Fatalf("second request finished instead of queueing: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-firstDone:
+			if err != nil {
+				t.Fatalf("first request: %v", err)
+			}
+		case err := <-secondDone:
+			if err != nil {
+				t.Fatalf("second request: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("queued requests did not finish")
+		}
+	}
+	if got := atomic.LoadInt64(&maxActive); got != 1 {
+		t.Fatalf("max active upstream requests = %d, want 1", got)
 	}
 }
 
@@ -817,6 +991,191 @@ func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
 	}
 }
 
+func TestTestGroupKeysHonorsSelectedGroupIDs(t *testing.T) {
+	hits := map[string]int{}
+	var hitsMu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test"}]}`))
+		case "/v1/responses":
+			hitsMu.Lock()
+			hits[r.Header.Get("X-UpstreamOps-Group")]++
+			hitsMu.Unlock()
+			_, _ = w.Write([]byte(`{"id":"resp_probe","output_text":"ok"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("s", 32))
+	channel := &storage.Channel{Name: "selected-health", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	var ids []uint
+	for _, ref := range []string{"group-a", "group-b", "group-c"} {
+		key := &storage.UpstreamGroupKey{
+			ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+			GroupRef: ref, GroupName: ref, Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+		}
+		if err := env.groupKeys.Upsert(key); err != nil {
+			t.Fatalf("insert group %s: %v", ref, err)
+		}
+		ids = append(ids, key.ID)
+	}
+
+	result, err := env.svc.TestGroupKeys(context.Background(), HealthTestOptions{BatchSize: 10, GroupIDs: []uint{ids[0], ids[2]}})
+	if err != nil {
+		t.Fatalf("test selected groups: %v", err)
+	}
+	if result.Total != 2 || result.Checked != 2 || result.Alive != 2 || len(result.Items) != 2 {
+		t.Fatalf("result = %#v, want two selected alive items", result)
+	}
+	hitsMu.Lock()
+	defer hitsMu.Unlock()
+	if hits["group-a"] != 1 || hits["group-c"] != 1 || hits["group-b"] != 0 {
+		t.Fatalf("unexpected response hits: %#v", hits)
+	}
+}
+
+func TestTestGroupKeysClassifiesZeroBalanceSeparatelyFromDead(t *testing.T) {
+	var responseHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test"}]}`))
+		case "/v1/responses":
+			responseHits++
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = w.Write([]byte(`{"error":{"code":"insufficient_quota","message":"insufficient balance"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("z", 32))
+	channel := &storage.Channel{Name: "zero-balance", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	key := &storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "limited", GroupName: "limited", Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+	}
+	if err := env.groupKeys.Upsert(key); err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	result, err := env.svc.TestGroupKeys(context.Background(), HealthTestOptions{BatchSize: 10, GroupIDs: []uint{key.ID}})
+	if err != nil {
+		t.Fatalf("test zero balance group: %v", err)
+	}
+	if result.ZeroBalance != 1 || result.Dead != 0 || len(result.Items) != 1 || result.Items[0].Status != "zero_balance" {
+		t.Fatalf("result = %#v, want zero_balance separate from dead", result)
+	}
+	if responseHits != 1 {
+		t.Fatalf("response hits = %d, want no retry for zero balance", responseHits)
+	}
+	stored, err := env.groupKeys.FindByID(key.ID)
+	if err != nil {
+		t.Fatalf("load group: %v", err)
+	}
+	if stored.Status != "zero_balance" {
+		t.Fatalf("stored status = %q, want zero_balance", stored.Status)
+	}
+}
+
+func TestTestGroupKeysClassifiesCommonProbeFailures(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusCode int
+		body       string
+		wantStatus string
+	}{
+		{
+			name:       "codex rate limits payload",
+			statusCode: http.StatusOK,
+			body:       `{"allowed":false,"limit_reached":true,"type":"codex_rate_limits","plan_type":"k12","rate_limits":{"used_percent":100,"window_minutes":300,"reset_after_seconds":2920}}`,
+			wantStatus: "rate_limited",
+		},
+		{
+			name:       "forbidden html",
+			statusCode: http.StatusForbidden,
+			body:       `<html><head><title>403 Forbidden</title></head><body><center><h1>403 Forbidden</h1></center><hr><center>nginx</center></body></html>`,
+			wantStatus: "forbidden",
+		},
+		{
+			name:       "non generation payload",
+			statusCode: http.StatusOK,
+			body:       `{"ok":true,"message":"pong"}`,
+			wantStatus: "non_generation",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var responseHits int
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.URL.Path {
+				case "/v1/models":
+					_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test"}]}`))
+				case "/v1/responses":
+					responseHits++
+					w.WriteHeader(tc.statusCode)
+					_, _ = w.Write([]byte(tc.body))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer upstream.Close()
+
+			env := newGatewayProxyTestEnv(t, strings.Repeat("c", 32))
+			channel := &storage.Channel{Name: "classified-" + tc.wantStatus, Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+			if err := env.channels.Create(channel); err != nil {
+				t.Fatalf("create channel: %v", err)
+			}
+			keyCipher, err := env.cipher.Encrypt("sk-upstream")
+			if err != nil {
+				t.Fatalf("encrypt key: %v", err)
+			}
+			key := &storage.UpstreamGroupKey{
+				ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+				GroupRef: tc.wantStatus, GroupName: tc.wantStatus, Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+			}
+			if err := env.groupKeys.Upsert(key); err != nil {
+				t.Fatalf("insert group: %v", err)
+			}
+
+			result, err := env.svc.TestGroupKeys(context.Background(), HealthTestOptions{BatchSize: 10, GroupIDs: []uint{key.ID}})
+			if err != nil {
+				t.Fatalf("test classified group: %v", err)
+			}
+			if len(result.Items) != 1 || result.Items[0].Status != tc.wantStatus || result.Items[0].ErrorType != tc.wantStatus {
+				t.Fatalf("result item = %#v, want status/error_type %s", result.Items, tc.wantStatus)
+			}
+			if result.Dead != 0 {
+				t.Fatalf("dead = %d, want classified failure not counted as dead; result=%#v", result.Dead, result)
+			}
+			if responseHits != 1 {
+				t.Fatalf("response hits = %d, want no retry for classified failure", responseHits)
+			}
+		})
+	}
+}
+
 func TestJoinUpstreamURLNormalizesDirectBaseURL(t *testing.T) {
 	got, err := joinUpstreamURL("https://relay.example.com/v1", "/v1/responses?stream=1")
 	if err != nil {
@@ -1204,6 +1563,50 @@ func TestProxyFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
 	}
 }
 
+func TestProxyConvertsChatCompletionFromResponsesEndpoint(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"chatcmpl_direct","object":"chat.completion","model":"gpt-test","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("n", 32))
+	channel := &storage.Channel{Name: "chat-json-on-responses", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "chat-json-on-responses", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+		RequestMode: "responses",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	out := rec.Body.String()
+	if strings.Contains(out, "chat.completion") {
+		t.Fatalf("chat completion must be converted for responses clients: %s", out)
+	}
+	if !strings.Contains(out, `"object":"response"`) || !strings.Contains(out, `"output_text":"pong"`) {
+		t.Fatalf("responses object malformed: %s", out)
+	}
+}
+
 // TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses 覆盖 Codex 直连的真实场景：
 // 流式 /v1/responses 打到只支持 chat 的上游，网关降级到 chat 流并把 chat chunk 转回
 // responses SSE 事件，客户端最终能收到 response.completed。
@@ -1259,6 +1662,59 @@ func TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
 	}
 	if !strings.Contains(out, "response.completed") || !strings.Contains(out, "pong") || !strings.Contains(out, "[DONE]") {
 		t.Fatalf("stream fallback output malformed: %s", out)
+	}
+}
+
+func TestProxyConvertsChatSSEFromResponsesEndpointForCodexDirect(t *testing.T) {
+	var responsesHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		responsesHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_direct\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+			"data: {\"id\":\"chatcmpl_direct\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"}}]}\n\n" +
+			"data: {\"id\":\"chatcmpl_direct\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
+			"data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("d", 32))
+	channel := &storage.Channel{Name: "chat-on-responses", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "chat-on-responses", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+		RequestMode: "responses",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	out := rec.Body.String()
+	if responsesHits != 1 {
+		t.Fatalf("responses hits = %d, want 1", responsesHits)
+	}
+	if strings.Contains(out, "chat.completion.chunk") {
+		t.Fatalf("chat chunks must not be passed to Codex responses stream: %s", out)
+	}
+	if !strings.Contains(out, "response.created") || !strings.Contains(out, "response.output_text.delta") || !strings.Contains(out, "response.completed") || !strings.Contains(out, "pong") || !strings.Contains(out, "[DONE]") {
+		t.Fatalf("responses stream malformed: %s", out)
 	}
 }
 
@@ -1384,6 +1840,31 @@ func TestOrderCandidatesPrefersHealthyCheapStable(t *testing.T) {
 	}
 }
 
+func TestOrderCandidatesPrefersLowerRatioForSchedulableGroups(t *testing.T) {
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 10, Status: "alive", Ratio: 0.2},
+		{ID: 11, Status: "alive", Ratio: 0.05},
+		{ID: 12, Status: "unknown", Ratio: 0.01},
+		{ID: 13, Status: "dead", Ratio: 0.001},
+	}
+	ordered := orderCandidates(candidates)
+	if ordered[0].ID != 11 {
+		t.Fatalf("first candidate = %#v, want lowest-ratio alive group", ordered[0])
+	}
+	if ordered[1].ID != 10 {
+		t.Fatalf("second candidate = %#v, want other alive group before unknown/dead", ordered[1])
+	}
+}
+
+func TestBlockedBootstrapKeyKeywordChecksGroupDescription(t *testing.T) {
+	if keyword, blocked := blockedBootstrapKeyKeyword(
+		storage.Channel{Name: "regular"},
+		connector.APIKeyGroup{Name: "gpt", Description: "no img relay"},
+	); !blocked || keyword != "img" {
+		t.Fatalf("blocked = %v keyword = %q, want img description hit", blocked, keyword)
+	}
+}
+
 func TestExtractStreamUsageFromResponsesSSE(t *testing.T) {
 	body := []byte("event: response.completed\n" +
 		"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":5,\"total_tokens\":12}}}\n\n" +
@@ -1411,6 +1892,53 @@ func TestStreamRawSSEPreservesChatDone(t *testing.T) {
 	}
 	if usage.SoftFailure != "" {
 		t.Fatalf("raw chat stream should not mark soft failure: %#v", usage)
+	}
+}
+
+func TestStreamNonSSEAsResponsesEventsWrapsChatJSON(t *testing.T) {
+	body := []byte(`{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-test","choices":[{"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
+	rec := httptest.NewRecorder()
+	usage, err := streamNonSSEAsResponsesEvents(rec, http.StatusOK, http.Header{"Content-Type": []string{"application/json"}}, body, &storage.UpstreamGroupKey{
+		ChannelName: "test-channel",
+		GroupName:   "test-group",
+		Ratio:       0.01,
+	}, "responses_from_chat")
+	if err != nil {
+		t.Fatalf("stream non-sse responses: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); !strings.Contains(got, "text/event-stream") {
+		t.Fatalf("content-type = %q", got)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "event: response.completed") || !strings.Contains(out, "pong") || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("unexpected wrapped stream: %s", out)
+	}
+	if usage.Prompt != 3 || usage.Completion != 2 || usage.Total != 5 {
+		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestStreamEventReadyAcceptsResponsesLifecycleEvents(t *testing.T) {
+	if !streamEventReady(sseEvent{
+		Event: "response.created",
+		Data:  `{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
+	}) {
+		t.Fatal("response.created should start forwarding immediately")
+	}
+	if !streamEventReady(sseEvent{
+		Data: `{"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}`,
+	}) {
+		t.Fatal("chat completion chunk should start forwarding immediately")
+	}
+}
+
+func TestProxyTransportAllowsSlowStreamingHeaders(t *testing.T) {
+	transport := buildProxyTransport("")
+	if transport.ResponseHeaderTimeout != streamFirstEventTimeout {
+		t.Fatalf("response header timeout = %s, want %s", transport.ResponseHeaderTimeout, streamFirstEventTimeout)
 	}
 }
 

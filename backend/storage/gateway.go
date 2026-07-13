@@ -71,6 +71,10 @@ func (r *GatewayKeys) FindEnabledByHash(hash string) (*GatewayKey, error) {
 
 func (r *GatewayKeys) Update(key *GatewayKey) error { return r.db.Save(key).Error }
 
+func (r *GatewayKeys) Disable(id uint) error {
+	return r.db.Model(&GatewayKey{}).Where("id = ?", id).Update("enabled", false).Error
+}
+
 func (r *GatewayKeys) Delete(id uint) error {
 	return r.db.Delete(&GatewayKey{}, id).Error
 }
@@ -108,6 +112,7 @@ func (r *GatewayKeys) AddUsage(id uint, promptTokens, completionTokens, totalTok
 			"total_tokens": gorm.Expr("total_tokens + ?", totalTokens),
 			"today_cost":   gorm.Expr("today_cost + ?", cost),
 			"total_cost":   gorm.Expr("total_cost + ?", cost),
+			"enabled":      gorm.Expr("CASE WHEN balance_limit > 0 AND total_cost + ? >= balance_limit THEN ? ELSE enabled END", cost, false),
 			"last_used_at": &now,
 		}).Error
 	})
@@ -175,7 +180,7 @@ func orderUpstreamGroupKeys(q *gorm.DB, table string) *gorm.DB {
 		return table + "." + name
 	}
 	return q.
-		Order("CASE " + col("status") + " WHEN 'alive' THEN 0 WHEN 'unknown' THEN 1 WHEN 'dead' THEN 2 ELSE 3 END ASC").
+		Order("CASE " + col("status") + " WHEN 'alive' THEN 0 WHEN 'unknown' THEN 1 WHEN 'rate_limited' THEN 2 WHEN 'dead' THEN 3 WHEN 'server_error' THEN 3 WHEN 'timeout' THEN 3 WHEN 'network_error' THEN 3 WHEN 'upstream_error' THEN 3 WHEN 'zero_balance' THEN 4 WHEN 'forbidden' THEN 4 WHEN 'auth_failed' THEN 4 WHEN 'model_error' THEN 4 WHEN 'invalid_request' THEN 4 WHEN 'non_generation' THEN 4 ELSE 5 END ASC").
 		Order(col("charity") + " DESC").
 		Order(col("priority") + " DESC").
 		Order(col("ratio") + " ASC").
@@ -436,12 +441,19 @@ func (r *UpstreamGroupKeys) MarkFailure(id uint, errMsg string, disabledUntil ti
 }
 
 func (r *UpstreamGroupKeys) MarkHealthFailure(id uint, errMsg string, disabledUntil time.Time, latencyMS int64) error {
+	return r.MarkHealthFailureStatus(id, "dead", errMsg, disabledUntil, latencyMS)
+}
+
+func (r *UpstreamGroupKeys) MarkHealthFailureStatus(id uint, status string, errMsg string, disabledUntil time.Time, latencyMS int64) error {
 	now := time.Now()
 	if latencyMS < 0 {
 		latencyMS = 0
 	}
+	if strings.TrimSpace(status) == "" {
+		status = "dead"
+	}
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
-		"status":          "dead",
+		"status":          status,
 		"failure_count":   gorm.Expr("failure_count + ?", 1),
 		"last_checked_at": &now,
 		"last_latency_ms": latencyMS,

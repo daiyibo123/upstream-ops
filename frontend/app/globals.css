@@ -145,24 +145,42 @@
   }
   body {
     @apply bg-background text-foreground;
+    overflow-x: hidden;
   }
 }
 
-@keyframes public-dispatch-scroll {
-  from { transform: translateY(0); }
-  to { transform: translateY(calc(-50% - 0.25rem)); }
-}
+@layer components {
+  .app-page {
+    @apply relative min-h-dvh overflow-hidden bg-background text-foreground;
+  }
 
-.public-dispatch-scroll {
-  animation: public-dispatch-scroll 30s linear infinite;
-}
+  .app-ambient {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background:
+      radial-gradient(circle at 16% 8%, color-mix(in oklch, var(--brand) 16%, transparent) 0, transparent 34%),
+      radial-gradient(circle at 86% 16%, color-mix(in oklch, var(--success) 11%, transparent) 0, transparent 30%),
+      linear-gradient(135deg, color-mix(in oklch, var(--background) 96%, var(--brand)) 0%, var(--background) 58%, color-mix(in oklch, var(--background) 96%, var(--success)) 100%);
+  }
 
-.public-dispatch-scroll:hover {
-  animation-play-state: paused;
-}
+  .app-card {
+    @apply border-border/80 bg-card/90 shadow-sm backdrop-blur;
+  }
 
-@media (prefers-reduced-motion: reduce) {
-  .public-dispatch-scroll {
-    animation: none;
+  .soft-brand {
+    @apply border-brand/20 bg-brand/10 text-brand;
+  }
+
+  .soft-success {
+    @apply border-success/20 bg-success/10 text-success;
+  }
+
+  .soft-warning {
+    @apply border-warning/20 bg-warning/10 text-warning;
+  }
+
+  .soft-danger {
+    @apply border-danger/20 bg-danger/10 text-danger;
   }
 }

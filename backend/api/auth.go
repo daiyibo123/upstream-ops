@@ -32,6 +32,11 @@ func login(c *gin.Context, d *Deps) {
 		})
 		return
 	}
+	clientIP := c.ClientIP()
+	if retryAfter, locked := authLoginProtector.locked(clientIP); locked {
+		respondLoginLocked(c, retryAfter)
+		return
+	}
 	var in loginInput
 	if err := c.ShouldBindJSON(&in); err != nil {
 		fail(c, http.StatusBadRequest, err)
@@ -39,9 +44,14 @@ func login(c *gin.Context, d *Deps) {
 	}
 	token, exp, err := authSvc.Login(in.Username, in.Password)
 	if err != nil {
+		if retryAfter, locked := authLoginProtector.recordFailure(clientIP); locked {
+			respondLoginLocked(c, retryAfter)
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 		return
 	}
+	authLoginProtector.reset(clientIP)
 	c.JSON(http.StatusOK, gin.H{
 		"data": gin.H{
 			"token":      token,

@@ -430,7 +430,7 @@ export default function SettingsPage() {
           <Card className="overflow-hidden border-border shadow-none">
             <CardContent className="space-y-8 p-4 sm:p-6">
               <SectionCard
-                icon={<MonitorCog className="size-4 text-violet-600" />}
+                icon={<MonitorCog className="size-4 text-brand" />}
                 title="应用信息"
                 description="控制页面标题和通知标题前缀。"
               >
@@ -444,8 +444,8 @@ export default function SettingsPage() {
                       className={cn(
                         "border-transparent",
                         versionInfo.update_available
-                          ? "bg-amber-50 text-amber-700"
-                          : "bg-emerald-50 text-emerald-700",
+                          ? "bg-warning/10 text-warning"
+                          : "bg-success/10 text-success",
                       )}
                     >
                       {versionInfo.update_available
@@ -471,7 +471,7 @@ export default function SettingsPage() {
                   <Button
                     size="sm"
                     variant="outline"
-                    className="h-7 border-cyan-200 bg-cyan-50 px-2 text-xs text-cyan-700 hover:bg-cyan-100 hover:text-cyan-800"
+                    className="h-7 border-brand/20 bg-brand/10 px-2 text-xs text-brand hover:bg-brand/15 hover:text-brand"
                     onClick={handleSystemUpdate}
                     disabled={updatingSystem}
                   >
@@ -486,7 +486,7 @@ export default function SettingsPage() {
                   <Button
                     size="sm"
                     variant="outline"
-                    className="h-7 border-amber-200 bg-amber-50 px-2 text-xs text-amber-700 hover:bg-amber-100 hover:text-amber-800"
+                    className="h-7 border-warning/20 bg-warning/10 px-2 text-xs text-warning hover:bg-warning/15 hover:text-warning"
                     onClick={handleRestart}
                     disabled={restarting}
                   >
@@ -540,7 +540,7 @@ export default function SettingsPage() {
               </SectionCard>
 
               <SectionCard
-                icon={<HeartHandshake className="size-4 text-emerald-600" />}
+                icon={<HeartHandshake className="size-4 text-success" />}
                 title="首页公益 Key"
                 description="从已创建的调用 Key 中选择一个展示到首页，可设置复制密码和展示名称。"
                 action={<PublicKeyConfigCard />}
@@ -552,7 +552,7 @@ export default function SettingsPage() {
 
               <div className="grid grid-cols-1 gap-6 xl:grid-cols-[1.05fr_1fr]">
             <SectionCard
-              icon={<ShieldCheck className="size-4 text-emerald-600" />}
+              icon={<ShieldCheck className="size-4 text-success" />}
               title="登录鉴权"
               description="控制后台是否需要登录，以及登录令牌的签发方式。"
             >
@@ -658,7 +658,7 @@ export default function SettingsPage() {
             </SectionCard>
 
             <SectionCard
-              icon={<Clock3 className="size-4 text-sky-600" />}
+              icon={<Clock3 className="size-4 text-brand" />}
               title="调度与保留策略"
               description="管理余额采集、倍率采集和历史清理任务。"
             >
@@ -773,7 +773,7 @@ export default function SettingsPage() {
                   />
                 </Field>
               </div>
-              <div className="mt-4 grid gap-4 md:grid-cols-3">
+              <div className="mt-4 grid gap-4 md:grid-cols-4">
                 <Field
                   label="监控日志保留天数"
                   description="超过该天数的监控日志会被清理。"
@@ -853,12 +853,37 @@ export default function SettingsPage() {
                     }
                   />
                 </Field>
+                <Field
+                  label="使用记录保留天数"
+                  description="只清理调用使用记录；0 表示永久保留。"
+                >
+                  <Input
+                    type="number"
+                    value={String(form.scheduler.retention.usageLogsDays ?? 1)}
+                    onChange={(e) =>
+                      setForm((prev) =>
+                        prev
+                          ? {
+                              ...prev,
+                              scheduler: {
+                                ...prev.scheduler,
+                                retention: {
+                                  ...prev.scheduler.retention,
+                                  usageLogsDays: num(e.target.value),
+                                },
+                              },
+                            }
+                          : prev,
+                      )
+                    }
+                  />
+                </Field>
               </div>
             </SectionCard>
           </div>
 
           <SectionCard
-            icon={<Bell className="size-4 text-amber-600" />}
+            icon={<Bell className="size-4 text-warning" />}
             title="通知策略"
             description="这些项决定系统怎么合并、过滤和重试通知。"
           >
@@ -1169,7 +1194,7 @@ export default function SettingsPage() {
           </SectionCard>
 
           <SectionCard
-            icon={<Network className="size-4 text-cyan-600" />}
+            icon={<Network className="size-4 text-brand" />}
             title="代理 IP"
             description="配置渠道上游请求使用的全局代理。只有渠道里开启代理 IP 的账号会使用这里的配置。"
             action={
@@ -1332,7 +1357,7 @@ export default function SettingsPage() {
               className={cn(
                 "text-xs",
                 configSavedPendingApply
-                  ? "font-medium text-amber-700"
+                  ? "font-medium text-warning"
                   : "text-muted-foreground",
               )}
             >
@@ -1347,7 +1372,7 @@ export default function SettingsPage() {
 
         <TabsContent value="notifications">
           <SectionCard
-            icon={<Send className="size-4 text-violet-600" />}
+            icon={<Send className="size-4 text-brand" />}
             title="通知渠道"
             description="管理邮件、企业微信、飞书通知出口。"
             action={
@@ -1403,7 +1428,7 @@ export default function SettingsPage() {
                             className={cn(
                               "mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-xl border",
                               channel.enabled
-                                ? "border-violet-200 bg-violet-50 text-violet-700"
+                                ? "border-brand/20 bg-brand/10 text-brand"
                                 : "border-border bg-muted/40 text-muted-foreground",
                             )}
                           >
@@ -1425,8 +1450,8 @@ export default function SettingsPage() {
                                 className={cn(
                                   "border-transparent",
                                   channel.enabled
-                                    ? "bg-emerald-50 text-emerald-700"
-                                    : "bg-slate-100 text-slate-500",
+                                    ? "bg-success/10 text-success"
+                                    : "bg-muted text-muted-foreground",
                                 )}
                               >
                                 {channel.enabled ? "启用中" : "已禁用"}
@@ -1434,7 +1459,7 @@ export default function SettingsPage() {
                               {channel.proxy_enabled ? (
                                 <Badge
                                   variant="outline"
-                                  className="border-transparent bg-cyan-50 text-cyan-700"
+                                  className="border-transparent bg-brand/10 text-brand"
                                 >
                                   代理 IP
                                 </Badge>
@@ -1593,8 +1618,8 @@ function NoteBox({
   children: React.ReactNode;
 }) {
   return (
-    <div className="rounded-2xl border border-emerald-200 bg-emerald-50/70 px-4 py-3 text-sm text-emerald-900">
-      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-emerald-700">
+    <div className="rounded-2xl border border-success/20 bg-success/10 px-4 py-3 text-sm text-success">
+      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-success">
         {title}
       </p>
       <p className="mt-1 leading-6">{children}</p>

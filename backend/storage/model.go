@@ -328,6 +328,8 @@ type GatewayKey struct {
 	TodayTokens     int64      `gorm:"not null;default:0" json:"today_tokens"`
 	TotalTokens     int64      `gorm:"not null;default:0" json:"total_tokens"`
 	CostPerMillion  float64    `gorm:"not null;default:0" json:"cost_per_million"`
+	BalanceLimit    float64    `gorm:"not null;default:0" json:"balance_limit"`
+	ConcurrencyLimit int       `gorm:"not null;default:0" json:"concurrency_limit"`
 	TodayCost       float64    `gorm:"not null;default:0" json:"today_cost"`
 	TotalCost       float64    `gorm:"not null;default:0" json:"total_cost"`
 	UsageDate       string     `gorm:"size:10;index" json:"usage_date,omitempty"`

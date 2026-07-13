@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { CheckCircle2, ChevronLeft, ChevronRight, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, XCircle } from "lucide-react"
+import { CheckCircle2, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, XCircle } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -34,25 +34,42 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { apiFetch } from "@/lib/api"
-import { channelTypeLabel, formatRatio, formatTokens, relativeTime } from "@/lib/format"
+import { channelTypeLabel, formatRatio, formatTokens, money, relativeTime } from "@/lib/format"
 import { testGatewayHealthStream, type ProgressEvent } from "@/lib/sync-stream"
 import { cn } from "@/lib/utils"
 import type {
-  Channel,
-  ChannelPage,
   GatewayBootstrapResult,
   GatewayHealthResult,
   GatewayKey,
   GatewayKeyReveal,
   UpstreamGroupKey,
-  UpstreamGroupKeyPage,
 } from "@/lib/api-types"
 
 const TOKEN_M = 1_000_000
 
 type ClientFormat = "openai" | "claude" | "grok" | "any"
+type ColumnClientFormat = "openai" | "claude" | "grok"
 type GroupScope = "all" | "selected"
 type UpstreamRequestMode = "responses" | "chat"
+type GroupFormatFilter = "all" | ColumnClientFormat
+type RateFilter = "all" | "0-0.05" | "0.06-0.1" | "0.1-0.2" | "0.2+"
+type CharityFilter = "all" | "charity" | "normal"
+
+interface GroupFilters {
+  search: string
+  format: GroupFormatFilter
+  rateBand: RateFilter
+  charity: CharityFilter
+}
+
+function createDefaultGroupFilters(): GroupFilters {
+  return {
+    search: "",
+    format: "all",
+    rateBand: "all",
+    charity: "all",
+  }
+}
 
 interface KeyDraft {
   name: string
@@ -63,6 +80,8 @@ interface KeyDraft {
   dailyLimitM: string
   totalLimitM: string
   costPerMillion: string
+  balanceLimit: string
+  concurrencyLimit: string
   expiresInDays: string
 }
 
@@ -76,23 +95,10 @@ function createDefaultDraft(): KeyDraft {
     dailyLimitM: "",
     totalLimitM: "",
     costPerMillion: "",
+    balanceLimit: "",
+    concurrencyLimit: "",
     expiresInDays: "0",
   }
-}
-
-interface ManualDraft {
-  sourceMode: "new" | "existing"
-  channelId: string
-  channelName: string
-  siteUrl: string
-  groupName: string
-  groupDescription: string
-  key: string
-  ratio: string
-  clientFormat: "openai" | "claude" | "grok"
-  requestMode: UpstreamRequestMode
-  charity: boolean
-  priority: string
 }
 
 interface HealthProgress {
@@ -105,28 +111,25 @@ interface HealthProgress {
   message: string
 }
 
-function createDefaultManualDraft(): ManualDraft {
-  return {
-    sourceMode: "new",
-    channelId: "",
-    channelName: "",
-    siteUrl: "",
-    groupName: "",
-    groupDescription: "",
-    key: "",
-    ratio: "1",
-    clientFormat: "openai",
-    requestMode: "responses",
-    charity: false,
-    priority: "0",
-  }
-}
-
 function statusTone(status: string) {
   switch (status) {
     case "alive":
       return "bg-success/10 text-success border-success/20"
     case "dead":
+      return "bg-danger/10 text-danger border-danger/20"
+    case "zero_balance":
+      return "bg-warning/10 text-warning border-warning/20"
+    case "rate_limited":
+    case "non_generation":
+    case "timeout":
+    case "server_error":
+      return "bg-warning/10 text-warning border-warning/20"
+    case "forbidden":
+    case "auth_failed":
+    case "network_error":
+    case "upstream_error":
+    case "model_error":
+    case "invalid_request":
       return "bg-danger/10 text-danger border-danger/20"
     case "checking":
       return "bg-brand/10 text-brand border-brand/20"
@@ -149,6 +152,28 @@ function statusText(status: string) {
       return "存活"
     case "dead":
       return "死亡"
+    case "zero_balance":
+      return "零余额"
+    case "rate_limited":
+      return "限流"
+    case "forbidden":
+      return "403 拒绝"
+    case "non_generation":
+      return "非生成"
+    case "auth_failed":
+      return "认证失败"
+    case "timeout":
+      return "超时"
+    case "network_error":
+      return "网络错误"
+    case "upstream_error":
+      return "上游错误"
+    case "model_error":
+      return "模型错误"
+    case "invalid_request":
+      return "请求错误"
+    case "server_error":
+      return "上游 5xx"
     case "checking":
       return "测活中"
     case "queued":
@@ -211,8 +236,156 @@ function groupMatchesFormat(group: UpstreamGroupKey, format: ClientFormat) {
   return format === "any" || groupFormat === "any" || groupFormat === format
 }
 
+function groupBelongsToColumn(group: UpstreamGroupKey, format: ColumnClientFormat) {
+  const groupFormat = groupClientFormat(group)
+  return groupFormat === format || groupFormat === "any"
+}
+
+function rateFilterLabel(value: RateFilter) {
+  switch (value) {
+    case "0-0.05":
+      return "0-0.05"
+    case "0.06-0.1":
+      return "0.06-0.1"
+    case "0.1-0.2":
+      return "0.1-0.2"
+    case "0.2+":
+      return "0.2 以上"
+    default:
+      return "全部倍率"
+  }
+}
+
+function charityFilterLabel(value: CharityFilter) {
+  switch (value) {
+    case "charity":
+      return "仅公益 Key"
+    case "normal":
+      return "非公益"
+    default:
+      return "全部公益状态"
+  }
+}
+
+function groupMatchesRateBand(group: UpstreamGroupKey, band: RateFilter) {
+  if (band === "all") return true
+  const ratio = Number(group.ratio ?? 0)
+  if (!Number.isFinite(ratio)) return false
+  switch (band) {
+    case "0-0.05":
+      return ratio >= 0 && ratio <= 0.05
+    case "0.06-0.1":
+      return ratio > 0.05 && ratio <= 0.1
+    case "0.1-0.2":
+      return ratio > 0.1 && ratio <= 0.2
+    case "0.2+":
+      return ratio > 0.2
+    default:
+      return true
+  }
+}
+
+function groupMatchesCharity(group: UpstreamGroupKey, charity: CharityFilter) {
+  if (charity === "all") return true
+  return charity === "charity" ? group.charity === true : group.charity !== true
+}
+
+function upstreamKeyLabel(group: UpstreamGroupKey) {
+  const id = Number(group.upstream_key_id ?? 0)
+  return id > 0 ? `上游 Key #${id}` : "手动/本地 Key"
+}
+
+function normalizeSearchText(value: unknown) {
+  return String(value ?? "").trim().toLowerCase()
+}
+
+function groupSearchText(group: UpstreamGroupKey) {
+  const format = normalizeClientFormat(group.client_format)
+  const status = effectiveStatus(group)
+  return [
+    group.channel_name,
+    group.channel_id,
+    group.channel_type,
+    channelTypeLabel(group.channel_type),
+    group.group_name,
+    group.group_description,
+    group.group_ref,
+    group.ratio,
+    formatRatio(group.ratio),
+    clientFormatLabel(format),
+    format,
+    requestModeLabel(group.request_mode),
+    normalizeRequestMode(group.request_mode),
+    status,
+    statusText(status),
+    upstreamKeyLabel(group),
+    group.charity ? "公益 charity public" : "非公益 normal",
+  ]
+    .filter((value) => value != null && String(value).trim() !== "")
+    .join(" ")
+    .toLowerCase()
+}
+
+function groupMatchesFilters(group: UpstreamGroupKey, filters: GroupFilters) {
+  const checks: boolean[] = []
+  const query = normalizeSearchText(filters.search)
+  if (query) checks.push(groupSearchText(group).includes(query))
+  if (filters.format !== "all") checks.push(groupMatchesFormat(group, filters.format))
+  if (filters.rateBand !== "all") checks.push(groupMatchesRateBand(group, filters.rateBand))
+  if (filters.charity !== "all") checks.push(groupMatchesCharity(group, filters.charity))
+  return checks.length === 0 || checks.some(Boolean)
+}
+
+function activeGroupFilterCount(filters: GroupFilters) {
+  return (
+    (filters.search.trim() ? 1 : 0) +
+    (filters.format !== "all" ? 1 : 0) +
+    (filters.rateBand !== "all" ? 1 : 0) +
+    (filters.charity !== "all" ? 1 : 0)
+  )
+}
+
 function groupStatusRank(status: string) {
-  return status === "alive" ? 0 : status === "unknown" ? 1 : status === "dead" ? 2 : 3
+  return status === "alive"
+    ? 0
+    : status === "unknown"
+      ? 1
+      : status === "rate_limited"
+        ? 2
+        : ["dead", "server_error", "timeout", "network_error", "upstream_error"].includes(status)
+          ? 3
+          : ["zero_balance", "forbidden", "auth_failed", "model_error", "invalid_request", "non_generation"].includes(status)
+            ? 4
+            : 5
+}
+
+function isWarningHealthStatus(status: string) {
+  return ["zero_balance", "rate_limited", "non_generation", "timeout", "server_error"].includes(status)
+}
+
+function isFailureHealthStatus(status: string) {
+  return !["alive", "unknown", "checking", "queued", "disabled"].includes(status)
+}
+
+function healthResultSummaryText(result: GatewayHealthResult) {
+  const parts = [
+    `存活 ${result.alive}`,
+    `死亡 ${result.dead}`,
+    `零余额 ${result.zero_balance || 0}`,
+    `限流 ${result.rate_limited || 0}`,
+    `403 ${result.forbidden || 0}`,
+    `非生成 ${result.non_generation || 0}`,
+  ]
+  const other =
+    (result.auth_failed || 0) +
+    (result.timeout || 0) +
+    (result.network_error || 0) +
+    (result.upstream_error || 0) +
+    (result.model_error || 0) +
+    (result.invalid_request || 0) +
+    (result.server_error || 0)
+  if (other > 0) parts.push(`其它异常 ${other}`)
+  return parts.join("，")
 }
 
 function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
@@ -250,6 +423,20 @@ function mInputToTokens(raw: string) {
 
 function sanitizeMInput(value: string) {
   return value.replace(/[^\d.]/g, "").replace(/(\..*)\./g, "$1")
+}
+
+function sanitizeIntInput(value: string) {
+  return value.replace(/[^\d]/g, "")
+}
+
+function formatMoneyLimit(value?: number | null, precise = false) {
+  const n = Number(value ?? 0)
+  if (!Number.isFinite(n) || n <= 0) return "不限"
+  return money(n, { precise })
+}
+
+function keyBalanceExhausted(key: GatewayKey) {
+  return key.balance_limit > 0 && key.total_cost >= key.balance_limit
 }
 
 function formatExpiry(value?: string | null) {
@@ -302,6 +489,8 @@ function draftFromKey(key: GatewayKey): KeyDraft {
     dailyLimitM: tokensToMInput(key.daily_limit),
     totalLimitM: tokensToMInput(key.total_limit),
     costPerMillion: key.cost_per_million > 0 ? String(key.cost_per_million) : "",
+    balanceLimit: key.balance_limit > 0 ? String(key.balance_limit) : "",
+    concurrencyLimit: key.concurrency_limit > 0 ? String(key.concurrency_limit) : "",
     expiresInDays: "keep",
   }
 }
@@ -314,6 +503,8 @@ function buildGatewayKeyPayload(draft: KeyDraft, includeEnabled: boolean, includ
     daily_limit: mInputToTokens(draft.dailyLimitM),
     total_limit: mInputToTokens(draft.totalLimitM),
     cost_per_million: Math.max(0, Number(draft.costPerMillion) || 0),
+    balance_limit: Math.max(0, Number(draft.balanceLimit) || 0),
+    concurrency_limit: Math.max(0, Math.floor(Number(draft.concurrencyLimit) || 0)),
   }
   if (includeEnabled) {
     payload.enabled = draft.enabled
@@ -335,6 +526,19 @@ function selectedGroupSummary(key: GatewayKey, groups: UpstreamGroupKey[]) {
   return `指定 ${ids.length} 个${names.length ? `：${names.join("、")}` : ""}`
 }
 
+function formatConcurrencyLimit(value?: number | null) {
+  const n = Math.floor(Number(value ?? 0))
+  return Number.isFinite(n) && n > 0 ? `${n} 路` : "不限"
+}
+
+function keyUsageStatusText(key: GatewayKey) {
+  if (keyBalanceExhausted(key)) return "余额已用尽"
+  if (!key.enabled) return "已停用"
+  if (key.daily_limit > 0 && key.today_tokens >= key.daily_limit) return "今日额度已满"
+  if (key.total_limit > 0 && key.total_tokens >= key.total_limit) return "总额度已满"
+  return "启用中"
+}
+
 function KeyDraftFields({
   draft,
   groups,
@@ -349,7 +553,31 @@ function KeyDraftFields({
   showKeepExpiry?: boolean
 }) {
   const eligibleGroups = groups.filter((group) => groupMatchesFormat(group, draft.clientFormat))
+  const [bindingSearch, setBindingSearch] = useState("")
+  const [bindingChannel, setBindingChannel] = useState("all")
+  const [bindingRateBand, setBindingRateBand] = useState<RateFilter>("all")
+  const [bindingKeySearch, setBindingKeySearch] = useState("")
   const selected = new Set(draft.selectedGroupIds)
+  const channelOptions = useMemo(() => {
+    const map = new Map<number, string>()
+    for (const group of eligibleGroups) {
+      map.set(group.channel_id, group.channel_name || `#${group.channel_id}`)
+    }
+    return [...map.entries()]
+      .map(([id, name]) => ({ id, name }))
+      .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"))
+  }, [eligibleGroups])
+  const visibleGroups = useMemo(() => {
+    const query = normalizeSearchText(bindingSearch)
+    const keyQuery = normalizeSearchText(bindingKeySearch)
+    return eligibleGroups.filter((group) => {
+      const channelOK = bindingChannel === "all" || String(group.channel_id) === bindingChannel
+      const rateOK = groupMatchesRateBand(group, bindingRateBand)
+      const queryOK = !query || groupSearchText(group).includes(query)
+      const keyOK = !keyQuery || upstreamKeyLabel(group).toLowerCase().includes(keyQuery)
+      return channelOK && rateOK && queryOK && keyOK
+    })
+  }, [bindingChannel, bindingKeySearch, bindingRateBand, bindingSearch, eligibleGroups])
 
   function updateFormat(format: ClientFormat) {
     onChange({
@@ -404,9 +632,9 @@ function KeyDraftFields({
         </div>
       ) : null}
 
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <div className="space-y-1.5">
-          <Label htmlFor="gateway-key-daily">每日额度（M）</Label>
+          <Label htmlFor="gateway-key-daily">每日额度（M Token）</Label>
           <Input
             id="gateway-key-daily"
             value={draft.dailyLimitM}
@@ -416,7 +644,7 @@ function KeyDraftFields({
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="gateway-key-total">总额度（M）</Label>
+          <Label htmlFor="gateway-key-total">总额度（M Token）</Label>
           <Input
             id="gateway-key-total"
             value={draft.totalLimitM}
@@ -426,13 +654,33 @@ function KeyDraftFields({
           />
         </div>
         <div className="space-y-1.5">
-          <Label htmlFor="gateway-key-cost">每百万 Token 费用</Label>
+          <Label htmlFor="gateway-key-cost">每百万 Token 费用（$）</Label>
           <Input
             id="gateway-key-cost"
             value={draft.costPerMillion}
             inputMode="decimal"
             onChange={(event) => onChange({ ...draft, costPerMillion: sanitizeMInput(event.target.value) })}
             placeholder="留空不计费"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="gateway-key-balance">可消耗余额（$）</Label>
+          <Input
+            id="gateway-key-balance"
+            value={draft.balanceLimit}
+            inputMode="decimal"
+            onChange={(event) => onChange({ ...draft, balanceLimit: sanitizeMInput(event.target.value) })}
+            placeholder="留空不限"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="gateway-key-concurrency">最大并发数</Label>
+          <Input
+            id="gateway-key-concurrency"
+            value={draft.concurrencyLimit}
+            inputMode="numeric"
+            onChange={(event) => onChange({ ...draft, concurrencyLimit: sanitizeIntInput(event.target.value) })}
+            placeholder="留空或 0 不限"
           />
         </div>
         <div className="space-y-1.5">
@@ -451,6 +699,9 @@ function KeyDraftFields({
             </SelectContent>
           </Select>
         </div>
+        <p className="text-xs leading-5 text-muted-foreground sm:col-span-2 lg:col-span-2 lg:self-end">
+          余额按每百万 Token 费用折算；超过最大并发的请求会排队等待，不会直接失败。
+        </p>
       </div>
 
       <div className="space-y-2">
@@ -470,8 +721,8 @@ function KeyDraftFields({
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2 text-xs">
             <span className="text-muted-foreground">
               {draft.scope === "all"
-                ? `将按优先级和低倍率顺序使用 ${eligibleGroups.length} 个匹配分组`
-                : `已选择 ${draft.selectedGroupIds.length}/${eligibleGroups.length} 个匹配分组`}
+                ? `将按优先级和低倍率顺序使用 ${eligibleGroups.length} 个匹配分组，当前筛选显示 ${visibleGroups.length} 个`
+                : `已选择 ${draft.selectedGroupIds.length}/${eligibleGroups.length} 个匹配分组，当前筛选显示 ${visibleGroups.length} 个`}
             </span>
             {draft.scope === "selected" ? (
               <div className="flex items-center gap-1">
@@ -480,9 +731,27 @@ function KeyDraftFields({
                   size="sm"
                   variant="ghost"
                   className="h-7 px-2 text-xs"
+                  onClick={() =>
+                    onChange({
+                      ...draft,
+                      selectedGroupIds: cleanGroupIDs(
+                        [...draft.selectedGroupIds, ...visibleGroups.map((group) => group.id)],
+                        groups,
+                        draft.clientFormat,
+                      ),
+                    })
+                  }
+                >
+                  全选当前
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
                   onClick={() => onChange({ ...draft, selectedGroupIds: eligibleGroups.map((group) => group.id) })}
                 >
-                  全选
+                  全选全部
                 </Button>
                 <Button
                   type="button"
@@ -496,14 +765,60 @@ function KeyDraftFields({
               </div>
             ) : null}
           </div>
-          <div className="max-h-56 overflow-y-auto p-2">
+          <div className="grid gap-2 border-b border-border p-2 md:grid-cols-[minmax(180px,1.2fr)_0.9fr_0.75fr_0.85fr]">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={bindingSearch}
+                onChange={(event) => setBindingSearch(event.target.value)}
+                className="h-8 pl-8 text-xs"
+                placeholder="搜索渠道、分组、倍率"
+              />
+            </div>
+            <Select value={bindingChannel} onValueChange={setBindingChannel}>
+              <SelectTrigger className="h-8 w-full text-xs">
+                <SelectValue placeholder="选择渠道" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部渠道</SelectItem>
+                {channelOptions.map((channel) => (
+                  <SelectItem key={channel.id} value={String(channel.id)}>
+                    {channel.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={bindingRateBand} onValueChange={(value) => setBindingRateBand(value as RateFilter)}>
+              <SelectTrigger className="h-8 w-full text-xs">
+                <SelectValue placeholder="倍率" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部倍率</SelectItem>
+                <SelectItem value="0-0.05">0-0.05</SelectItem>
+                <SelectItem value="0.06-0.1">0.06-0.1</SelectItem>
+                <SelectItem value="0.1-0.2">0.1-0.2</SelectItem>
+                <SelectItem value="0.2+">0.2 以上</SelectItem>
+              </SelectContent>
+            </Select>
+            <Input
+              value={bindingKeySearch}
+              onChange={(event) => setBindingKeySearch(event.target.value)}
+              className="h-8 text-xs"
+              placeholder="搜索对应 Key"
+            />
+          </div>
+          <div className="max-h-64 overflow-y-auto p-2">
             {eligibleGroups.length === 0 ? (
               <div className="px-2 py-6 text-center text-xs text-muted-foreground">
                 没有匹配 {clientFormatLabel(draft.clientFormat)} 的分组，先同步或切换格式
               </div>
+            ) : visibleGroups.length === 0 ? (
+              <div className="px-2 py-6 text-center text-xs text-muted-foreground">
+                没有符合当前渠道、倍率或对应 Key 筛选的分组
+              </div>
             ) : (
               <div className="space-y-1">
-                {eligibleGroups.map((group) => {
+                {visibleGroups.map((group) => {
                   const status = effectiveStatus(group)
                   return (
                     <label
@@ -534,7 +849,10 @@ function KeyDraftFields({
                           </Badge>
                         </span>
                         <span className="mt-1 block text-muted-foreground">
-                          优先级 {group.priority || 0} · 倍率 {formatRatio(group.ratio)} · {channelTypeLabel(group.channel_type)}
+                          渠道 {group.channel_name || `#${group.channel_id}`} · 倍率 {formatRatio(group.ratio)} · {upstreamKeyLabel(group)}
+                        </span>
+                        <span className="mt-0.5 block text-muted-foreground">
+                          优先级 {group.priority || 0} · {channelTypeLabel(group.channel_type)}
                         </span>
                       </span>
                     </label>
@@ -554,12 +872,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const showGroups = section === "all" || section === "groups"
   const [keys, setKeys] = useState<GatewayKey[]>([])
   const [groups, setGroups] = useState<UpstreamGroupKey[]>([])
-  const [groupTotal, setGroupTotal] = useState(0)
-  const [groupPages, setGroupPages] = useState(1)
-  const [groupAliveTotal, setGroupAliveTotal] = useState(0)
-  const [groupDeadTotal, setGroupDeadTotal] = useState(0)
-  const [groupEnabledTotal, setGroupEnabledTotal] = useState(0)
-  const [channels, setChannels] = useState<Channel[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
   const [createDraft, setCreateDraft] = useState<KeyDraft>(() => createDefaultDraft())
@@ -573,11 +885,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [priorityDrafts, setPriorityDrafts] = useState<Record<number, string>>({})
   const [healthResults, setHealthResults] = useState<Record<number, GatewayHealthResult["items"][number]>>({})
   const [healthProgress, setHealthProgress] = useState<HealthProgress | null>(null)
-  const [manualOpen, setManualOpen] = useState(false)
-  const [manualDraft, setManualDraft] = useState<ManualDraft>(() => createDefaultManualDraft())
-  const [pageSize, setPageSize] = useState(10)
-  const [page, setPage] = useState(1)
-  const [groupSearch, setGroupSearch] = useState("")
+  const [selectedHealthGroupIds, setSelectedHealthGroupIds] = useState<number[]>([])
+  const [groupFilterDraft, setGroupFilterDraft] = useState<GroupFilters>(() => createDefaultGroupFilters())
+  const [groupFilters, setGroupFilters] = useState<GroupFilters>(() => createDefaultGroupFilters())
   const [keySearch, setKeySearch] = useState("")
 
   const filteredKeys = useMemo(() => {
@@ -590,63 +900,89 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     )
   }, [keySearch, keys])
 
-  const aliveCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "alive").length, [groups])
-  const deadCount = useMemo(() => groups.filter((group) => effectiveStatus(group) === "dead").length, [groups])
-  const enabledGroupCount = useMemo(() => groups.filter((group) => group.enabled !== false).length, [groups])
-
-  const serverGroupPaging = showGroups && !showKeys
-  const totalGroups = serverGroupPaging ? groupTotal : groups.length
-  const displayAliveCount = serverGroupPaging ? groupAliveTotal : aliveCount
-  const displayDeadCount = serverGroupPaging ? groupDeadTotal : deadCount
-  const displayEnabledCount = serverGroupPaging ? groupEnabledTotal : enabledGroupCount
-  const totalPages = serverGroupPaging ? Math.max(1, groupPages) : Math.max(1, Math.ceil(groups.length / pageSize))
-  const currentPage = Math.min(page, totalPages)
-  const pagedGroups = useMemo(
-    () => (serverGroupPaging ? groups : groups.slice((currentPage - 1) * pageSize, currentPage * pageSize)),
-    [groups, currentPage, pageSize, serverGroupPaging],
+  const totalGroups = groups.length
+  const filteredGroups = useMemo(
+    () => sortGroupsForDisplay(groups.filter((group) => groupMatchesFilters(group, groupFilters))),
+    [groups, groupFilters],
   )
-  const rangeStart = totalGroups === 0 ? 0 : (currentPage - 1) * pageSize + 1
-  const rangeEnd = Math.min(currentPage * pageSize, totalGroups)
-
-  useEffect(() => {
-    if (page > totalPages) setPage(totalPages)
-  }, [page, totalPages])
-
-  useEffect(() => {
-    setPage(1)
-  }, [groupSearch])
+  const groupColumns = useMemo(
+    () => [
+      {
+        key: "openai" as const,
+        title: "OpenAI",
+        description: "ChatGPT / Responses / Chat Completions",
+        items: filteredGroups.filter((group) => groupBelongsToColumn(group, "openai")),
+      },
+      {
+        key: "claude" as const,
+        title: "Claude",
+        description: "Anthropic Messages 兼容渠道",
+        items: filteredGroups.filter((group) => groupBelongsToColumn(group, "claude")),
+      },
+      {
+        key: "grok" as const,
+        title: "Grok",
+        description: "xAI / Grok 兼容渠道",
+        items: filteredGroups.filter((group) => groupBelongsToColumn(group, "grok")),
+      },
+    ],
+    [filteredGroups],
+  )
+  const displayAliveCount = useMemo(
+    () => filteredGroups.filter((group) => effectiveStatus(group) === "alive").length,
+    [filteredGroups],
+  )
+  const displayDeadCount = useMemo(
+    () => filteredGroups.filter((group) => effectiveStatus(group) === "dead").length,
+    [filteredGroups],
+  )
+  const displayZeroBalanceCount = useMemo(
+    () => filteredGroups.filter((group) => effectiveStatus(group) === "zero_balance").length,
+    [filteredGroups],
+  )
+  const displayRateLimitedCount = useMemo(
+    () => filteredGroups.filter((group) => effectiveStatus(group) === "rate_limited").length,
+    [filteredGroups],
+  )
+  const displayForbiddenCount = useMemo(
+    () => filteredGroups.filter((group) => effectiveStatus(group) === "forbidden").length,
+    [filteredGroups],
+  )
+  const displayNonGenerationCount = useMemo(
+    () => filteredGroups.filter((group) => effectiveStatus(group) === "non_generation").length,
+    [filteredGroups],
+  )
+  const displayEnabledCount = useMemo(
+    () => filteredGroups.filter((group) => group.enabled !== false).length,
+    [filteredGroups],
+  )
+  const activeFilters = activeGroupFilterCount(groupFilters)
+  const selectedHealthGroupSet = useMemo(() => new Set(selectedHealthGroupIds), [selectedHealthGroupIds])
+  const selectedHealthGroups = useMemo(
+    () => groups.filter((group) => selectedHealthGroupSet.has(group.id)),
+    [groups, selectedHealthGroupSet],
+  )
+  const selectedEnabledHealthGroups = useMemo(
+    () => selectedHealthGroups.filter((group) => group.enabled !== false),
+    [selectedHealthGroups],
+  )
+  const selectedVisibleHealthCount = useMemo(
+    () => filteredGroups.filter((group) => selectedHealthGroupSet.has(group.id)).length,
+    [filteredGroups, selectedHealthGroupSet],
+  )
 
   async function load() {
     setLoading(true)
     try {
-      const groupQuery = new URLSearchParams({ page: String(currentPage), page_size: String(pageSize) })
-      if (groupSearch.trim()) groupQuery.set("search", groupSearch.trim())
-      const groupRequest = serverGroupPaging
-        ? apiFetch<UpstreamGroupKeyPage>(`/gateway/group-keys?${groupQuery.toString()}`)
-        : apiFetch<UpstreamGroupKey[]>("/gateway/group-keys")
-      const [keyList, groupResult, channelPage] = await Promise.all([
+      const [keyList, groupResult] = await Promise.all([
         apiFetch<GatewayKey[]>("/gateway/keys"),
-        groupRequest,
-        apiFetch<ChannelPage>("/channels?page=1&page_size=-1"),
+        apiFetch<UpstreamGroupKey[]>("/gateway/group-keys"),
       ])
       setKeys(Array.isArray(keyList) ? keyList : [])
-      setChannels(Array.isArray(channelPage?.items) ? channelPage.items : [])
-      const rawGroups = Array.isArray(groupResult) ? groupResult : groupResult.items ?? []
-      const nextGroups = sortGroupsForDisplay(rawGroups)
-      if (Array.isArray(groupResult)) {
-        setGroupTotal(nextGroups.length)
-        setGroupPages(Math.max(1, Math.ceil(nextGroups.length / pageSize)))
-        setGroupAliveTotal(nextGroups.filter((group) => effectiveStatus(group) === "alive").length)
-        setGroupDeadTotal(nextGroups.filter((group) => effectiveStatus(group) === "dead").length)
-        setGroupEnabledTotal(nextGroups.filter((group) => group.enabled !== false).length)
-      } else {
-        setGroupTotal(groupResult.total ?? nextGroups.length)
-        setGroupPages(groupResult.pages ?? 1)
-        setGroupAliveTotal(groupResult.alive ?? 0)
-        setGroupDeadTotal(groupResult.dead ?? 0)
-        setGroupEnabledTotal(groupResult.enabled ?? 0)
-      }
+      const nextGroups = sortGroupsForDisplay(Array.isArray(groupResult) ? groupResult : [])
       setGroups(nextGroups)
+      const validGroupIds = new Set(nextGroups.map((group) => group.id))
+      setSelectedHealthGroupIds((prev) => prev.filter((id) => validGroupIds.has(id)))
       setConcurrencyDrafts(
         Object.fromEntries(nextGroups.map((group) => [group.id, String(group.concurrency_limit || 0)])),
       )
@@ -663,7 +999,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
 
   useEffect(() => {
     void load()
-  }, [currentPage, pageSize, serverGroupPaging, groupSearch])
+  }, [])
 
   function validateDraft(draft: KeyDraft) {
     if (draft.scope === "selected" && draft.selectedGroupIds.length === 0) {
@@ -672,6 +1008,17 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
     if (mInputToTokens(draft.dailyLimitM) < 0 || mInputToTokens(draft.totalLimitM) < 0) {
       toast.error("额度必须是大于等于 0 的数字")
+      return false
+    }
+    const balanceLimit = Number(draft.balanceLimit) || 0
+    const costPerMillion = Number(draft.costPerMillion) || 0
+    if (balanceLimit > 0 && costPerMillion <= 0) {
+      toast.error("设置可消耗余额时，需要填写每百万 Token 费用")
+      return false
+    }
+    const concurrencyLimit = Number(draft.concurrencyLimit) || 0
+    if (!Number.isFinite(concurrencyLimit) || concurrencyLimit < 0) {
+      toast.error("最大并发数必须是大于等于 0 的整数")
       return false
     }
     return true
@@ -791,22 +1138,52 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
+  function toggleHealthGroupSelected(id: number, selected: boolean) {
+    setSelectedHealthGroupIds((prev) => {
+      if (selected) {
+        return prev.includes(id) ? prev : [...prev, id].sort((a, b) => a - b)
+      }
+      return prev.filter((item) => item !== id)
+    })
+  }
+
+  function selectVisibleHealthGroups() {
+    setSelectedHealthGroupIds((prev) => {
+      const next = new Set(prev)
+      for (const group of filteredGroups) {
+        next.add(group.id)
+      }
+      return Array.from(next).sort((a, b) => a - b)
+    })
+  }
+
+  function clearHealthSelection() {
+    setSelectedHealthGroupIds([])
+  }
+
   async function testGroups() {
+    if (selectedHealthGroups.length === 0) {
+      toast.error("请先勾选要测活的分组 Key")
+      return
+    }
+    const enabledTargets = selectedEnabledHealthGroups
+    if (enabledTargets.length === 0) {
+      toast.error("选中的分组都已停用，无法测活")
+      return
+    }
     setBusy("test")
     setHealthResults((prev) => {
       const next = { ...prev }
-      for (const group of groups) {
-        if (group.enabled !== false) {
-          next[group.id] = {
-            id: group.id,
-            channel_id: group.channel_id,
-            channel_name: group.channel_name || "",
-            group_ref: group.group_ref,
-            group_name: group.group_name,
-            ratio: group.ratio,
-            status: "queued",
-            latency_ms: 0,
-          }
+      for (const group of enabledTargets) {
+        next[group.id] = {
+          id: group.id,
+          channel_id: group.channel_id,
+          channel_name: group.channel_name || "",
+          group_ref: group.group_ref,
+          group_name: group.group_name,
+          ratio: group.ratio,
+          status: "queued",
+          latency_ms: 0,
         }
       }
       return next
@@ -814,7 +1191,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     setHealthProgress({
       running: true,
       completed: 0,
-      total: displayEnabledCount || totalGroups,
+      total: enabledTargets.length,
       batch: 0,
       batches: 0,
       batchSize: 30,
@@ -829,23 +1206,24 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             setHealthResults((prev) => ({ ...prev, [item.id]: item }))
           }
           setHealthProgress((prev) => healthProgressFromEvent(ev, prev ?? {
-            running: true,
-            completed: 0,
-            total: displayEnabledCount || totalGroups,
-            batch: 0,
-            batches: 0,
-            batchSize: 30,
-            message: "测活中...",
+              running: true,
+              completed: 0,
+              total: enabledTargets.length,
+              batch: 0,
+              batches: 0,
+              batchSize: 30,
+              message: "测活中...",
           }))
           if (ev.stage === "done" && ev.data && typeof ev.data === "object" && "items" in ev.data) {
             finalResult = ev.data as GatewayHealthResult
           }
         },
-      })
+      }, enabledTargets.map((group) => group.id))
       const completedResult = finalResult as GatewayHealthResult | undefined
       if (completedResult) {
-        setHealthResults(Object.fromEntries((completedResult.items ?? []).map((item) => [item.id, item])))
-        toast.success(`测活完成：存活 ${completedResult.alive}，死亡 ${completedResult.dead}`)
+        const nextItems = Object.fromEntries((completedResult.items ?? []).map((item) => [item.id, item]))
+        setHealthResults((prev) => ({ ...prev, ...nextItems }))
+        toast.success(`测活完成：${healthResultSummaryText(completedResult)}`)
       } else {
         toast.success("测活完成")
       }
@@ -864,7 +1242,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     try {
       const result = await apiFetch<GatewayHealthResult["items"][number]>(`/gateway/group-keys/${group.id}/test`, { method: "POST" })
       setHealthResults((prev) => ({ ...prev, [group.id]: result }))
-      toast.success(`${group.channel_name || "上游"} / ${group.group_name}：${result.status === "alive" ? "存活" : result.status === "disabled" ? "已禁用" : "不可用"}`)
+      toast.success(`${group.channel_name || "上游"} / ${group.group_name}：${statusText(result.status)}`)
       await load()
     } catch (e) {
       const err = e as Error
@@ -981,67 +1359,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
-  async function submitManualGroup() {
-    if (!manualDraft.groupName.trim()) {
-      toast.error("请填写分组名")
-      return
-    }
-    if (!manualDraft.key.trim()) {
-      toast.error("请填写 Key")
-      return
-    }
-    if (manualDraft.sourceMode === "existing" && !manualDraft.channelId) {
-      toast.error("请选择已有渠道")
-      return
-    }
-    if (manualDraft.sourceMode === "new" && !manualDraft.siteUrl.trim()) {
-      toast.error("请填写上游地址")
-      return
-    }
-    setBusy("manual-add")
-    try {
-      const created = await apiFetch<UpstreamGroupKey>("/gateway/group-keys/manual", {
-        method: "POST",
-        body: JSON.stringify({
-          ...(manualDraft.sourceMode === "existing"
-            ? { channel_id: Number(manualDraft.channelId) }
-            : {
-                channel_name: manualDraft.channelName.trim() || undefined,
-                site_url: manualDraft.siteUrl.trim() || undefined,
-              }),
-          group_name: manualDraft.groupName.trim(),
-          group_description: manualDraft.groupDescription.trim() || undefined,
-          key: manualDraft.key.trim(),
-          ratio: Number(manualDraft.ratio) || 0,
-          client_format: manualDraft.clientFormat,
-          request_mode: manualDraft.requestMode,
-          charity: manualDraft.charity,
-          priority: Math.max(0, Math.floor(Number(manualDraft.priority) || 0)),
-        }),
-      })
-      try {
-        const health = await apiFetch<GatewayHealthResult["items"][number]>(`/gateway/group-keys/${created.id}/test`, { method: "POST" })
-        setHealthResults((prev) => ({ ...prev, [created.id]: health }))
-        if (health.status === "alive") {
-          toast.success("手动渠道已添加，并已通过 Responses 测活")
-        } else {
-          toast.warning(`手动渠道已保存，但测活未通过：${health.error || "上游无有效响应"}`)
-        }
-      } catch (e) {
-        const err = e as Error
-        toast.warning(`手动渠道已保存，但自动测活失败：${err.message || "请稍后单独测活"}`)
-      }
-      setManualOpen(false)
-      setManualDraft(createDefaultManualDraft())
-      await load()
-    } catch (e) {
-      const err = e as Error
-      toast.error(err.message || "手动添加分组失败")
-    } finally {
-      setBusy(null)
-    }
-  }
-
   return (
     <Card className="border border-border shadow-none">
       <CardHeader className="flex flex-col gap-3 pb-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1061,20 +1378,38 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             <Badge variant="outline" className="border-danger/20 bg-danger/10 text-danger">
               死亡 {displayDeadCount}
             </Badge>
+            <Badge variant="outline" className="border-warning/20 bg-warning/10 text-warning">
+              零余额 {displayZeroBalanceCount}
+            </Badge>
+            <Badge variant="outline" className="border-warning/20 bg-warning/10 text-warning">
+              限流 {displayRateLimitedCount}
+            </Badge>
+            <Badge variant="outline" className="border-danger/20 bg-danger/10 text-danger">
+              403 {displayForbiddenCount}
+            </Badge>
+            <Badge variant="outline" className="border-warning/20 bg-warning/10 text-warning">
+              非生成 {displayNonGenerationCount}
+            </Badge>
             <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
               启用 {displayEnabledCount}/{totalGroups}
             </Badge>
-            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={() => setManualOpen(true)}>
-              <Plus className="size-3.5" />
-              手动添加
-            </Button>
+            <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
+              已选 {selectedHealthGroupIds.length}
+              {activeFilters > 0 ? ` · 当前筛选 ${selectedVisibleHealthCount}` : ""}
+            </Badge>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
               {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
               一键创建分组 Key
             </Button>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || filteredGroups.length === 0} onClick={selectVisibleHealthGroups}>
+              选中当前筛选
+            </Button>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || selectedHealthGroupIds.length === 0} onClick={clearHealthSelection}>
+              清空选择
+            </Button>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={testGroups}>
               {busy === "test" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
-              一键分组测活
+              测活已选分组
             </Button>
             {healthProgress ? (
               <div className="w-full rounded-md border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground sm:w-auto">
@@ -1142,7 +1477,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                           <div className="min-w-0">
                             <p className="truncate text-xs font-medium text-foreground">{key.name}</p>
                             <p className={cn("text-[11px]", key.enabled ? "text-success" : "text-muted-foreground")}>
-                              {key.enabled ? "启用中" : "已停用"} · {clientFormatLabel(key.client_format)}
+                              {keyUsageStatusText(key)} · {clientFormatLabel(key.client_format)} · 并发 {formatConcurrencyLimit(key.concurrency_limit)}
                             </p>
                           </div>
                         </TableCell>
@@ -1159,12 +1494,14 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                         <TableCell className="hidden text-right text-xs md:table-cell">
                           <span className="font-medium text-foreground">{formatTokens(key.today_tokens)}</span>
                           <span className="text-muted-foreground"> / {key.daily_limit > 0 ? formatTokens(key.daily_limit) : "不限"}</span>
-                          <span className="mt-0.5 block text-[10px] text-muted-foreground">费用 {key.today_cost > 0 ? key.today_cost.toFixed(4) : "0"}</span>
+                          <span className="mt-0.5 block text-[10px] text-muted-foreground">余额 {money(key.today_cost, { precise: true })}</span>
                         </TableCell>
                         <TableCell className="hidden text-right text-xs xl:table-cell">
                           <span className="font-medium text-foreground">{formatTokens(key.total_tokens)}</span>
                           <span className="text-muted-foreground"> / {key.total_limit > 0 ? formatTokens(key.total_limit) : "不限"}</span>
-                          <span className="mt-0.5 block text-[10px] text-muted-foreground">累计费用 {key.total_cost > 0 ? key.total_cost.toFixed(4) : "0"}</span>
+                          <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                            余额 {money(key.total_cost, { precise: true })} / {formatMoneyLimit(key.balance_limit, true)}
+                          </span>
                         </TableCell>
                         <TableCell className="hidden text-xs text-muted-foreground lg:table-cell">
                           {formatExpiry(key.expires_at)}
@@ -1233,479 +1570,401 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
         ) : null}
 
         {showGroups ? (
-        <>
-        <div className="relative max-w-xl">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            value={groupSearch}
-            onChange={(event) => setGroupSearch(event.target.value)}
-            className="h-9 pl-8 text-xs"
-            placeholder="搜索渠道、上游分组、分组说明或分组标识"
-            aria-label="搜索可用渠道对应的上游分组"
-          />
-        </div>
-        <div className="overflow-x-auto rounded-md border border-border">
-          <Table className="min-w-[1360px]">
-            <TableHeader>
-              <TableRow>
-                <TableHead>状态</TableHead>
-                <TableHead className="w-20">启用</TableHead>
-                <TableHead className="w-20">公益</TableHead>
-                <TableHead>渠道</TableHead>
-                <TableHead>分组</TableHead>
-                <TableHead className="w-24">格式</TableHead>
-                <TableHead className="w-32">上游接口</TableHead>
-                <TableHead className="text-right">倍率</TableHead>
-                <TableHead className="w-28">优先级</TableHead>
-                <TableHead className="w-32">并发上限</TableHead>
-                <TableHead>测活</TableHead>
-                <TableHead>错误</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {loading ? (
-                <TableRow>
-                  <TableCell colSpan={12} className="h-24 text-center text-xs text-muted-foreground">
-                    <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
-                    加载中...
-                  </TableCell>
-                </TableRow>
-              ) : groups.length === 0 ? (
-                <TableRow>
-                  <TableCell colSpan={12} className="h-24 text-center text-xs text-muted-foreground">
-                    还没有分组 Key，先点“一键创建分组 Key”
-                  </TableCell>
-                </TableRow>
-              ) : (
-                pagedGroups.map((group) => {
-                  const latestHealth = healthResults[group.id]
-                  const status = latestHealth?.status ?? effectiveStatus(group)
-                  const Icon = status === "alive" ? CheckCircle2 : status === "dead" ? XCircle : RefreshCw
-                  const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
-                  return (
-                    <TableRow key={group.id} className={cn(group.charity && "bg-success/5")}>
-                      <TableCell>
-                        <Badge variant="outline" className={cn("gap-1.5", statusTone(status))}>
-                          <Icon className={cn("size-3", status === "checking" && "animate-spin")} />
-                          {statusText(status)}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        <Switch
-                          checked={group.enabled !== false}
-                          disabled={!!busy}
-                          title={group.enabled === false ? "启用这个上游分组" : "禁用后不会参与调度和测活"}
-                          onCheckedChange={(checked) => void toggleGroupEnabled(group, checked)}
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-col items-start gap-1">
-                          <Switch
-                            checked={group.charity === true}
-                            disabled={!!busy}
-                            title={group.charity ? "取消公益标记" : "标记为公益分组"}
-                            onCheckedChange={(checked) => void toggleGroupCharity(group, checked)}
-                          />
-                          {group.charity ? (
-                            <Badge variant="outline" className="gap-1 border-success/20 bg-success/10 px-1.5 text-[10px] text-success">
-                              <HeartHandshake className="size-3" />
-                              公益
-                            </Badge>
-                          ) : null}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="text-sm font-medium">{group.channel_name || `#${group.channel_id}`}</div>
-                        <div className="text-[11px] text-muted-foreground">{channelTypeLabel(group.channel_type)}</div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="text-sm font-medium">{group.group_name}</div>
-                        <div className="max-w-96 truncate text-[11px] text-muted-foreground">{group.group_description || group.group_ref}</div>
-                      </TableCell>
-                      <TableCell>
-                        <Select
-                          value={normalizeClientFormat(group.client_format)}
-                          disabled={!!busy}
-                          onValueChange={(value) => void changeGroupClientFormat(group, value)}
-                        >
-                          <SelectTrigger className="h-8 w-24 text-xs">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="openai">ChatGPT</SelectItem>
-                            <SelectItem value="claude">Claude</SelectItem>
-                            <SelectItem value="grok">Grok</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </TableCell>
-                      <TableCell>
-                        <Select
-                          value={normalizeRequestMode(group.request_mode)}
-                          disabled={!!busy}
-                          onValueChange={(value) => void changeGroupRequestMode(group, normalizeRequestMode(value))}
-                        >
-                          <SelectTrigger className="h-8 w-28 text-xs">
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="responses">Responses</SelectItem>
-                            <SelectItem value="chat">Chat</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </TableCell>
-                      <TableCell className="text-right">
-                        <div className="font-mono text-xs">{formatRatio(group.ratio)}</div>
-                        <div className="text-[11px] text-muted-foreground">{formatTokens(group.total_tokens)} tok</div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex items-center gap-1">
-                          <Input
-                            value={priorityDrafts[group.id] ?? String(group.priority || 0)}
-                            inputMode="numeric"
-                            className="h-7 w-16 px-2 text-xs"
-                            disabled={!!busy}
-                            title="数值越大越优先；同优先级再按低倍率调度"
-                            onChange={(event) =>
-                              setPriorityDrafts((prev) => ({
-                                ...prev,
-                                [group.id]: event.target.value.replace(/[^\d]/g, ""),
-                              }))
-                            }
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter") {
-                                event.currentTarget.blur()
-                              }
-                            }}
-                            onBlur={() => {
-                              const draft = priorityDrafts[group.id] ?? String(group.priority || 0)
-                              if (Number(draft) !== (group.priority || 0)) {
-                                void savePriority(group)
-                              }
-                            }}
-                          />
-                          {busy === `group-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
-                        </div>
-                        <div className="mt-1 text-[11px] text-muted-foreground">越大越优先</div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex items-center gap-1">
-                          <Input
-                            value={concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)}
-                            inputMode="numeric"
-                            className="h-7 w-16 px-2 text-xs"
-                            disabled={!!busy}
-                            title="0 表示不限"
-                            onChange={(event) =>
-                              setConcurrencyDrafts((prev) => ({
-                                ...prev,
-                                [group.id]: event.target.value.replace(/[^\d]/g, ""),
-                              }))
-                            }
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter") {
-                                event.currentTarget.blur()
-                              }
-                            }}
-                            onBlur={() => {
-                              const draft = concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)
-                              if (Number(draft) !== (group.concurrency_limit || 0)) {
-                                void saveConcurrencyLimit(group)
-                              }
-                            }}
-                          />
-                          {busy === `group-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
-                        </div>
-                        <div className="mt-1 text-[11px] text-muted-foreground">{(group.concurrency_limit || 0) > 0 ? `${group.concurrency_limit} 路` : "不限"}</div>
-                      </TableCell>
-                      <TableCell className="text-xs text-muted-foreground">
-                        <div>{latestHealth?.checked_at ? relativeTime(latestHealth.checked_at) : group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}</div>
-                        <div className="mt-1 flex items-center gap-1.5 text-[11px]">
-                          <span>{latencyMS > 0 ? `${latencyMS}ms` : "延迟 —"}</span>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-6 px-1.5 text-[11px]"
-                            disabled={!!busy || group.enabled === false}
-                            title="仅测活此上游分组"
-                            onClick={() => void testGroup(group)}
-                          >
-                            {busy === `test-${group.id}` ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
-                            测活
-                          </Button>
-                        </div>
-                      </TableCell>
-                      <TableCell className="max-w-72 text-xs text-danger">
-                        <div className="flex items-center gap-2">
-                          <span className="truncate" title={group.last_error || ""}>{group.last_error || ""}</span>
-                          {group.disabled_until && new Date(group.disabled_until).getTime() > Date.now() ? (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              className="h-7 shrink-0 px-2 text-[11px]"
-                              disabled={!!busy}
-                              title="立即解除冷却，恢复调度"
-                              onClick={() => void clearCooldown(group)}
-                            >
-                              解除冷却
-                            </Button>
-                          ) : null}
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="size-7 shrink-0 text-muted-foreground hover:text-danger"
-                            disabled={!!busy}
-                            title="删除该分组（清理上游已删除的残留，仅删本地）"
-                            onClick={() => void deleteGroup(group)}
-                          >
-                            <Trash2 className="size-3.5" />
-                          </Button>
-                        </div>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })
-              )}
-            </TableBody>
-          </Table>
-        </div>
-
-        {showGroups && totalGroups > 0 ? (
-          <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/10 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
-            <div className="text-xs text-muted-foreground">
-              显示 {rangeStart}-{rangeEnd} / {totalGroups} 个分组
-            </div>
-            <div className="flex items-center gap-1.5">
-              <div className="flex items-center gap-1 text-xs text-muted-foreground">
-                <span>每页</span>
-                <Select
-                  value={String(pageSize)}
-                  onValueChange={(value) => {
-                    setPageSize(Number(value))
-                    setPage(1)
-                  }}
-                >
-                  <SelectTrigger className="h-8 w-20 text-xs">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="10">10 条</SelectItem>
-                    <SelectItem value="20">20 条</SelectItem>
-                    <SelectItem value="50">50 条</SelectItem>
-                  </SelectContent>
-                </Select>
+          <>
+            <div className="rounded-md border border-border bg-muted/10 p-3">
+              <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <p className="text-xs font-medium text-foreground">统一筛选区</p>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    搜索、格式、倍率、公益 Key 按“或”匹配；不填条件时展示全部渠道。
+                  </p>
+                </div>
+                <Badge variant="outline" className="border-border bg-background text-muted-foreground">
+                  命中 {filteredGroups.length}/{totalGroups}
+                </Badge>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1 px-2 text-xs"
-                disabled={currentPage <= 1}
-                onClick={() => setPage((prev) => Math.max(1, prev - 1))}
-              >
-                <ChevronLeft className="size-3.5" />
-                上一页
-              </Button>
-              <span className="min-w-16 text-center text-xs text-muted-foreground">
-                {currentPage} / {totalPages}
-              </span>
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1 px-2 text-xs"
-                disabled={currentPage >= totalPages}
-                onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
-              >
-                下一页
-                <ChevronRight className="size-3.5" />
-              </Button>
-            </div>
-          </div>
-        ) : null}
-        </>
-        ) : null}
-      </CardContent>
-
-      <Dialog
-        open={manualOpen}
-        onOpenChange={(open) => {
-          setManualOpen(open)
-          if (!open) setManualDraft(createDefaultManualDraft())
-        }}
-      >
-        <DialogContent className="sm:max-w-2xl">
-          <DialogHeader>
-            <DialogTitle>手动添加渠道</DialogTitle>
-            <DialogDescription>
-              给无法登录、只能拿到 Key 的上游手动创建分组。分组名和 Key 为必填。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div className="space-y-1.5">
-              <Label>接入方式</Label>
-              <Select
-                value={manualDraft.sourceMode}
-                onValueChange={(value) =>
-                  setManualDraft((prev) => ({
-                    ...prev,
-                    sourceMode: value === "existing" ? "existing" : "new",
-                  }))
-                }
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="new">新建渠道</SelectItem>
-                  <SelectItem value="existing">选择已有渠道</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            {manualDraft.sourceMode === "existing" ? (
-              <div className="space-y-1.5">
-                <Label>已有渠道</Label>
+              <div className="grid gap-2 lg:grid-cols-[minmax(220px,1.4fr)_0.85fr_0.85fr_0.85fr_auto]">
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={groupFilterDraft.search}
+                    onChange={(event) => setGroupFilterDraft((prev) => ({ ...prev, search: event.target.value }))}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        setGroupFilters({ ...groupFilterDraft, search: groupFilterDraft.search.trim() })
+                      }
+                    }}
+                    className="h-9 pl-8 text-xs"
+                    placeholder="模糊搜索渠道、分组、格式、公益、倍率"
+                    aria-label="搜索可用渠道对应的上游分组"
+                  />
+                </div>
                 <Select
-                  value={manualDraft.channelId}
-                  onValueChange={(value) => setManualDraft((prev) => ({ ...prev, channelId: value }))}
+                  value={groupFilterDraft.format}
+                  onValueChange={(value) =>
+                    setGroupFilterDraft((prev) => ({ ...prev, format: value as GroupFormatFilter }))
+                  }
                 >
-                  <SelectTrigger>
-                    <SelectValue placeholder="选择渠道" />
+                  <SelectTrigger className="h-9 w-full text-xs">
+                    <SelectValue placeholder="格式筛选" />
                   </SelectTrigger>
                   <SelectContent>
-                    {channels.map((channel) => (
-                      <SelectItem key={channel.id} value={String(channel.id)}>
-                        {channel.name}
-                      </SelectItem>
-                    ))}
+                    <SelectItem value="all">全部格式</SelectItem>
+                    <SelectItem value="openai">OpenAI</SelectItem>
+                    <SelectItem value="claude">Claude</SelectItem>
+                    <SelectItem value="grok">Grok</SelectItem>
                   </SelectContent>
                 </Select>
+                <Select
+                  value={groupFilterDraft.rateBand}
+                  onValueChange={(value) =>
+                    setGroupFilterDraft((prev) => ({ ...prev, rateBand: value as RateFilter }))
+                  }
+                >
+                  <SelectTrigger className="h-9 w-full text-xs">
+                    <SelectValue placeholder="倍率筛选" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">全部倍率</SelectItem>
+                    <SelectItem value="0-0.05">0-0.05</SelectItem>
+                    <SelectItem value="0.06-0.1">0.06-0.1</SelectItem>
+                    <SelectItem value="0.1-0.2">0.1-0.2</SelectItem>
+                    <SelectItem value="0.2+">0.2 以上</SelectItem>
+                  </SelectContent>
+                </Select>
+                <Select
+                  value={groupFilterDraft.charity}
+                  onValueChange={(value) =>
+                    setGroupFilterDraft((prev) => ({ ...prev, charity: value as CharityFilter }))
+                  }
+                >
+                  <SelectTrigger className="h-9 w-full text-xs">
+                    <SelectValue placeholder="公益 Key 筛选" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">全部公益状态</SelectItem>
+                    <SelectItem value="charity">仅公益 Key</SelectItem>
+                    <SelectItem value="normal">非公益</SelectItem>
+                  </SelectContent>
+                </Select>
+                <div className="flex gap-2">
+                  <Button
+                    size="sm"
+                    className="h-9 flex-1 gap-1.5 text-xs lg:flex-none"
+                    onClick={() => setGroupFilters({ ...groupFilterDraft, search: groupFilterDraft.search.trim() })}
+                  >
+                    <Search className="size-3.5" />
+                    搜索
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-9 flex-1 text-xs lg:flex-none"
+                    onClick={() => {
+                      const next = createDefaultGroupFilters()
+                      setGroupFilterDraft(next)
+                      setGroupFilters(next)
+                    }}
+                  >
+                    重置
+                  </Button>
+                </div>
+              </div>
+              {activeFilters > 0 ? (
+                <div className="mt-3 flex flex-wrap gap-1.5 text-[11px]">
+                  {groupFilters.search.trim() ? (
+                    <Badge variant="outline" className="bg-background">搜索：{groupFilters.search.trim()}</Badge>
+                  ) : null}
+                  {groupFilters.format !== "all" ? (
+                    <Badge variant="outline" className="bg-background">格式：{clientFormatLabel(groupFilters.format)}</Badge>
+                  ) : null}
+                  {groupFilters.rateBand !== "all" ? (
+                    <Badge variant="outline" className="bg-background">倍率：{rateFilterLabel(groupFilters.rateBand)}</Badge>
+                  ) : null}
+                  {groupFilters.charity !== "all" ? (
+                    <Badge variant="outline" className="bg-background">公益：{charityFilterLabel(groupFilters.charity)}</Badge>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+
+            {loading ? (
+              <div className="rounded-md border border-dashed border-border bg-background px-3 py-12 text-center text-xs text-muted-foreground">
+                <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
+                加载中...
+              </div>
+            ) : groups.length === 0 ? (
+              <div className="rounded-md border border-dashed border-border bg-background px-3 py-12 text-center text-xs text-muted-foreground">
+                还没有分组 Key，先点“一键创建分组 Key”
+              </div>
+            ) : filteredGroups.length === 0 ? (
+              <div className="rounded-md border border-dashed border-border bg-background px-3 py-12 text-center text-xs text-muted-foreground">
+                没有符合当前筛选条件的渠道
               </div>
             ) : (
-              <>
-                <div className="space-y-1.5">
-                  <Label htmlFor="manual-channel-name">渠道名</Label>
-                  <Input
-                    id="manual-channel-name"
-                    value={manualDraft.channelName}
-                    onChange={(event) => setManualDraft((prev) => ({ ...prev, channelName: event.target.value }))}
-                    placeholder="例如：某公益中转"
-                  />
-                </div>
-                <div className="space-y-1.5 sm:col-span-2">
-                  <Label htmlFor="manual-site-url">上游地址 *</Label>
-                  <Input
-                    id="manual-site-url"
-                    value={manualDraft.siteUrl}
-                    onChange={(event) => setManualDraft((prev) => ({ ...prev, siteUrl: event.target.value }))}
-                    placeholder="https://..."
-                  />
-                </div>
-              </>
-            )}
-            <div className="space-y-1.5">
-              <Label htmlFor="manual-group-name">分组名 *</Label>
-              <Input
-                id="manual-group-name"
-                value={manualDraft.groupName}
-                onChange={(event) => setManualDraft((prev) => ({ ...prev, groupName: event.target.value }))}
-                placeholder="例如：default"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="manual-ratio">倍率</Label>
-              <Input
-                id="manual-ratio"
-                value={manualDraft.ratio}
-                inputMode="decimal"
-                onChange={(event) => setManualDraft((prev) => ({ ...prev, ratio: sanitizeMInput(event.target.value) }))}
-                placeholder="1"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label htmlFor="manual-priority">调度优先级</Label>
-              <Input
-                id="manual-priority"
-                value={manualDraft.priority}
-                inputMode="numeric"
-                onChange={(event) => setManualDraft((prev) => ({ ...prev, priority: event.target.value.replace(/[^\d]/g, "") }))}
-                placeholder="0"
-              />
-            </div>
-            <div className="space-y-1.5 sm:col-span-2">
-              <Label htmlFor="manual-group-desc">分组说明</Label>
-              <Input
-                id="manual-group-desc"
-                value={manualDraft.groupDescription}
-                onChange={(event) => setManualDraft((prev) => ({ ...prev, groupDescription: event.target.value }))}
-                placeholder="可选，例如：手动粘贴的公益线路"
-              />
-            </div>
-            <div className="space-y-1.5 sm:col-span-2">
-              <Label htmlFor="manual-key">Key *</Label>
-              <Input
-                id="manual-key"
-                value={manualDraft.key}
-                onChange={(event) => setManualDraft((prev) => ({ ...prev, key: event.target.value }))}
-                placeholder="上游 API Key"
-              />
-            </div>
-            <div className="space-y-1.5">
-              <Label>类型</Label>
-              <Select
-                value={manualDraft.clientFormat}
-                onValueChange={(value) => {
-                  const format = normalizeClientFormat(value)
-                  setManualDraft((prev) => ({
-                    ...prev,
-                    clientFormat: format === "claude" || format === "grok" ? format : "openai",
-                  }))
-                }}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="openai">OpenAI</SelectItem>
-                  <SelectItem value="claude">Claude</SelectItem>
-                  <SelectItem value="grok">Grok (xAI)</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="space-y-1.5">
-              <Label>请求方式</Label>
-              <Select
-                value={manualDraft.requestMode}
-                onValueChange={(value) => setManualDraft((prev) => ({ ...prev, requestMode: normalizeRequestMode(value) }))}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="responses">Responses</SelectItem>
-                  <SelectItem value="chat">Chat</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="flex items-center justify-between gap-3 rounded-md border border-border bg-muted/20 px-3 py-2 sm:col-span-2">
-              <div>
-                <p className="text-sm font-medium text-foreground">是否公益</p>
-                <p className="text-xs text-muted-foreground">标记为公益分组后会有醒目标记</p>
+              <div className="grid gap-3 xl:grid-cols-3">
+                {groupColumns.map((column) => {
+                  const alive = column.items.filter((group) => effectiveStatus(group) === "alive").length
+                  return (
+                    <div key={column.key} className="rounded-md border border-border bg-background">
+                      <div className="border-b border-border p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <div>
+                            <p className="text-sm font-semibold text-foreground">{column.title}</p>
+                            <p className="mt-0.5 text-[11px] text-muted-foreground">{column.description}</p>
+                          </div>
+                          <Badge variant="outline" className="bg-muted/40">
+                            {column.items.length} 个
+                          </Badge>
+                        </div>
+                        <div className="mt-2 flex gap-1.5 text-[11px]">
+                          <Badge variant="outline" className="border-success/20 bg-success/10 text-success">存活 {alive}</Badge>
+                          <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
+                            其它 {Math.max(0, column.items.length - alive)}
+                          </Badge>
+                        </div>
+                      </div>
+                      <div className="space-y-2 p-2">
+                        {column.items.length === 0 ? (
+                          <div className="rounded-md border border-dashed border-border px-3 py-8 text-center text-xs text-muted-foreground">
+                            暂无匹配 {column.title} 的渠道
+                          </div>
+                        ) : (
+                          column.items.map((group) => {
+                            const latestHealth = healthResults[group.id]
+                            const status = latestHealth?.status ?? effectiveStatus(group)
+                            const Icon = status === "alive" ? CheckCircle2 : isFailureHealthStatus(status) ? XCircle : RefreshCw
+                            const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
+                            const selected = selectedHealthGroupSet.has(group.id)
+                            const healthError = latestHealth?.error || group.last_error
+                            return (
+                              <div
+                                key={`${column.key}-${group.id}`}
+                                className={cn(
+                                  "rounded-md border border-border bg-card p-3 text-xs shadow-sm",
+                                  group.charity && "border-success/20 bg-success/5",
+                                  selected && "border-brand/30 ring-1 ring-brand/20",
+                                )}
+                              >
+                                <div className="flex items-start justify-between gap-2">
+                                  <div className="flex min-w-0 items-start gap-2">
+                                    <Checkbox
+                                      className="mt-0.5 shrink-0"
+                                      checked={selected}
+                                      disabled={!!busy}
+                                      aria-label={`选择 ${group.channel_name || group.channel_id} / ${group.group_name} 参与测活`}
+                                      onCheckedChange={(checked) => toggleHealthGroupSelected(group.id, checked === true)}
+                                    />
+                                    <div className="min-w-0">
+                                      <div className="flex flex-wrap items-center gap-1.5">
+                                        <p className="truncate text-sm font-semibold text-foreground">
+                                          {group.channel_name || `#${group.channel_id}`}
+                                        </p>
+                                        {group.charity ? (
+                                          <Badge variant="outline" className="gap-1 border-success/20 bg-success/10 px-1.5 text-[10px] text-success">
+                                            <HeartHandshake className="size-3" />
+                                            公益
+                                          </Badge>
+                                        ) : null}
+                                      </div>
+                                      <p className="mt-0.5 truncate text-muted-foreground">{channelTypeLabel(group.channel_type)}</p>
+                                    </div>
+                                  </div>
+                                  <Badge variant="outline" className={cn("shrink-0 gap-1.5", statusTone(status))}>
+                                    <Icon className={cn("size-3", status === "checking" && "animate-spin")} />
+                                    {statusText(status)}
+                                  </Badge>
+                                </div>
+
+                                <div className="mt-3 rounded-md bg-muted/40 px-2 py-2">
+                                  <p className="truncate font-medium text-foreground">{group.group_name}</p>
+                                  <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                                    {group.group_description || group.group_ref}
+                                  </p>
+                                  <div className="mt-2 flex flex-wrap gap-1.5">
+                                    <Badge variant="outline" className="bg-background">倍率 {formatRatio(group.ratio)}</Badge>
+                                    <Badge variant="outline" className="bg-background">{upstreamKeyLabel(group)}</Badge>
+                                    <Badge variant="outline" className="bg-background">优先级 {group.priority || 0}</Badge>
+                                    <Badge variant="outline" className="bg-background">{formatTokens(group.total_tokens)} tok</Badge>
+                                    <Badge variant="outline" className="bg-background">{requestModeLabel(group.request_mode)}</Badge>
+                                  </div>
+                                </div>
+
+                                <div className="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+                                  <div className="space-y-1">
+                                    <Label className="text-[11px] text-muted-foreground">格式</Label>
+                                    <Select
+                                      value={normalizeClientFormat(group.client_format)}
+                                      disabled={!!busy}
+                                      onValueChange={(value) => void changeGroupClientFormat(group, value)}
+                                    >
+                                      <SelectTrigger className="h-8 w-full text-xs">
+                                        <SelectValue />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="openai">OpenAI</SelectItem>
+                                        <SelectItem value="claude">Claude</SelectItem>
+                                        <SelectItem value="grok">Grok</SelectItem>
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+                                  <div className="space-y-1">
+                                    <Label className="text-[11px] text-muted-foreground">上游接口</Label>
+                                    <Select
+                                      value={normalizeRequestMode(group.request_mode)}
+                                      disabled={!!busy}
+                                      onValueChange={(value) => void changeGroupRequestMode(group, normalizeRequestMode(value))}
+                                    >
+                                      <SelectTrigger className="h-8 w-full text-xs">
+                                        <SelectValue />
+                                      </SelectTrigger>
+                                      <SelectContent>
+                                        <SelectItem value="responses">Responses</SelectItem>
+                                        <SelectItem value="chat">Chat</SelectItem>
+                                      </SelectContent>
+                                    </Select>
+                                  </div>
+                                  <div className="space-y-1">
+                                    <Label className="text-[11px] text-muted-foreground">优先级</Label>
+                                    <div className="flex items-center gap-1">
+                                      <Input
+                                        value={priorityDrafts[group.id] ?? String(group.priority || 0)}
+                                        inputMode="numeric"
+                                        className="h-8 px-2 text-xs"
+                                        disabled={!!busy}
+                                        title="数值越大越优先；同优先级再按低倍率调度"
+                                        onChange={(event) =>
+                                          setPriorityDrafts((prev) => ({
+                                            ...prev,
+                                            [group.id]: event.target.value.replace(/[^\d]/g, ""),
+                                          }))
+                                        }
+                                        onKeyDown={(event) => {
+                                          if (event.key === "Enter") event.currentTarget.blur()
+                                        }}
+                                        onBlur={() => {
+                                          const draft = priorityDrafts[group.id] ?? String(group.priority || 0)
+                                          if (Number(draft) !== (group.priority || 0)) void savePriority(group)
+                                        }}
+                                      />
+                                      {busy === `group-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+                                    </div>
+                                  </div>
+                                  <div className="space-y-1">
+                                    <Label className="text-[11px] text-muted-foreground">并发上限</Label>
+                                    <div className="flex items-center gap-1">
+                                      <Input
+                                        value={concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)}
+                                        inputMode="numeric"
+                                        className="h-8 px-2 text-xs"
+                                        disabled={!!busy}
+                                        title="0 表示不限"
+                                        onChange={(event) =>
+                                          setConcurrencyDrafts((prev) => ({
+                                            ...prev,
+                                            [group.id]: event.target.value.replace(/[^\d]/g, ""),
+                                          }))
+                                        }
+                                        onKeyDown={(event) => {
+                                          if (event.key === "Enter") event.currentTarget.blur()
+                                        }}
+                                        onBlur={() => {
+                                          const draft = concurrencyDrafts[group.id] ?? String(group.concurrency_limit || 0)
+                                          if (Number(draft) !== (group.concurrency_limit || 0)) void saveConcurrencyLimit(group)
+                                        }}
+                                      />
+                                      {busy === `group-${group.id}` && <Loader2 className="size-3 animate-spin text-muted-foreground" />}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
+                                  <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
+                                    <label className="flex items-center gap-1.5">
+                                      <Switch
+                                        checked={group.enabled !== false}
+                                        disabled={!!busy}
+                                        title={group.enabled === false ? "启用这个上游分组" : "禁用后不会参与调度和测活"}
+                                        onCheckedChange={(checked) => void toggleGroupEnabled(group, checked)}
+                                      />
+                                      启用
+                                    </label>
+                                    <label className="flex items-center gap-1.5">
+                                      <Switch
+                                        checked={group.charity === true}
+                                        disabled={!!busy}
+                                        title={group.charity ? "取消公益标记" : "标记为公益分组"}
+                                        onCheckedChange={(checked) => void toggleGroupCharity(group, checked)}
+                                      />
+                                      公益
+                                    </label>
+                                  </div>
+                                  <div className="flex items-center gap-1">
+                                    {group.disabled_until && new Date(group.disabled_until).getTime() > Date.now() ? (
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-7 px-2 text-[11px]"
+                                        disabled={!!busy}
+                                        title="立即解除冷却，恢复调度"
+                                        onClick={() => void clearCooldown(group)}
+                                      >
+                                        解除冷却
+                                      </Button>
+                                    ) : null}
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      className="h-7 gap-1 px-2 text-[11px]"
+                                      disabled={!!busy || group.enabled === false}
+                                      title="仅测活此上游分组"
+                                      onClick={() => void testGroup(group)}
+                                    >
+                                      {busy === `test-${group.id}` ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
+                                      测活
+                                    </Button>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon"
+                                      className="size-7 text-muted-foreground hover:text-danger"
+                                      disabled={!!busy}
+                                      title="删除该分组（清理上游已删除的残留，仅删本地）"
+                                      onClick={() => void deleteGroup(group)}
+                                    >
+                                      <Trash2 className="size-3.5" />
+                                    </Button>
+                                  </div>
+                                </div>
+
+                                <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                                  <span>测活：{latestHealth?.checked_at ? relativeTime(latestHealth.checked_at) : group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}</span>
+                                  <span>延迟：{latencyMS > 0 ? `${latencyMS}ms` : "—"}</span>
+                                  <span>并发：{(group.concurrency_limit || 0) > 0 ? `${group.concurrency_limit} 路` : "不限"}</span>
+                                </div>
+                                {healthError ? (
+                                  <p
+                                    className={cn(
+                                      "mt-2 truncate rounded-md px-2 py-1 text-[11px]",
+                                      isWarningHealthStatus(status) ? "bg-warning/10 text-warning" : "bg-danger/10 text-danger",
+                                    )}
+                                    title={healthError}
+                                  >
+                                    {healthError}
+                                  </p>
+                                ) : null}
+                              </div>
+                            )
+                          })
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
-              <Switch
-                checked={manualDraft.charity}
-                onCheckedChange={(checked) => setManualDraft((prev) => ({ ...prev, charity: checked }))}
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setManualOpen(false)} disabled={!!busy}>
-              取消
-            </Button>
-            <Button onClick={() => void submitManualGroup()} disabled={!!busy}>
-              {busy === "manual-add" ? <Loader2 className="mr-1.5 size-3.5 animate-spin" /> : null}
-              添加
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+            )}
+          </>
+        ) : null}
+      </CardContent>
 
       <Dialog
         open={createOpen}

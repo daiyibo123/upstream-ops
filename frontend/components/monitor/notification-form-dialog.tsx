@@ -59,6 +59,8 @@ interface ConfigState {
   secret: string
 }
 
+type ConfigTouched = Partial<Record<keyof ConfigState, boolean>>
+
 interface SubRow {
   channel_ids: number[]
   event_mode: "all" | "custom"
@@ -128,6 +130,23 @@ function hasRateEvents(row: SubRow) {
   return row.event_mode === "all" || row.events.some((event) => rateEventSet.has(event))
 }
 
+function hasTouchedConfig(touched: ConfigTouched) {
+  return Object.values(touched).some(Boolean)
+}
+
+function splitRecipients(value: string) {
+  return value
+    .split(/[,，;\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+function requiredText(value: string, label: string) {
+  const next = value.trim()
+  if (!next) throw new Error(`${label}不能为空`)
+  return next
+}
+
 function initialState(c?: NotificationChannel | null): FormState {
   let subs: SubRow[] = []
   if (c?.subscriptions) {
@@ -163,29 +182,46 @@ function initialState(c?: NotificationChannel | null): FormState {
 }
 
 // buildConfigByType 把 cfg state 序列化成各 notifier 期望的 JSON。
-// 留空字段会被剔除（除非该字段是必填）。
-function buildConfigByType(type: NotificationChannelType, cfg: ConfigState): string {
+// 编辑模式 partial=true 时只提交用户实际改过的字段，后端会与旧配置合并。
+function buildConfigByType(
+  type: NotificationChannelType,
+  cfg: ConfigState,
+  touched: ConfigTouched = {},
+  partial = false,
+): string {
   switch (type) {
     case "email": {
-      const port = Number(cfg.port)
-      if (!Number.isFinite(port) || port <= 0) throw new Error("端口必须是正整数")
-      const to = cfg.to.split(",").map((s) => s.trim()).filter(Boolean)
-      if (to.length === 0) throw new Error("收件人至少一个")
-      return JSON.stringify({
-        host: cfg.host,
-        port,
-        username: cfg.username,
-        password: cfg.password,
-        from: cfg.from,
-        to,
-        use_tls: cfg.use_tls,
-      })
+      const body: Record<string, unknown> = {}
+      if (!partial || touched.host) body.host = requiredText(cfg.host, "Host")
+      if (!partial || touched.port) {
+        const port = Number(cfg.port)
+        if (!Number.isFinite(port) || port <= 0) throw new Error("端口必须是正整数")
+        body.port = port
+      }
+      if (!partial || touched.username) body.username = cfg.username.trim()
+      if (!partial || touched.password) body.password = cfg.password
+      if (!partial || touched.from) body.from = requiredText(cfg.from, "From")
+      if (!partial || touched.to) {
+        const to = splitRecipients(cfg.to)
+        if (to.length === 0) throw new Error("收件人至少一个")
+        body.to = to
+      }
+      if (!partial || touched.use_tls) body.use_tls = cfg.use_tls
+      return JSON.stringify(body)
     }
-    case "wecom":
-      return JSON.stringify({ webhook_url: cfg.webhook_url })
+    case "wecom": {
+      const body: Record<string, unknown> = {}
+      if (!partial || touched.webhook_url) {
+        body.webhook_url = requiredText(cfg.webhook_url, "Webhook URL")
+      }
+      return JSON.stringify(body)
+    }
     case "feishu": {
-      const body: Record<string, unknown> = { webhook_url: cfg.webhook_url }
-      if (cfg.secret) body.secret = cfg.secret
+      const body: Record<string, unknown> = {}
+      if (!partial || touched.webhook_url) {
+        body.webhook_url = requiredText(cfg.webhook_url, "Webhook URL")
+      }
+      if (!partial || touched.secret) body.secret = cfg.secret.trim()
       return JSON.stringify(body)
     }
     default:
@@ -199,6 +235,7 @@ export function NotificationFormDialog({
   channel,
 }: NotificationFormDialogProps) {
   const [form, setForm] = useState<FormState>(() => initialState(channel))
+  const [cfgTouched, setCfgTouched] = useState<ConfigTouched>({})
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const refresh = useTriggerRefresh()
@@ -207,6 +244,7 @@ export function NotificationFormDialog({
   useEffect(() => {
     if (open) {
       setForm(initialState(channel))
+      setCfgTouched({})
       setError(null)
     }
   }, [open, channel])
@@ -215,6 +253,13 @@ export function NotificationFormDialog({
 
   function updateCfg(patch: Partial<ConfigState>) {
     setForm((f) => ({ ...f, cfg: { ...f.cfg, ...patch } }))
+    setCfgTouched((prev) => {
+      const next = { ...prev }
+      for (const key of Object.keys(patch) as Array<keyof ConfigState>) {
+        next[key] = true
+      }
+      return next
+    })
   }
 
   function addSub() {
@@ -252,19 +297,10 @@ export function NotificationFormDialog({
       }
 
       let configJSON = ""
-      const requireConfig = !isEdit
-      // 判断 cfg 是否填了关键字段
-      const hasConfigInput = (() => {
-        switch (form.type) {
-          case "email":
-            return !!(form.cfg.host || form.cfg.from || form.cfg.to)
-          default:
-            return !!form.cfg.webhook_url
-        }
-      })()
-
-      if (requireConfig || hasConfigInput) {
+      if (!isEdit) {
         configJSON = buildConfigByType(form.type, form.cfg)
+      } else if (hasTouchedConfig(cfgTouched)) {
+        configJSON = buildConfigByType(form.type, form.cfg, cfgTouched, true)
       }
 
       const subscriptions = JSON.stringify(

@@ -134,6 +134,11 @@ export function GatewayStatusDashboard() {
   const totalGroups = gateway?.total_groups ?? 0
   const aliveGroups = gateway?.alive_groups ?? 0
   const deadGroups = gateway?.dead_groups ?? 0
+  const zeroBalanceGroups = gateway?.zero_balance_groups ?? 0
+  const rateLimitedGroups = gateway?.rate_limited_groups ?? 0
+  const forbiddenGroups = gateway?.forbidden_groups ?? 0
+  const nonGenerationGroups = gateway?.non_generation_groups ?? 0
+  const errorGroups = gateway?.error_groups ?? 0
   const unknownGroups = gateway?.unknown_groups ?? 0
   const healthPct = pct(aliveGroups, totalGroups)
   const dailyLimit = keys
@@ -146,7 +151,18 @@ export function GatewayStatusDashboard() {
     .filter((group) => group.enabled !== false)
     .slice()
     .sort((a, b) => {
-      const statusRank = (status: string) => (status === "alive" ? 0 : status === "unknown" ? 1 : 2)
+      const statusRank = (status: string) =>
+        status === "alive"
+          ? 0
+          : status === "unknown"
+            ? 1
+            : status === "rate_limited"
+              ? 2
+              : ["dead", "server_error", "timeout", "network_error", "upstream_error"].includes(status)
+                ? 3
+                : ["zero_balance", "forbidden", "auth_failed", "model_error", "invalid_request", "non_generation"].includes(status)
+                  ? 4
+                  : 5
       return (
         statusRank(a.status) - statusRank(b.status) ||
         (b.priority || 0) - (a.priority || 0) ||
@@ -159,6 +175,11 @@ export function GatewayStatusDashboard() {
   const statusData = [
     { label: "存活", name: "alive", value: aliveGroups, fill: "var(--success)" },
     { label: "死亡", name: "dead", value: deadGroups, fill: "var(--danger)" },
+    { label: "零余额", name: "zero_balance", value: zeroBalanceGroups, fill: "var(--warning)" },
+    { label: "限流", name: "rate_limited", value: rateLimitedGroups, fill: "var(--warning)" },
+    { label: "403", name: "forbidden", value: forbiddenGroups, fill: "var(--danger)" },
+    { label: "非生成", name: "non_generation", value: nonGenerationGroups, fill: "var(--warning)" },
+    { label: "其它异常", name: "error", value: errorGroups, fill: "var(--danger)" },
     { label: "未知", name: "unknown", value: unknownGroups, fill: "var(--muted-foreground)" },
   ].filter((item) => item.value > 0)
 
@@ -211,9 +232,13 @@ export function GatewayStatusDashboard() {
           <Metric
             label="可用渠道"
             value={`${aliveGroups}/${totalGroups}`}
-            sub={deadGroups > 0 ? `${deadGroups} 个死亡等待复活检测` : "当前无死亡分组"}
+            sub={
+              deadGroups > 0 || zeroBalanceGroups > 0 || rateLimitedGroups > 0 || forbiddenGroups > 0 || nonGenerationGroups > 0 || errorGroups > 0
+                ? `${deadGroups} 死亡 · ${zeroBalanceGroups} 零余额 · ${rateLimitedGroups} 限流 · ${forbiddenGroups} 403 · ${nonGenerationGroups} 非生成 · ${errorGroups} 其它`
+                : "当前无明确失败分组"
+            }
             icon={RadioTower}
-            tone={deadGroups > 0 ? "warning" : "success"}
+            tone={deadGroups > 0 || zeroBalanceGroups > 0 || rateLimitedGroups > 0 || forbiddenGroups > 0 || nonGenerationGroups > 0 || errorGroups > 0 ? "warning" : "success"}
           />
           <Metric
             label="最便宜可用"
@@ -268,6 +293,22 @@ export function GatewayStatusDashboard() {
                   <p className="flex justify-between gap-2">
                     <span className="text-muted-foreground">死亡</span>
                     <span className="font-semibold text-danger">{deadGroups}</span>
+                  </p>
+                  <p className="flex justify-between gap-2">
+                    <span className="text-muted-foreground">零余额</span>
+                    <span className="font-semibold text-warning">{zeroBalanceGroups}</span>
+                  </p>
+                  <p className="flex justify-between gap-2">
+                    <span className="text-muted-foreground">限流</span>
+                    <span className="font-semibold text-warning">{rateLimitedGroups}</span>
+                  </p>
+                  <p className="flex justify-between gap-2">
+                    <span className="text-muted-foreground">403 / 非生成</span>
+                    <span className="font-semibold text-warning">{forbiddenGroups + nonGenerationGroups}</span>
+                  </p>
+                  <p className="flex justify-between gap-2">
+                    <span className="text-muted-foreground">其它异常</span>
+                    <span className="font-semibold text-danger">{errorGroups}</span>
                   </p>
                   <p className="flex justify-between gap-2">
                     <span className="text-muted-foreground">未知</span>
@@ -456,6 +497,10 @@ export function GatewayStatusDashboard() {
                           ? "bg-success"
                           : group.status === "dead"
                             ? "bg-danger"
+                            : ["zero_balance", "rate_limited", "non_generation", "timeout", "server_error"].includes(group.status)
+                              ? "bg-warning"
+                              : ["forbidden", "auth_failed", "network_error", "upstream_error", "model_error", "invalid_request"].includes(group.status)
+                                ? "bg-danger"
                             : "bg-muted-foreground/40",
                       )}
                     />

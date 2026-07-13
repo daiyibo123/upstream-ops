@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"mime"
+	"net"
 	"net/smtp"
 	"strings"
 	"time"
@@ -36,6 +37,17 @@ func newEmail(raw string) (*email, error) {
 	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
 		return nil, err
 	}
+	cfg.Host = strings.TrimSpace(cfg.Host)
+	cfg.Username = strings.TrimSpace(cfg.Username)
+	cfg.From = strings.TrimSpace(cfg.From)
+	to := cfg.To[:0]
+	for _, rcpt := range cfg.To {
+		rcpt = strings.TrimSpace(rcpt)
+		if rcpt != "" {
+			to = append(to, rcpt)
+		}
+	}
+	cfg.To = to
 	if cfg.Host == "" || cfg.Port == 0 || cfg.From == "" || len(cfg.To) == 0 {
 		return nil, errors.New("email config requires host/port/from/to")
 	}
@@ -46,18 +58,21 @@ func (e *email) Type() storage.NotificationChannelType { return storage.NotifyEm
 
 func (e *email) Send(ctx context.Context, msg Message) error {
 	addr := fmt.Sprintf("%s:%d", e.cfg.Host, e.cfg.Port)
-	auth := smtp.PlainAuth("", e.cfg.Username, e.cfg.Password, e.cfg.Host)
+	var auth smtp.Auth
+	if e.cfg.Username != "" || e.cfg.Password != "" {
+		auth = smtp.PlainAuth("", e.cfg.Username, e.cfg.Password, e.cfg.Host)
+	}
 
 	body := buildEmailBody(e.cfg.From, e.cfg.To, msg)
 
 	// 简单 deadline，避免完全阻塞调度。
 	done := make(chan error, 1)
 	go func() {
-		if e.cfg.UseTLS {
+		if e.cfg.Port == 465 {
 			done <- sendTLS(addr, e.cfg.Host, auth, e.cfg.From, e.cfg.To, []byte(body))
 			return
 		}
-		done <- smtp.SendMail(addr, auth, e.cfg.From, e.cfg.To, []byte(body))
+		done <- sendSMTP(addr, e.cfg.Host, auth, e.cfg.From, e.cfg.To, []byte(body), e.cfg.UseTLS)
 	}()
 
 	select {
@@ -222,7 +237,8 @@ func emailEventLabel(event storage.NotificationEvent) string {
 // sendTLS 通过 SMTPS（隐式 TLS，常见于 465）发送邮件。
 func sendTLS(addr, host string, auth smtp.Auth, from string, to []string, body []byte) error {
 	tlsConfig := &tls.Config{ServerName: host}
-	conn, err := tls.Dial("tcp", addr, tlsConfig)
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsConfig)
 	if err != nil {
 		return fmt.Errorf("smtp tls dial: %w", err)
 	}
@@ -234,6 +250,38 @@ func sendTLS(addr, host string, auth smtp.Auth, from string, to []string, body [
 	}
 	defer client.Quit()
 
+	return sendWithSMTPClient(client, auth, from, to, body)
+}
+
+// sendSMTP 通过普通 SMTP 发送；服务端支持 STARTTLS 时自动升级。
+// requireStartTLS=true 时如果服务端不支持 STARTTLS 会直接报错，用于兼容用户把
+// 587 端口理解成“开启 TLS”的常见配置方式。
+func sendSMTP(addr, host string, auth smtp.Auth, from string, to []string, body []byte, requireStartTLS bool) error {
+	dialer := &net.Dialer{Timeout: 15 * time.Second}
+	conn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("smtp dial: %w", err)
+	}
+	defer conn.Close()
+
+	client, err := smtp.NewClient(conn, host)
+	if err != nil {
+		return fmt.Errorf("smtp new client: %w", err)
+	}
+	defer client.Quit()
+
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		if err := client.StartTLS(&tls.Config{ServerName: host}); err != nil {
+			return fmt.Errorf("smtp starttls: %w", err)
+		}
+	} else if requireStartTLS {
+		return errors.New("smtp server does not support STARTTLS")
+	}
+
+	return sendWithSMTPClient(client, auth, from, to, body)
+}
+
+func sendWithSMTPClient(client *smtp.Client, auth smtp.Auth, from string, to []string, body []byte) error {
 	if auth != nil {
 		if err := client.Auth(auth); err != nil {
 			return fmt.Errorf("smtp auth: %w", err)

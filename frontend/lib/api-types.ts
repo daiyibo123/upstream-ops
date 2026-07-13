@@ -206,6 +206,9 @@ export interface DashboardGatewayKey {
   today_tokens: number
   total_tokens: number
   cost_per_million: number
+  balance_limit: number
+  concurrency_limit: number
+  balance_remaining: number
   today_cost: number
   total_cost: number
   expires_at?: string | null
@@ -218,6 +221,11 @@ export interface DashboardGatewayStat {
   total_groups: number
   alive_groups: number
   dead_groups: number
+  zero_balance_groups: number
+  rate_limited_groups: number
+  forbidden_groups: number
+  non_generation_groups: number
+  error_groups: number
   unknown_groups: number
   today_tokens: number
   total_tokens: number
@@ -294,6 +302,7 @@ export interface SystemSchedulerRetentionConfig {
   balanceSnapshotsDays: number
   notificationLogsDays: number
   announcementsDays: number
+  usageLogsDays: number
 }
 
 export interface SystemSchedulerConfig {
@@ -515,6 +524,9 @@ export interface GatewayKey {
   today_tokens: number
   total_tokens: number
   cost_per_million: number
+  balance_limit: number
+  concurrency_limit: number
+  balance_remaining: number
   today_cost: number
   total_cost: number
   usage_date?: string
@@ -529,11 +541,26 @@ export interface GatewayKeyReveal {
   key: string
 }
 
+export interface GatewayKeyUsage {
+  id: number
+  name: string
+  key_prefix: string
+  today_tokens: number
+  today_cost: number
+  total_tokens: number
+  total_cost: number
+  cost_per_million: number
+  balance_limit: number
+  balance_remaining: number
+  usage_date?: string
+}
+
 export interface PublicGatewayKey {
   id: number
   enabled: boolean
   name: string
   key_prefix: string
+  masked_key?: string
   password_required: boolean
   password_hint?: string
   expires_at?: string | null
@@ -557,7 +584,23 @@ export interface UpstreamGroupKey {
   charity?: boolean
   enabled: boolean
   upstream_key_id: number
-  status: "unknown" | "alive" | "dead" | "disabled" | string
+  status:
+    | "unknown"
+    | "alive"
+    | "dead"
+    | "zero_balance"
+    | "rate_limited"
+    | "forbidden"
+    | "non_generation"
+    | "auth_failed"
+    | "timeout"
+    | "network_error"
+    | "upstream_error"
+    | "model_error"
+    | "invalid_request"
+    | "server_error"
+    | "disabled"
+    | string
   concurrency_limit: number
   failure_count: number
   prompt_tokens: number
@@ -626,6 +669,17 @@ export interface GatewayHealthResult {
   checked: number
   alive: number
   dead: number
+  zero_balance: number
+  rate_limited: number
+  forbidden: number
+  non_generation: number
+  auth_failed: number
+  timeout: number
+  network_error: number
+  upstream_error: number
+  model_error: number
+  invalid_request: number
+  server_error: number
   batch_size: number
   batches: number
   items: Array<{
@@ -636,6 +690,7 @@ export interface GatewayHealthResult {
     group_name: string
     ratio: number
     status: string
+    error_type?: string
     latency_ms: number
     error?: string
     checked_at?: string | null

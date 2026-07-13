@@ -149,13 +149,13 @@ export function DockBar() {
       icon: LayoutDashboard,
       label: "监控面板",
       path: "/",
-      gradient: "from-sky-400 via-blue-500 to-blue-600",
+      gradient: "from-brand/90 via-brand to-primary",
     },
     {
       icon: Plus,
       label: "添加渠道",
       onAction: openAdd,
-      gradient: "from-emerald-400 via-emerald-500 to-teal-600",
+      gradient: "from-success/90 via-success to-primary",
     },
     {
       icon: Settings,

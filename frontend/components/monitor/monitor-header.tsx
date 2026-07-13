@@ -106,7 +106,7 @@ export function MonitorHeader() {
                     href={updateURL || "https://github.com/daiyibo123/upstream-ops"}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="ml-2 font-medium text-emerald-600 underline-offset-2 hover:text-emerald-700 hover:underline"
+                    className="ml-2 font-medium text-success underline-offset-2 hover:text-success hover:underline"
                   >
                     有新版本 {latestVersion}
                   </a>
