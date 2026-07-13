@@ -1484,7 +1484,7 @@ func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamG
 	if normalizeClientFormat(candidate.ClientFormat) == "claude" && request.ResponseMode == "claude" {
 		return request.alt()
 	}
-	if request.ResponseMode == "responses" && request.Stream && normalizeClientFormat(candidate.ClientFormat) != "claude" {
+	if shouldPreferChatBridgeForResponsesStream(request, candidate) {
 		return request.altWithFallbackToSelf()
 	}
 	switch normalizeUpstreamRequestMode(candidate.RequestMode) {
@@ -1493,6 +1493,18 @@ func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamG
 	default:
 		return request
 	}
+}
+
+func shouldPreferChatBridgeForResponsesStream(request normalizedRequest, candidate *storage.UpstreamGroupKey) bool {
+	// Codex 直连通常发 /v1/responses + stream=true，但经过不同路由/代理时
+	// User-Agent / OpenAI-Beta 等头不稳定；用头判断会漏掉"不开路由"场景。
+	// sub2api / NewAPI 这类 OpenAI 兼容上游最稳定的是 /v1/chat/completions，
+	// 所以只要 Responses 流可以生成 chat 兼容体，就先走 chat 桥接，再在 chat
+	// 端点缺失时回退原生 Responses。Claude 上游保留原生 Messages/Responses 路径。
+	return request.ResponseMode == "responses" &&
+		request.Stream &&
+		request.hasAlt() &&
+		normalizeClientFormat(candidate.ClientFormat) != "claude"
 }
 
 // applyUpstreamAuthHeaders sets the common API headers and the headers xAI
@@ -1554,20 +1566,6 @@ func (r normalizedRequest) altWithFallbackToSelf() normalizedRequest {
 	out.AltMode = origMode
 	out.AltStream = origStream
 	return out
-}
-
-func looksLikeCodexClient(header http.Header) bool {
-	if header == nil {
-		return false
-	}
-	text := strings.ToLower(strings.Join([]string{
-		header.Get("User-Agent"),
-		header.Get("OpenAI-Beta"),
-		header.Get("Originator"),
-		header.Get("X-Stainless-Package-Version"),
-		header.Get("X-Stainless-Runtime"),
-	}, " "))
-	return strings.Contains(text, "codex") || strings.Contains(text, "responses=experimental")
 }
 
 func (s *Service) attemptStream(
@@ -1773,6 +1771,12 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		case "responses_from_chat":
 			// 降级路径：客户端发的是 responses，但这个上游只支持 chat，我们已把请求转成
 			// chat/completions 发出去，此处再把上游的 chat SSE 流转回 responses 事件给客户端。
+			// 有些中转会把 chat 路径又路由到 responses 实现，返回体已经是 responses SSE；
+			// 这时必须按原生 responses 流处理，否则会把 delta 当成未知 chat chunk 丢掉。
+			if bufferedSSELooksLikeResponses(buffered) {
+				usage, err := streamRawSSE(w, buffered, reader, "responses")
+				return false, usage, err
+			}
 			usage, err := streamChatAsResponsesEvents(w, buffered, reader)
 			return false, usage, err
 		}
@@ -2006,6 +2010,9 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 	req := healthGenerationProbeRequest(model)
 	req = requestForCandidate(req, key)
 	status, _, body, err = s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
+	if fallback, _, ok := healthProbeFallbackRequest(req, status, body, err); ok {
+		status, _, body, err = s.requestHealthProbeCandidate(ctx, fallback, key, healthProbeTimeout)
+	}
 	latencyMS := time.Since(start).Milliseconds()
 	if err != nil {
 		return status, body, latencyMS, err
@@ -2017,6 +2024,25 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 		return status, body, latencyMS, fmt.Errorf("upstream returned non-generation payload: %s", truncateBody(body, 240))
 	}
 	return status, body, latencyMS, nil
+}
+
+func healthProbeFallbackRequest(request normalizedRequest, status int, body []byte, err error) (normalizedRequest, string, bool) {
+	if !request.hasAlt() {
+		return request, "", false
+	}
+	if err != nil || status < 200 || status >= 300 {
+		return fallbackRequestAfterFailure(request, healthProbeError(status, body, err).Error())
+	}
+	if request.ResponseMode != "responses_from_chat" {
+		return request, "", false
+	}
+	if isUpstreamErrorBody(body) {
+		return fallbackRequestAfterFailure(request, fmt.Sprintf("upstream returned error payload: %s", truncateBody(body, 240)))
+	}
+	if !looksLikeHealthGenerationSuccess(body) {
+		return fallbackRequestAfterFailure(request, fmt.Sprintf("upstream returned non-generation payload: %s", truncateBody(body, 240)))
+	}
+	return request, "", false
 }
 
 // healthProbeClaude 用 Anthropic Messages 格式测活 claude 类型渠道。
@@ -2136,7 +2162,7 @@ func healthGenerationProbeRequest(model string) normalizedRequest {
 		Stream:       true,
 		AltPath:      "/v1/chat/completions",
 		AltBody:      chatBody,
-		AltMode:      "raw",
+		AltMode:      "responses_from_chat",
 		AltStream:    true,
 	}
 }
@@ -3199,7 +3225,12 @@ func fallbackRequestAfterFailure(request normalizedRequest, errMsg string) (norm
 	if !request.hasAlt() || request.ResponseMode == "raw" {
 		return request, "", false
 	}
-	if request.ResponseMode == "responses_from_chat" && looksLikeEndpointMissingError(errMsg) {
+	// chat 桥接失败时，先尝试回到原生 Responses，再决定是否换候选：
+	// 1) chat 端点不存在/路由不通；
+	// 2) chat 端点对该模型/兼容体不支持；
+	// 3) 上游直接返回了 responses 语义的错误。
+	if request.ResponseMode == "responses_from_chat" &&
+		(looksLikeEndpointMissingError(errMsg) || looksLikeUnsupportedModelError(errMsg) || looksLikeResponsesEndpointError(errMsg)) {
 		return request.alt(), "upstream native responses fallback", true
 	}
 	// responses 模式且备有 chat 回退：只要错误像"上游不支持 responses 端点"，就自动降级到
@@ -4961,6 +4992,42 @@ func bufferedSSELooksLikeChatCompletion(events []sseEvent) bool {
 	return false
 }
 
+func bufferedSSELooksLikeResponses(events []sseEvent) bool {
+	for _, ev := range events {
+		if sseEventLooksLikeResponses(ev) {
+			return true
+		}
+	}
+	return false
+}
+
+func sseEventLooksLikeResponses(ev sseEvent) bool {
+	if strings.HasPrefix(sseEventType(ev), "response.") {
+		return true
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(ev.Event)), "response.") {
+		return true
+	}
+	data := strings.TrimSpace(ev.Data)
+	if data == "" || data == "[DONE]" {
+		return false
+	}
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		return false
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(stringValue(raw["type"]))), "response.") {
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(stringValue(raw["object"])), "response") {
+		return true
+	}
+	if _, ok := raw["response"].(map[string]any); ok {
+		return true
+	}
+	return false
+}
+
 func sseEventLooksLikeChatCompletion(ev sseEvent) bool {
 	data := strings.TrimSpace(ev.Data)
 	if data == "" || data == "[DONE]" {
@@ -6351,6 +6418,11 @@ func shouldRetryStatus(status int) bool {
 }
 
 func shouldRetryUpstreamStatus(status int, msg string) bool {
+	// 模型不存在/无权限这类错误，哪怕上游塞进了 invalid_request_error 或 422，
+	// 也应该继续换下一个候选，而不是把第一次撞到的渠道当成“客户端参数错”。
+	if looksLikeUnsupportedModelError(msg) {
+		return true
+	}
 	if !shouldRetryStatus(status) {
 		return false
 	}
@@ -6393,16 +6465,48 @@ func looksLikeUnsupportedModelError(msg string) bool {
 	s := strings.ToLower(msg)
 	return (strings.Contains(s, "model") || strings.Contains(s, "模型") || strings.Contains(s, "channel") || strings.Contains(s, "渠道")) &&
 		(strings.Contains(s, "not found") ||
+			strings.Contains(s, "model_not_found") ||
+			strings.Contains(s, "does not exist") ||
+			strings.Contains(s, "doesn't exist") ||
+			strings.Contains(s, "not exist") ||
+			strings.Contains(s, "no such model") ||
 			strings.Contains(s, "not support") ||
 			strings.Contains(s, "does not support") ||
 			strings.Contains(s, "unsupported") ||
+			strings.Contains(s, "model_not_supported") ||
+			strings.Contains(s, "model_not_available") ||
+			strings.Contains(s, "unsupported_model") ||
+			strings.Contains(s, "invalid model") ||
+			strings.Contains(s, "invalid_model") ||
+			strings.Contains(s, "unknown model") ||
+			strings.Contains(s, "model is invalid") ||
+			strings.Contains(s, "model invalid") ||
 			strings.Contains(s, "unavailable") ||
 			strings.Contains(s, "not available") ||
 			strings.Contains(s, "no available") ||
+			strings.Contains(s, "do not have access") ||
+			strings.Contains(s, "don't have access") ||
+			strings.Contains(s, "not have access") ||
+			strings.Contains(s, "no access") ||
+			strings.Contains(s, "without access") ||
+			strings.Contains(s, "not enabled") ||
+			strings.Contains(s, "not allowed") ||
+			strings.Contains(s, "not permitted") ||
+			strings.Contains(s, "permission") ||
 			strings.Contains(s, "不存在") ||
 			strings.Contains(s, "不支持") ||
 			strings.Contains(s, "不可用") ||
-			strings.Contains(s, "无可用"))
+			strings.Contains(s, "无可用") ||
+			strings.Contains(s, "没有可用") ||
+			strings.Contains(s, "没有权限") ||
+			strings.Contains(s, "无权限") ||
+			strings.Contains(s, "无访问权限") ||
+			strings.Contains(s, "没有访问权限") ||
+			strings.Contains(s, "无权访问") ||
+			strings.Contains(s, "不能访问") ||
+			strings.Contains(s, "无法访问") ||
+			strings.Contains(s, "未开通") ||
+			strings.Contains(s, "未开放"))
 }
 
 func truncateBody(body []byte, max int) string {

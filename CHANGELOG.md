@@ -8,6 +8,19 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, and the Dockerfile version argument before its matching Git tag is pushed.
 
+## v0.22.2 - 2026-07-13
+
+### Fixed
+
+- Fixed direct Codex `/v1/responses` streaming without ccswitch routing: OpenAI-compatible upstreams now select the Chat Completions compatibility bridge by protocol rather than unreliable client headers, while retaining native Responses fallback when Chat is unavailable.
+- Hardened Responses stream compatibility for direct URL use: Chat SSE and non-SSE JSON replies are converted into complete Responses lifecycle events; upstream EOF, bare `[DONE]`, and malformed terminal streams are closed with `response.completed` plus `[DONE]` rather than a premature disconnect.
+- Added failover for model-not-found, unsupported-model, and model-access-denied upstream responses, so a requested model such as `gpt-5.6` automatically proceeds to the next eligible channel.
+- Restored one-click health checks to OpenAI-format enabled groups only, preventing Claude/Grok formats from being tested with an incompatible probe.
+
+### Changed
+
+- Preserved request affinity and upstream cache-related payload fields through gateway forwarding so repeated Codex conversations remain pinned to the same upstream where possible and do not lose provider-side prompt-cache eligibility.
+
 ## v0.22.1 - 2026-07-13
 
 ### Fixed

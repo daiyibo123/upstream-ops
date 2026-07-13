@@ -672,6 +672,99 @@ func TestProxyFailsOverOnUnsupportedModelBadRequest(t *testing.T) {
 	}
 }
 
+func TestProxyFailsOverOnOpenAIModelAccessBadRequest(t *testing.T) {
+	var badHits int
+	badUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		badHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"The model gpt-5.6 does not exist or you do not have access to it.","type":"invalid_request_error","param":"model","code":"model_not_found"}}`))
+	}))
+	defer badUpstream.Close()
+
+	var liveHits int
+	liveUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		liveHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_live_56","model":"gpt-5.6","output_text":"ok","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`))
+	}))
+	defer liveUpstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("5", 32))
+	badChannel := &storage.Channel{Name: "bad-5.6", Type: storage.ChannelTypeSub2API, SiteURL: badUpstream.URL, MonitorEnabled: true}
+	liveChannel := &storage.Channel{Name: "live-5.6", Type: storage.ChannelTypeSub2API, SiteURL: liveUpstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(badChannel); err != nil {
+		t.Fatalf("create bad channel: %v", err)
+	}
+	if err := env.channels.Create(liveChannel); err != nil {
+		t.Fatalf("create live channel: %v", err)
+	}
+	badCipher, err := env.cipher.Encrypt("sk-bad-56")
+	if err != nil {
+		t.Fatalf("encrypt bad key: %v", err)
+	}
+	liveCipher, err := env.cipher.Encrypt("sk-live-56")
+	if err != nil {
+		t.Fatalf("encrypt live key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: badChannel.ID, ChannelName: "bad-5.6", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "bad", GroupName: "bad", Ratio: 0.1, KeyCipher: badCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert bad group key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: liveChannel.ID, ChannelName: "live-5.6", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "live", GroupName: "live", Ratio: 0.2, KeyCipher: liveCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert live group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.6","input":"ping"}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "resp_live_56") {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if badHits != 1 || liveHits != 1 {
+		t.Fatalf("model access error did not fail over: bad=%d live=%d", badHits, liveHits)
+	}
+}
+
+func TestShouldRetryUpstreamStatusTreatsModelAccessAsRetryable(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			name:   "openai invalid request model access",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"message":"The model gpt-5.6 does not exist or you do not have access to it.","type":"invalid_request_error","param":"model","code":"model_not_found"}}`,
+		},
+		{
+			name:   "unprocessable unsupported model",
+			status: http.StatusUnprocessableEntity,
+			body:   `{"error":{"message":"model gpt-5.6 is not enabled for this channel","type":"invalid_request_error"}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !shouldRetryUpstreamStatus(tc.status, tc.body) {
+				t.Fatalf("status %d body %s should fail over", tc.status, tc.body)
+			}
+		})
+	}
+
+	if shouldRetryUpstreamStatus(http.StatusBadRequest, `{"error":{"message":"missing required field: model","type":"invalid_request_error"}}`) {
+		t.Fatal("plain client request validation error should not fail over")
+	}
+}
+
 func TestProxyConcurrentRequestsFailOverAndRecordUsage(t *testing.T) {
 	var deadHits int64
 	deadUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -874,14 +967,19 @@ func TestHealthProbeRequiresGenerationSuccess(t *testing.T) {
 	}
 }
 
-func TestHealthProbeUsesStreamingOpenAIRequest(t *testing.T) {
+func TestHealthProbeFallsBackFromChatBridgeToStreamingOpenAIRequest(t *testing.T) {
 	var seen map[string]any
+	var chatHits, responsesHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/models":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test"}]}`))
+		case "/v1/chat/completions":
+			chatHits++
+			http.NotFound(w, r)
 		case "/v1/responses":
+			responsesHits++
 			if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
 				t.Errorf("decode response probe body: %v", err)
 			}
@@ -916,6 +1014,9 @@ func TestHealthProbeUsesStreamingOpenAIRequest(t *testing.T) {
 	status, _, _, err := env.svc.healthProbeCandidate(context.Background(), group)
 	if err != nil || status != http.StatusOK {
 		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if chatHits != 1 || responsesHits != 1 {
+		t.Fatalf("health probe should try chat bridge then native responses fallback, chat=%d responses=%d", chatHits, responsesHits)
 	}
 	if seen["stream"] != true || seen["max_output_tokens"] != float64(1) {
 		t.Fatalf("probe body = %#v", seen)
@@ -1654,9 +1755,9 @@ func TestProxyConvertsChatCompletionFromResponsesEndpoint(t *testing.T) {
 	}
 }
 
-// TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses 覆盖 Codex 直连的真实场景：
+// TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses 覆盖不开路由直连的真实场景：
 // 流式 /v1/responses 打到只支持 chat 的上游，网关降级到 chat 流并把 chat chunk 转回
-// responses SSE 事件，客户端最终能收到 response.completed。
+// responses SSE 事件。即使请求头里没有 Codex 特征，客户端最终也能收到 response.completed。
 func TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
 	var responsesHits, chatHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1712,9 +1813,14 @@ func TestProxyStreamFallsBackToChatWhenUpstreamLacksResponses(t *testing.T) {
 	}
 }
 
-func TestProxyConvertsChatSSEFromResponsesEndpointForCodexDirect(t *testing.T) {
-	var responsesHits int
+func TestResponsesStreamChatBridgeFallsBackToNativeResponses(t *testing.T) {
+	var responsesHits, chatHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/chat/completions" {
+			chatHits++
+			http.NotFound(w, r)
+			return
+		}
 		if r.URL.Path != "/v1/responses" {
 			http.NotFound(w, r)
 			return
@@ -1754,8 +1860,8 @@ func TestProxyConvertsChatSSEFromResponsesEndpointForCodexDirect(t *testing.T) {
 		t.Fatalf("proxy request: %v", err)
 	}
 	out := rec.Body.String()
-	if responsesHits != 1 {
-		t.Fatalf("responses hits = %d, want 1", responsesHits)
+	if chatHits != 1 || responsesHits != 1 {
+		t.Fatalf("expected chat bridge then native fallback, chat=%d responses=%d", chatHits, responsesHits)
 	}
 	if strings.Contains(out, "chat.completion.chunk") {
 		t.Fatalf("chat chunks must not be passed to Codex responses stream: %s", out)
@@ -1765,7 +1871,7 @@ func TestProxyConvertsChatSSEFromResponsesEndpointForCodexDirect(t *testing.T) {
 	}
 }
 
-func TestCodexResponsesStreamPrefersChatBridge(t *testing.T) {
+func TestResponsesStreamPrefersChatBridgeWithoutCodexHeaders(t *testing.T) {
 	var responsesHits, chatHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -1816,10 +1922,31 @@ func TestCodexResponsesStreamPrefersChatBridge(t *testing.T) {
 	}
 	out := rec.Body.String()
 	if !strings.Contains(out, "response.output_item.added") || !strings.Contains(out, "response.output_text.done") || !strings.Contains(out, "response.completed") || !strings.Contains(out, "data: [DONE]") {
-		t.Fatalf("Codex responses bridge missing lifecycle events: %s", out)
+		t.Fatalf("responses bridge missing lifecycle events: %s", out)
 	}
 	if got := rec.Header().Get("X-Accel-Buffering"); got != "no" {
 		t.Fatalf("X-Accel-Buffering = %q, want no", got)
+	}
+}
+
+func TestResponsesStreamChoosesChatBridgeByProtocolNotHeaders(t *testing.T) {
+	req := normalizedRequest{
+		Path:         "/v1/responses",
+		Body:         []byte(`{"model":"gpt-test","input":"ping","stream":true}`),
+		ResponseMode: "responses",
+		Stream:       true,
+		Header:       make(http.Header),
+		AltPath:      "/v1/chat/completions",
+		AltBody:      []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"ping"}],"stream":true}`),
+		AltMode:      "responses_from_chat",
+		AltStream:    true,
+	}
+	got := requestForCandidate(req, &storage.UpstreamGroupKey{ClientFormat: "openai", RequestMode: "responses"})
+	if got.Path != "/v1/chat/completions" || got.ResponseMode != "responses_from_chat" || !got.Stream {
+		t.Fatalf("responses stream should choose chat bridge without Codex headers, got path=%q mode=%q stream=%v", got.Path, got.ResponseMode, got.Stream)
+	}
+	if got.AltPath != req.Path || got.AltMode != "responses" || string(got.AltBody) != string(req.Body) {
+		t.Fatalf("chat bridge must retain native responses fallback, altPath=%q altMode=%q altBody=%s", got.AltPath, got.AltMode, string(got.AltBody))
 	}
 }
 
