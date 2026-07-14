@@ -1845,8 +1845,8 @@ func TestNormalizeManualAPIBaseURLTrimsEndpointAndRejectsAdminURL(t *testing.T) 
 	if err != nil {
 		t.Fatalf("normalize manual base URL: %v", err)
 	}
-	if got != "https://relay.example.com/v1" {
-		t.Fatalf("normalized URL = %q, want https://relay.example.com/v1", got)
+	if got != "https://relay.example.com" {
+		t.Fatalf("normalized URL = %q, want https://relay.example.com", got)
 	}
 	if _, err := normalizeManualAPIBaseURL("https://relay.example.com/admin"); err == nil {
 		t.Fatal("expected admin URL to be rejected")

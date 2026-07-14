@@ -1221,7 +1221,7 @@ func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key
 			if mode == "chat" {
 				request = request.alt()
 			}
-			status, _, body, probeErr := s.requestHealthProbeCandidate(probeCtx, request, key, healthProbeTimeout)
+			status, _, body, probeErr := s.requestHealthProbeCandidate(ctx, request, key, healthProbeTimeout)
 			if !healthProbeSucceeded(status, body, probeErr) {
 				continue
 			}
@@ -1605,19 +1605,10 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 	// use their own request contracts and remain available through per-group
 	// testing, so they cannot be accidentally probed as an OpenAI model.
 	list = filterOpenAIHealthGroups(list)
-	ids := make([]uint, 0, len(list))
-	for i := range list {
-		ids = append(ids, list[i].ID)
-	}
-	// The protocol is a capability of the upstream, not an operator setting.
-	// Refresh it before every GPT batch test so legacy records are corrected
-	// even when the user has not run a group synchronization recently.
-	s.detectGroupRequestModes(ids)
-	for i := range list {
-		if refreshed, findErr := s.groupKeys.FindByID(list[i].ID); findErr == nil && refreshed != nil {
-			list[i] = *refreshed
-		}
-	}
+	// The probe itself performs the protocol fallback and persists the winning
+	// Responses/Chat mode. Keeping that work inside the one real health request
+	// avoids sending duplicate probes before every batch while still correcting
+	// legacy records automatically.
 
 	batchSize := normalizeHealthProbeBatchSize(opts.BatchSize)
 	observer := progress.FromContext(ctx)
@@ -1927,9 +1918,6 @@ func (s *Service) TestGroupKey(id uint) (*HealthResultItem, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
-	if detected, detectErr := s.DetectGroupRequestMode(ctx, key.ID); detectErr == nil && detected != nil {
-		key = detected
-	}
 	result := s.testGroupKey(ctx, key)
 	return &result, nil
 }
@@ -2726,9 +2714,10 @@ func healthFailureStatus(status int, body []byte, err error) string {
 	case looksLikeForbiddenFailure(status, text):
 		return "forbidden"
 	case looksLikeAuthFailure(status, text):
-		// Keep the channels page to the five visible health states: a 401 is an
-		// access refusal just like a 403 and is filtered together with it.
-		return "forbidden"
+		// Persist 401 as a distinct authentication failure so its own upstream
+		// key can be disabled. The frontend intentionally renders this in the
+		// same 403-access-refused bucket, without poisoning sibling keys.
+		return "auth_failed"
 	case looksLikeUpstreamRoutingUnavailable(text):
 		return "upstream_error"
 	case looksLikeUnsupportedModelError(text):
@@ -2739,10 +2728,10 @@ func healthFailureStatus(status int, body []byte, err error) string {
 		return "non_generation"
 	case looksLikeTimeoutFailure(err, text):
 		return "timeout"
-	case looksLikeNetworkFailure(status, err, text):
-		return "network_error"
 	case looksLikeUpstreamErrorFailure(text):
 		return "upstream_error"
+	case looksLikeNetworkFailure(status, err, text):
+		return "network_error"
 	case status >= 500 && status < 600:
 		return "server_error"
 	case status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout:
@@ -2804,7 +2793,25 @@ func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.Upstr
 		return status, body, err
 	}
 	if fallback, _, ok := healthProbeFallbackRequest(req, status, body, err); ok {
-		status, _, body, err = s.requestHealthProbeCandidate(ctx, fallback, key, healthProbeTimeout)
+		originalStatus, originalBody, originalErr := status, body, err
+		fallbackStatus, _, fallbackBody, fallbackErr := s.requestHealthProbeCandidate(ctx, fallback, key, healthProbeTimeout)
+		if fallbackErr == nil && healthProbeSucceeded(fallbackStatus, fallbackBody, nil) {
+			// The health request is a real streamed generation probe. If its
+			// alternate protocol succeeds, remember that capability immediately
+			// so the next Codex request does not need to rediscover it.
+			mode := "responses"
+			if fallback.ResponseMode == "responses_from_chat" {
+				mode = "chat"
+			}
+			if normalizeUpstreamRequestMode(key.RequestMode) != mode {
+				_ = s.groupKeys.UpdateRequestMode(key.ID, mode)
+			}
+			return fallbackStatus, fallbackBody, nil
+		}
+		// Keep the original result when the alternate protocol also fails. That
+		// preserves meaningful statuses such as rate limit or non-generation
+		// instead of replacing them with a misleading 404 from the fallback URL.
+		return originalStatus, originalBody, originalErr
 	}
 	return status, body, err
 }
@@ -2852,6 +2859,14 @@ func healthProbeFallbackRequest(request normalizedRequest, status int, body []by
 	if !request.hasAlt() {
 		return request, "", false
 	}
+	// For a health probe, a native Responses endpoint that is missing, accepts
+	// the request but emits no generation, or rejects this representation can
+	// safely try the Chat-compatible probe. This is intentionally narrower than
+	// real request forwarding: a live Codex Responses request keeps its native
+	// payload and never silently loses reasoning/tool fields.
+	if request.ResponseMode == "responses" && shouldTryHealthChatProbe(status, body, err) {
+		return request.alt(), "health chat-completions compatibility", true
+	}
 	if err != nil || status < 200 || status >= 300 {
 		return fallbackRequestAfterFailure(request, healthProbeError(status, body, err).Error())
 	}
@@ -2865,6 +2880,27 @@ func healthProbeFallbackRequest(request normalizedRequest, status int, body []by
 		return fallbackRequestAfterFailure(request, fmt.Sprintf("upstream returned non-generation payload: %s", truncateBody(body, 240)))
 	}
 	return request, "", false
+}
+
+func shouldTryHealthChatProbe(status int, body []byte, err error) bool {
+	if err == nil && status >= http.StatusOK && status < http.StatusMultipleChoices && looksLikeHealthGenerationSuccess(body) {
+		return false
+	}
+	text := healthFailureText(body, err)
+	if isUpstreamErrorBody(body) &&
+		!looksLikeEndpointMissingError(text) &&
+		!looksLikeUnsupportedModelError(text) &&
+		!looksLikeClientRequestError(text) {
+		return false
+	}
+	classification := healthFailureStatus(status, body, err)
+	switch classification {
+	case "zero_balance", "rate_limited", "forbidden", "auth_failed", "timeout", "network_error", "upstream_error", "server_error":
+		return false
+	case "model_error", "invalid_request", "non_generation", "dead":
+		return true
+	}
+	return err == nil && status >= http.StatusOK && status < http.StatusMultipleChoices && !looksLikeHealthGenerationSuccess(body)
 }
 
 // healthProbeClaude 用 Anthropic Messages 格式测活 claude 类型渠道。
@@ -4610,11 +4646,11 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
-		if out[i].Ratio != out[j].Ratio {
-			return out[i].Ratio < out[j].Ratio
-		}
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
+		}
+		if out[i].Ratio != out[j].Ratio {
+			return out[i].Ratio < out[j].Ratio
 		}
 		if out[i].FailureCount != out[j].FailureCount {
 			return out[i].FailureCount < out[j].FailureCount
@@ -4924,11 +4960,11 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
-		if out[i].Ratio != out[j].Ratio {
-			return out[i].Ratio < out[j].Ratio
-		}
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
+		}
+		if out[i].Ratio != out[j].Ratio {
+			return out[i].Ratio < out[j].Ratio
 		}
 		if out[i].FailureCount != out[j].FailureCount {
 			return out[i].FailureCount < out[j].FailureCount

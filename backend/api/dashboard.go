@@ -461,11 +461,11 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 				stat.ZeroBalanceGroups++
 			case "rate_limited":
 				stat.RateLimitedGroups++
-			case "forbidden":
+			case "forbidden", "auth_failed":
 				stat.ForbiddenGroups++
 			case "non_generation":
 				stat.NonGenerationGroups++
-			case "auth_failed", "timeout", "network_error", "upstream_error", "model_error", "invalid_request", "server_error":
+			case "timeout", "network_error", "upstream_error", "model_error", "invalid_request", "server_error":
 				stat.ErrorGroups++
 			default:
 				stat.UnknownGroups++

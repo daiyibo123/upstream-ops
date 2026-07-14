@@ -14,7 +14,7 @@ Every release must update this file, `backend/global/version.go`, and the Docker
 
 - Improved automatic upstream protocol detection. OpenAI-format groups now probe native Responses and Chat Completions with a real low-token stream; Claude uses its native Messages contract and `x-api-key`; Grok uses its native OpenAI-compatible Chat contract.
 - When the economical `gpt-5.4` health probe and its fallback model are unavailable, the gateway now reads the upstream model list and probes one advertised text model. This prevents model-limited but healthy upstreams, including `gpt-5.6`-only relays, from being marked as failed merely because the default probe model is absent.
-- Protocol detection now runs after manual key creation or replacement, channel-format changes, group synchronization, and immediately before OpenAI batch health checks. Request protocol is no longer manually selectable.
+- Protocol detection now runs after manual key creation or replacement, channel-format changes, group synchronization, and within OpenAI batch health checks. Request protocol is no longer manually selectable.
 - Corrected dashboard health statistics to include OpenAI Chat-Completions compatibility groups as OpenAI channels, and split the former combined `403 / 非生成` metric into independent 403-rejection and non-generation counts.
 - Restored manual channel creation in Available Channels. A manually added channel’s API Keys dialog can now add a bound upstream Key directly, edit an existing Key, reset stale runtime failures, and re-detect the upstream protocol.
 
