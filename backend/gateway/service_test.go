@@ -1109,17 +1109,24 @@ func TestOrderCandidatesUsesBackupGroupWhenSameGroupKeyUnhealthy(t *testing.T) {
 }
 
 func TestApplyUpstreamAuthHeadersMatchesChannelFormat(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("a", 32))
 	openAIHeader := http.Header{}
-	applyUpstreamAuthHeaders(openAIHeader, &storage.UpstreamGroupKey{ClientFormat: "openai"}, " sk-openai ")
+	env.svc.applyUpstreamAuthHeaders(openAIHeader, &storage.UpstreamGroupKey{ClientFormat: "openai"}, " sk-openai ")
 	if got := openAIHeader.Get("Authorization"); got != "Bearer sk-openai" {
 		t.Fatalf("openai authorization = %q", got)
 	}
 	if got := openAIHeader.Get("X-Api-Key"); got != "" {
 		t.Fatalf("openai x-api-key should be empty, got %q", got)
 	}
+	if got := openAIHeader.Get("User-Agent"); got != "codex-cli" {
+		t.Fatalf("openai default user-agent = %q", got)
+	}
+	if got := openAIHeader.Get("Originator"); got != "Codex CLI" {
+		t.Fatalf("openai default originator = %q", got)
+	}
 
 	claudeHeader := http.Header{"Authorization": []string{"Bearer old"}}
-	applyUpstreamAuthHeaders(claudeHeader, &storage.UpstreamGroupKey{ClientFormat: "claude"}, " sk-claude ")
+	env.svc.applyUpstreamAuthHeaders(claudeHeader, &storage.UpstreamGroupKey{ClientFormat: "claude"}, " sk-claude ")
 	if got := claudeHeader.Get("Authorization"); got != "" {
 		t.Fatalf("claude authorization should be removed, got %q", got)
 	}
@@ -2078,7 +2085,41 @@ func TestSanitizeManualSecretTrimsWrappingQuotes(t *testing.T) {
 	}
 }
 
+func TestNormalizeUpstreamAPIKeyStripsPastedAuthenticationPrefixes(t *testing.T) {
+	for _, input := range []string{
+		"Bearer sk-test",
+		"bearer sk-test",
+		"Authorization: Bearer sk-test",
+		"authorization: Bearer sk-test",
+		"X-Api-Key: sk-test",
+		"  'Authorization: Bearer sk-test'  ",
+	} {
+		if got := normalizeUpstreamAPIKey(input); got != "sk-test" {
+			t.Fatalf("normalizeUpstreamAPIKey(%q) = %q, want raw key", input, got)
+		}
+	}
+}
+
+func TestApplyUpstreamAuthHeadersPreservesInboundCodexHeaders(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("b", 32))
+	header := http.Header{
+		"User-Agent": []string{"codex-cli-test"},
+		"Originator": []string{"Codex CLI test"},
+	}
+	env.svc.applyUpstreamAuthHeaders(header, &storage.UpstreamGroupKey{ClientFormat: "openai"}, "Authorization: Bearer sk-test")
+	if got := header.Get("Authorization"); got != "Bearer sk-test" {
+		t.Fatalf("authorization = %q, want one Bearer prefix", got)
+	}
+	if got := header.Get("User-Agent"); got != "codex-cli-test" {
+		t.Fatalf("user-agent should preserve inbound Codex header, got %q", got)
+	}
+	if got := header.Get("Originator"); got != "Codex CLI test" {
+		t.Fatalf("originator should preserve inbound Codex header, got %q", got)
+	}
+}
+
 func TestGrokFormatIsIsolatedAndUsesXAIHeaders(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("g", 32))
 	candidates := []storage.UpstreamGroupKey{
 		{ID: 1, ClientFormat: "openai"},
 		{ID: 2, ClientFormat: "grok"},
@@ -2096,7 +2137,7 @@ func TestGrokFormatIsIsolatedAndUsesXAIHeaders(t *testing.T) {
 	}
 
 	header := http.Header{}
-	applyUpstreamAuthHeaders(header, &storage.UpstreamGroupKey{GroupName: "grok", ClientFormat: "grok"}, "xai-key")
+	env.svc.applyUpstreamAuthHeaders(header, &storage.UpstreamGroupKey{GroupName: "grok", ClientFormat: "grok"}, "xai-key")
 	if got := header.Get("Authorization"); got != "Bearer xai-key" {
 		t.Fatalf("Authorization = %q", got)
 	}
@@ -2278,6 +2319,71 @@ func TestProxyStreamFailsOverOnSSEErrorBeforeWriting(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(out, "pong") || strings.Contains(out, "dead stream") {
 		t.Fatalf("status=%d body=%s", rec.Code, out)
 	}
+	if deadHits != 1 || liveHits != 1 {
+		t.Fatalf("hits: dead=%d live=%d", deadHits, liveHits)
+	}
+}
+
+func TestProxyStreamFailsOverAfterLifecycleOnlyEvents(t *testing.T) {
+	var deadHits, liveHits int
+	deadUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deadHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\n" +
+			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_dead\",\"status\":\"in_progress\"}}\n\n" +
+			"event: response.in_progress\n" +
+			"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_dead\",\"status\":\"in_progress\"}}\n\n"))
+	}))
+	defer deadUpstream.Close()
+
+	liveUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		liveHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\",\"response_id\":\"resp_live\"}\n\n" +
+			"event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_live\",\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"))
+	}))
+	defer liveUpstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("l", 32))
+	for _, item := range []struct {
+		name  string
+		url   string
+		key   string
+		ratio float64
+	}{
+		{name: "lifecycle-only", url: deadUpstream.URL, key: "sk-dead", ratio: 0.1},
+		{name: "visible-output", url: liveUpstream.URL, key: "sk-live", ratio: 0.2},
+	} {
+		channel := &storage.Channel{Name: item.name, Type: storage.ChannelTypeSub2API, SiteURL: item.url, MonitorEnabled: true}
+		if err := env.channels.Create(channel); err != nil {
+			t.Fatalf("create %s channel: %v", item.name, err)
+		}
+		cipher, err := env.cipher.Encrypt(item.key)
+		if err != nil {
+			t.Fatalf("encrypt %s key: %v", item.name, err)
+		}
+		if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+			ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+			GroupRef: item.name, GroupName: item.name, Ratio: item.ratio, KeyCipher: cipher, Status: "alive",
+		}); err != nil {
+			t.Fatalf("insert %s key: %v", item.name, err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy should transparently fail over before visible output: %v", err)
+	}
+	out := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(out, "pong") || strings.Contains(out, "resp_dead") {
+		t.Fatalf("lifecycle-only upstream must not leak into response: status=%d body=%s", rec.Code, out)
+	}
+	assertResponsesStreamTerminalOnce(t, out, "response.completed")
 	if deadHits != 1 || liveHits != 1 {
 		t.Fatalf("hits: dead=%d live=%d", deadHits, liveHits)
 	}
@@ -3813,6 +3919,66 @@ func TestManualGroupRetriesAlternateAuthHeaderBeforeMarkingAuthFailure(t *testin
 	}
 }
 
+func TestLegacyManualBearerPrefixedKeyWorksForHealthProbeAndProxy(t *testing.T) {
+	var probeCalls, proxyCalls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer sk-newapi" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"Invalid token"}}`))
+			return
+		}
+		if r.Header.Get("User-Agent") == "codex-cli" && r.Header.Get("Originator") == "Codex CLI" {
+			probeCalls++
+		} else {
+			proxyCalls++
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"2\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("c", 32))
+	channel := &storage.Channel{Name: "legacy-newapi", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	legacyCipher, err := env.cipher.Encrypt("Authorization: Bearer sk-newapi")
+	if err != nil {
+		t.Fatalf("encrypt legacy key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", RequestModeSource: "manual", AuthMode: "bearer",
+		GroupRef: "manual:legacy-newapi", GroupName: "legacy-newapi", Ratio: 1, KeyCipher: legacyCipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:legacy-newapi")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+	if _, err := env.svc.TestGroupKey(group.ID); err != nil {
+		t.Fatalf("legacy key health probe should succeed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "codex-cli-real")
+	req.Header.Set("Originator", "Codex CLI real")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("legacy key proxy should not fail with invalid token: %v", err)
+	}
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "response.output_text.delta") {
+		t.Fatalf("legacy manual proxy response: status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if probeCalls == 0 || proxyCalls == 0 {
+		t.Fatalf("expected both synthetic Codex probe and inbound proxy, probe=%d proxy=%d", probeCalls, proxyCalls)
+	}
+}
+
 func TestManualHealthProbeDoesNotPersistWrongHeaderAs403(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-Api-Key") != "sk-health-x" {
@@ -4402,17 +4568,42 @@ func TestSSEReaderDispatchesDataLineWithoutBlankSeparator(t *testing.T) {
 	}
 }
 
-func TestStreamEventReadyAcceptsResponsesLifecycleEvents(t *testing.T) {
-	if !streamEventReady(sseEvent{
+func TestStreamEventReadyWaitsForVisibleGeneration(t *testing.T) {
+	if streamEventReady(sseEvent{
 		Event: "response.created",
 		Data:  `{"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}`,
 	}) {
-		t.Fatal("response.created should start forwarding immediately")
+		t.Fatal("response.created must remain buffered so the gateway can fail over")
 	}
-	if !streamEventReady(sseEvent{
+	if streamEventReady(sseEvent{
 		Data: `{"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"delta":{"role":"assistant"}}]}`,
 	}) {
-		t.Fatal("chat completion chunk should start forwarding immediately")
+		t.Fatal("chat role-only chunk must remain buffered so the gateway can fail over")
+	}
+	if !streamEventReady(sseEvent{
+		Event: "response.output_text.delta",
+		Data:  `{"type":"response.output_text.delta","response_id":"resp_1","delta":"pong"}`,
+	}) {
+		t.Fatal("response text delta should pin the stream to its upstream")
+	}
+	if !streamEventReady(sseEvent{
+		Data: `{"id":"chatcmpl_1","object":"chat.completion.chunk","choices":[{"delta":{"content":"pong"}}]}`,
+	}) {
+		t.Fatal("chat content chunk should pin the stream to its upstream")
+	}
+	if failed, _ := streamEventPreflightFailure(sseEvent{Data: "[DONE]"}); !failed {
+		t.Fatal("premature [DONE] must fail preflight instead of pinning the stream")
+	}
+}
+
+func TestPreflightSSEStreamRejectsLifecycleOnlyEOFForSafeFailover(t *testing.T) {
+	body := io.NopCloser(strings.NewReader("event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_lifecycle\",\"status\":\"in_progress\"}}\n\n" +
+		"event: response.in_progress\n" +
+		"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_lifecycle\",\"status\":\"in_progress\"}}\n\n"))
+	defer body.Close()
+	if _, err := preflightSSEStream(newSSEStreamReader(body), body, time.Second); err == nil || !strings.Contains(err.Error(), "usable generation") {
+		t.Fatalf("lifecycle-only EOF must remain eligible for failover, err=%v", err)
 	}
 }
 

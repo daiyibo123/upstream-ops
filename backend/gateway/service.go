@@ -1079,7 +1079,7 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 		if !isManualGroupKey(key) {
 			return nil, errors.New("only manually added group keys can replace the upstream key")
 		}
-		rawKey := sanitizeManualSecret(*input.Key)
+		rawKey := normalizeUpstreamAPIKey(*input.Key)
 		if rawKey == "" {
 			return nil, errors.New("upstream key cannot be empty")
 		}
@@ -1445,7 +1445,7 @@ type ManualGroupKeyInput struct {
 // CreateManualGroupKey 手动创建一个上游分组密钥，不经过登录/自动同步。
 func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKeyInput) (*storage.UpstreamGroupKey, error) {
 	groupName := strings.TrimSpace(input.GroupName)
-	rawKey := sanitizeManualSecret(input.Key)
+	rawKey := normalizeUpstreamAPIKey(input.Key)
 	if groupName == "" {
 		return nil, errors.New("分组名称不能为空")
 	}
@@ -2435,13 +2435,19 @@ func shouldPreferChatBridgeForResponsesStream(request normalizedRequest, candida
 // applyUpstreamAuthHeaders applies the credential contract detected for this
 // exact upstream key. Do not derive it only from the channel: one relay can
 // have both a Bearer key and an x-api-key key at the same time.
-func applyUpstreamAuthHeaders(header http.Header, key *storage.UpstreamGroupKey, upstreamKey string) {
+//
+// Existing manual records can contain a pasted header value such as
+// "Authorization: Bearer sk-...". Normalize it here as well as when saving,
+// so those records recover without an administrator having to delete and add
+// the channel again.
+func (s *Service) applyUpstreamAuthHeaders(header http.Header, key *storage.UpstreamGroupKey, upstreamKey string) {
+	upstreamKey = normalizeUpstreamAPIKey(upstreamKey)
 	header.Del("Authorization")
 	header.Del("X-Api-Key")
 	if upstreamAuthModeForKey(key) == "x_api_key" {
-		header.Set("X-Api-Key", strings.TrimSpace(upstreamKey))
+		header.Set("X-Api-Key", upstreamKey)
 	} else {
-		header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
+		header.Set("Authorization", "Bearer "+upstreamKey)
 	}
 	header.Set("Content-Type", "application/json")
 	if key != nil {
@@ -2456,8 +2462,42 @@ func applyUpstreamAuthHeaders(header http.Header, key *storage.UpstreamGroupKey,
 		return
 	}
 	if header.Get("User-Agent") == "" {
-		header.Set("User-Agent", "codex-cli/0.1 upstream-ops")
+		configured := strings.TrimSpace(s.upstreamConfig().UserAgent)
+		if configured != "" && configured != config.DefaultUpstreamUserAgent {
+			header.Set("User-Agent", configured)
+		} else if key != nil && normalizeClientFormat(key.ClientFormat) == "openai" {
+			// NewAPI-compatible relays can apply Codex-specific routing rules.
+			// This is deliberately a stable product identifier rather than an
+			// invented version string. Real inbound Codex headers are preserved.
+			header.Set("User-Agent", "codex-cli")
+		} else {
+			header.Set("User-Agent", config.DefaultUpstreamUserAgent)
+		}
 	}
+	if key != nil && normalizeClientFormat(key.ClientFormat) == "openai" && header.Get("Originator") == "" {
+		// NewAPI's Codex compatibility templates use this header together with
+		// the Codex CLI user agent. It is required only for synthetic requests
+		// such as health probes; a real client-provided Originator is untouched.
+		header.Set("Originator", "Codex CLI")
+	}
+}
+
+// decryptUpstreamAPIKey loads a stored upstream credential and accepts legacy
+// manual records that were saved with a pasted Authorization/X-Api-Key prefix.
+// The normalized secret is kept in memory only and must never be logged.
+func (s *Service) decryptUpstreamAPIKey(key *storage.UpstreamGroupKey) (string, error) {
+	if key == nil {
+		return "", errors.New("upstream key is required")
+	}
+	raw, err := s.cipher.Decrypt(key.KeyCipher)
+	if err != nil {
+		return "", err
+	}
+	raw = normalizeUpstreamAPIKey(raw)
+	if raw == "" {
+		return "", errors.New("upstream key cannot be empty")
+	}
+	return raw, nil
 }
 
 func alternateUpstreamAuthMode(key *storage.UpstreamGroupKey) string {
@@ -2733,7 +2773,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	if err != nil {
 		return true, usageTokens{}, err
 	}
-	upstreamKey, err := s.cipher.Decrypt(key.KeyCipher)
+	upstreamKey, err := s.decryptUpstreamAPIKey(key)
 	if err != nil {
 		return true, usageTokens{}, err
 	}
@@ -2746,7 +2786,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		return true, usageTokens{}, err
 	}
 	copyRequestHeaders(req.Header, request.Header)
-	applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
+	s.applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
 	if request.Stream {
 		req.Header.Set("Accept", "text/event-stream")
 		req.Header.Set("Cache-Control", "no-cache")
@@ -4013,7 +4053,7 @@ func (s *Service) requestCandidate(ctx context.Context, request normalizedReques
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	upstreamKey, err := s.cipher.Decrypt(key.KeyCipher)
+	upstreamKey, err := s.decryptUpstreamAPIKey(key)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -4032,7 +4072,7 @@ func (s *Service) requestCandidate(ctx context.Context, request normalizedReques
 		return 0, nil, nil, err
 	}
 	copyRequestHeaders(req.Header, request.Header)
-	applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
+	s.applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
 
 	client := s.httpClientFor(ctx, ch)
 	resp, err := client.Do(req)
@@ -4057,7 +4097,7 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	upstreamKey, err := s.cipher.Decrypt(key.KeyCipher)
+	upstreamKey, err := s.decryptUpstreamAPIKey(key)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -4076,7 +4116,7 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 		return 0, nil, nil, err
 	}
 	copyRequestHeaders(req.Header, request.Header)
-	applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
+	s.applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
 	// Health probes are streamed too. Avoid a compressed/buffered probe being
 	// mistaken for an unhealthy upstream merely because its first token arrived
 	// late at the gateway.
@@ -7185,7 +7225,11 @@ func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.
 			if len(buffered) == 0 {
 				return nil, errors.New("upstream stream ended before sending data")
 			}
-			return buffered, nil
+			// A valid completed event has already returned above. Reaching EOF
+			// here therefore means the upstream only emitted lifecycle noise and
+			// never produced a visible answer. Do not leak those events to the
+			// client: the caller can still retry another direct upstream safely.
+			return nil, errors.New("upstream stream ended before sending a usable generation event")
 		}
 		if err != nil {
 			return nil, err
@@ -7194,6 +7238,9 @@ func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.
 			continue
 		}
 		if failed, msg := streamEventFailure(ev); failed {
+			return nil, errors.New(msg)
+		}
+		if failed, msg := streamEventPreflightFailure(ev); failed {
 			return nil, errors.New(msg)
 		}
 		buffered = append(buffered, ev)
@@ -7205,7 +7252,12 @@ func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.
 	if len(buffered) == 0 {
 		return nil, errors.New("upstream stream did not send a usable event")
 	}
-	return buffered, nil
+	// Lifecycle-only traffic (for example response.created followed by
+	// response.in_progress) has not produced anything visible to the caller.
+	// Treat it as an unsuccessful preflight rather than pinning the request to
+	// a flaky upstream: Proxy can still try the next healthy key without
+	// duplicating text, reasoning, or tool calls.
+	return nil, errors.New("upstream stream did not send a usable generation event")
 }
 
 func readNextSSEWithTimeout(reader *sseStreamReader, closer io.Closer, timeout time.Duration, label string) (sseEvent, error) {
@@ -7253,31 +7305,75 @@ func readNextSSEWithTimeout(reader *sseStreamReader, closer io.Closer, timeout t
 func streamEventReady(ev sseEvent) bool {
 	data := strings.TrimSpace(ev.Data)
 	if data == "[DONE]" {
+		return false
+	}
+	typ := strings.ToLower(strings.TrimSpace(sseEventType(ev)))
+	switch typ {
+	case "response.completed", "response.done", "message_stop":
 		return true
+	case "response.created", "response.in_progress", "response.queued", "response.output_item.added", "response.content_part.added", "message_start", "content_block_start":
+		return false
 	}
 	if sseEventLooksLikeChatCompletion(ev) {
-		return true
-	}
-	typ := sseEventType(ev)
-	if strings.HasPrefix(typ, "response.") {
-		return true
-	}
-	if typ == "response.completed" || typ == "response.output_text.done" {
-		return true
+		return chatCompletionChunkHasGenerationOrTerminal(data)
 	}
 	if strings.Contains(typ, ".delta") || strings.Contains(typ, "_delta") {
 		return true
 	}
 	switch typ {
-	case "message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_stop":
+	case "content_block_delta", "content_block_stop":
 		return true
 	}
-	switch strings.TrimSpace(ev.Event) {
-	case "response.completed", "response.output_text.delta":
-		return true
-	default:
-		return strings.TrimSpace(ev.Event) != "" || data != ""
+	return false
+}
+
+// streamEventPreflightFailure marks terminal upstream events that arrive
+// before any visible output. They are safe to fail over from because nothing
+// has been written to the downstream ResponseWriter yet.
+func streamEventPreflightFailure(ev sseEvent) (bool, string) {
+	if strings.TrimSpace(ev.Data) == "[DONE]" {
+		return true, "upstream stream ended before response.completed"
 	}
+	switch strings.ToLower(strings.TrimSpace(sseEventType(ev))) {
+	case "response.cancelled":
+		return true, "upstream cancelled the response before output"
+	case "response.incomplete":
+		return true, "upstream returned an incomplete response before output"
+	}
+	return false, ""
+}
+
+func chatCompletionChunkHasGenerationOrTerminal(data string) bool {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(data), &raw); err != nil {
+		return false
+	}
+	choices, _ := raw["choices"].([]any)
+	for _, item := range choices {
+		choice, _ := item.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		if finish := strings.TrimSpace(stringValue(choice["finish_reason"])); finish != "" && !strings.EqualFold(finish, "null") {
+			return true
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		for _, field := range []string{"content", "reasoning", "reasoning_content", "analysis"} {
+			if strings.TrimSpace(stringValue(delta[field])) != "" {
+				return true
+			}
+		}
+		if calls, ok := delta["tool_calls"].([]any); ok && len(calls) > 0 {
+			return true
+		}
+		if call, ok := delta["function_call"].(map[string]any); ok && len(call) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func streamEventFailure(ev sseEvent) (bool, string) {
@@ -9131,10 +9227,38 @@ func joinUpstreamURL(siteURL, path string) (string, error) {
 	return base.String(), nil
 }
 
-func sanitizeManualSecret(value string) string {
+// normalizeUpstreamAPIKey converts a commonly pasted request-header value
+// back to its raw credential. Manual-channel forms accept both a plain key
+// and snippets copied from documentation or clients, for example
+// "Authorization: Bearer sk-..." and "X-Api-Key: sk-...".
+func normalizeUpstreamAPIKey(value string) string {
 	value = strings.TrimSpace(value)
-	value = strings.Trim(value, "\"'")
-	return strings.TrimSpace(value)
+	for {
+		trimmed := strings.TrimSpace(value)
+		if len(trimmed) >= 2 && ((trimmed[0] == '"' && trimmed[len(trimmed)-1] == '"') || (trimmed[0] == '\'' && trimmed[len(trimmed)-1] == '\'')) {
+			value = strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(lower, "authorization:"):
+			value = strings.TrimSpace(trimmed[len("authorization:"):])
+		case strings.HasPrefix(lower, "bearer "):
+			value = strings.TrimSpace(trimmed[len("bearer "):])
+		case strings.HasPrefix(lower, "x-api-key:"):
+			value = strings.TrimSpace(trimmed[len("x-api-key:"):])
+		case strings.HasPrefix(lower, "x-api-key "):
+			value = strings.TrimSpace(trimmed[len("x-api-key "):])
+		default:
+			return trimmed
+		}
+	}
+}
+
+// sanitizeManualSecret remains as a compatibility alias for callers and old
+// tests. All new code should use normalizeUpstreamAPIKey directly.
+func sanitizeManualSecret(value string) string {
+	return normalizeUpstreamAPIKey(value)
 }
 
 func normalizeManualAPIBaseURL(siteURL string) (string, error) {

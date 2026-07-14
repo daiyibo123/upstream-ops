@@ -6,7 +6,20 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 - `MINOR`: backwards-compatible features.
 - `PATCH`: backwards-compatible fixes and small improvements.
 
-Every release must update this file, `backend/global/version.go`, and the Dockerfile version argument before its matching Git tag is pushed.
+Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
+
+## v0.23.0 - 2026-07-14
+
+### Fixed
+
+- Fixed manual NewAPI/OpenAI-compatible upstream keys copied as `Bearer <key>`, `Authorization: Bearer <key>`, or `X-Api-Key: <key>`. They are normalized before storage and again before forwarding, so existing manual records no longer produce a duplicated `Bearer` prefix and `Invalid token` response.
+- Added Codex-compatible default request identity for synthetic OpenAI health probes (`User-Agent: codex-cli` and `Originator: Codex CLI`) while preserving the exact headers from real inbound Codex clients.
+- Hardened direct `/v1/responses` preflight failover. Lifecycle-only streams (`response.created` / `response.in_progress`) that end with EOF, a premature `[DONE]`, cancellation, incompleteness, or an error now move to the next healthy upstream before any downstream content is written.
+
+### Changed
+
+- Direct gateway forwarding remains single-request and cache-affine: once text, reasoning, or tool-call output has reached the client, it never replays the request on another upstream. The gateway instead sends exactly one protocol-compliant failure/cancellation terminal event if the active stream later breaks.
+- Added regression coverage for legacy manual Key formats, Codex request-header preservation, lifecycle-only EOF failover, and Responses terminal-event integrity.
 
 ## v0.22.7 - 2026-07-14
 
