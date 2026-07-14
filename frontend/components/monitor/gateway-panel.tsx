@@ -293,6 +293,44 @@ function requestModeLabel(value?: string | null) {
   }
 }
 
+function authModeLabel(value?: string | null) {
+  switch ((value ?? "").trim().toLowerCase()) {
+    case "x_api_key":
+    case "x-api-key":
+      return "X-Api-Key"
+    default:
+      return "Bearer"
+  }
+}
+
+function requestModeOptions(format: ClientFormat): Array<{ value: "auto" | UpstreamRequestMode; label: string }> {
+  switch (format) {
+    case "claude":
+      return [
+        { value: "auto", label: "自动检测（当前 Claude Messages）" },
+        { value: "messages", label: "手动：Claude Messages" },
+      ]
+    case "grok":
+      return [
+        { value: "auto", label: "自动检测（当前 Chat Completions）" },
+        { value: "chat", label: "手动：Chat Completions" },
+      ]
+    default:
+      return [
+        { value: "auto", label: "自动检测" },
+        { value: "responses", label: "手动：Responses" },
+        { value: "chat", label: "手动：Chat Completions" },
+      ]
+  }
+}
+
+function selectedRequestMode(group: UpstreamGroupKey): "auto" | UpstreamRequestMode {
+  if ((group.request_mode_source ?? "auto").toLowerCase() !== "manual") {
+    return "auto"
+  }
+  return normalizeRequestMode(group.request_mode)
+}
+
 function groupClientFormat(group: UpstreamGroupKey): ClientFormat {
   return normalizeClientFormat(group.client_format)
 }
@@ -1484,7 +1522,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
 
   async function updateGroup(
     group: UpstreamGroupKey,
-    patch: { concurrency_limit?: number; enabled?: boolean; priority?: number; client_format?: string; charity?: boolean },
+    patch: { concurrency_limit?: number; enabled?: boolean; priority?: number; client_format?: string; request_mode?: string; charity?: boolean },
   ) {
     setBusy(`group-${group.id}`)
     try {
@@ -1495,6 +1533,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           ...(patch.enabled == null ? {} : { enabled: patch.enabled }),
           ...(patch.priority == null ? {} : { priority: patch.priority }),
           ...(patch.client_format == null ? {} : { client_format: patch.client_format }),
+          ...(patch.request_mode == null ? {} : { request_mode: patch.request_mode }),
           ...(patch.charity == null ? {} : { charity: patch.charity }),
         }),
       })
@@ -1568,16 +1607,19 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   }
 
   async function changeGroupClientFormat(group: UpstreamGroupKey, format: string) {
-    let updated = await updateGroup(group, { client_format: format })
+    const updated = await updateGroup(group, { client_format: format })
     if (!updated) return
-    try {
-      updated = await apiFetch<UpstreamGroupKey>(`/gateway/group-keys/${group.id}/detect-request-mode`, { method: "POST" })
-      setGroups((prev) => sortGroupsForDisplay(prev.map((item) => (item.id === group.id ? updated : item))))
-      toast.success(`已标记为 ${clientFormatLabel(format)} 渠道，接口已自动识别为 ${requestModeLabel(updated.request_mode)}`)
-    } catch (e) {
-      const err = e as Error
-      toast.warning(`已标记为 ${clientFormatLabel(format)} 渠道，但接口自动识别失败：${err.message || "请稍后测活"}`)
+    toast.success(`已标记为 ${clientFormatLabel(format)} 渠道，已切回自动检测（当前 ${requestModeLabel(updated.request_mode)}）`)
+  }
+
+  async function changeGroupRequestMode(group: UpstreamGroupKey, mode: string) {
+    const updated = await updateGroup(group, { request_mode: mode })
+    if (!updated) return
+    if (mode === "auto") {
+      toast.success(`已切回自动检测（当前 ${requestModeLabel(updated.request_mode)}），可点击“测活”验证`)
+      return
     }
+    toast.success(`已手动指定为 ${requestModeLabel(updated.request_mode)}，可点击“测活”验证`)
   }
 
   async function toggleGroupCharity(group: UpstreamGroupKey, charity: boolean) {
@@ -1593,6 +1635,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     const Icon = status === "alive" ? CheckCircle2 : isFailureHealthStatus(status) ? XCircle : RefreshCw
     const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
     const format = groupClientFormat(group)
+    const requestMode = selectedRequestMode(group)
     const canTest = group.enabled !== false
 
     return (
@@ -1623,6 +1666,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             <Badge variant="outline" className="bg-background">倍率 {formatRatio(group.ratio)}</Badge>
             <Badge variant="outline" className="bg-background">{requestModeLabel(group.request_mode)}</Badge>
+            <Badge variant="outline" className="bg-background">{authModeLabel(group.auth_mode)}</Badge>
             <Badge variant="outline" className="bg-background">{upstreamKeyLabel(group)}</Badge>
             <Badge variant="outline" className="bg-background">{formatTokens(group.total_tokens)} tok</Badge>
           </div>
@@ -1648,16 +1692,24 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               <SelectItem value="grok">Grok</SelectItem>
             </SelectContent>
           </Select>
-          <div
-            className="flex h-8 items-center rounded-md border border-border bg-muted/20 px-2 text-xs text-muted-foreground"
-            title={format === "openai" ? "系统自动探测并保存 Responses 或 Chat" : "由渠道格式自动确定协议"}
+          <Select
+            value={requestMode}
+            disabled={!!busy}
+            onValueChange={(value) => void changeGroupRequestMode(group, value)}
           >
-            {format === "openai"
-              ? `自动：${requestModeLabel(group.request_mode)}`
-              : format === "claude"
-                ? "自动：Claude Messages"
-                : "自动：Grok Chat"}
-          </div>
+            <SelectTrigger className="h-8 w-full text-xs" aria-label="上游请求方式">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {requestModeOptions(format).map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.value === "auto" && format === "openai"
+                    ? `${option.label}（当前 ${requestModeLabel(group.request_mode)}）`
+                    : option.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
         </div>
 
         <div className="grid gap-1.5">

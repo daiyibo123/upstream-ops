@@ -8,6 +8,19 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, and the Dockerfile version argument before its matching Git tag is pushed.
 
+## v0.22.7 - 2026-07-14
+
+### Fixed
+
+- Restored per-key request-method configuration for manual channels. Administrators can keep automatic protocol detection or explicitly select Responses, Chat Completions, or Claude Messages; a manual correction is preserved during later synchronization and detection jobs.
+- Fixed manual upstream keys that were usable upstream but became `403`, `Invalid token`, or unavailable after being added. Protocol and authentication capability are now re-detected per concrete key, including a safe Bearer / `X-Api-Key` fallback before any response bytes are sent.
+- Manual health checks now retry the alternate authentication header for 401/403 results and keep an unresolved manual probe as `unknown` rather than cooling down a potentially healthy route. A real request still disables a genuinely invalid key only after both header contracts fail.
+- Allowed multiple manual keys under the same visible upstream group. They retain independent secrets, request modes, authentication headers, health state, and scheduling records instead of overwriting one another.
+
+### Changed
+
+- Available Channels now shows the detected authentication-header contract for each upstream key, alongside its protocol.
+
 ## v0.22.6 - 2026-07-14
 
 ### Fixed

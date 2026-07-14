@@ -1069,11 +1069,13 @@ func (s *Service) GroupKeyCounts() (storage.UpstreamGroupKeyCounts, error) {
 }
 
 func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.UpstreamGroupKey, error) {
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	keyChanged := input.Key != nil
 	if input.Key != nil {
-		key, err := s.groupKeys.FindByID(id)
-		if err != nil {
-			return nil, err
-		}
 		if !isManualGroupKey(key) {
 			return nil, errors.New("only manually added group keys can replace the upstream key")
 		}
@@ -1105,9 +1107,6 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 		}
 		s.clearRuntimeDisable(id)
 	}
-	if input.RequestMode != nil {
-		return nil, errors.New("upstream request mode is detected automatically and cannot be set manually")
-	}
 	if input.Priority != nil {
 		priority := *input.Priority
 		if priority < 0 {
@@ -1117,14 +1116,63 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 			return nil, err
 		}
 	}
+	formatChanged := false
 	if input.ClientFormat != nil {
-		if err := s.groupKeys.UpdateClientFormat(id, normalizeClientFormat(*input.ClientFormat)); err != nil {
+		format := normalizeClientFormat(*input.ClientFormat)
+		formatChanged = format != normalizeClientFormat(key.ClientFormat)
+		if err := s.groupKeys.UpdateClientFormat(id, format); err != nil {
 			return nil, err
 		}
+		key.ClientFormat = format
+	}
+
+	// A request mode has two independent pieces of state: the actual protocol
+	// used by the forwarder and whether that protocol was detected or explicitly
+	// selected by an administrator. Keeping that source lets a broken automatic
+	// probe be corrected and prevents later syncs from undoing the correction.
+	shouldDetect := false
+	if input.RequestMode != nil {
+		mode, source, err := requestModeConfigForClientFormat(key.ClientFormat, *input.RequestMode)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.groupKeys.UpdateRequestModeConfig(id, mode, source); err != nil {
+			return nil, err
+		}
+		key.RequestMode = mode
+		key.RequestModeSource = source
+		shouldDetect = source == "auto"
+	} else if formatChanged {
+		// A format change invalidates the former protocol choice. Return to
+		// automatic detection unless the caller explicitly supplied a compatible
+		// request mode in this same update.
+		mode := defaultRequestModeForClientFormat(key.ClientFormat)
+		if err := s.groupKeys.UpdateRequestModeConfig(id, mode, "auto"); err != nil {
+			return nil, err
+		}
+		key.RequestMode = mode
+		key.RequestModeSource = "auto"
+		shouldDetect = true
 	}
 	if input.Charity != nil {
 		if err := s.groupKeys.UpdateCharity(id, *input.Charity); err != nil {
 			return nil, err
+		}
+	}
+	if shouldDetect || keyChanged {
+		ctx, cancel := context.WithTimeout(context.Background(), manualRequestModeDetectTimeout)
+		defer cancel()
+		// Replacing a key changes both its protocol capability and, for some
+		// relays, the required authentication header. Automatic configurations
+		// are therefore re-detected before the next real request. A manual
+		// protocol still gets a header-only probe below.
+		if shouldDetect {
+			if detected, detectErr := s.DetectGroupRequestMode(ctx, id); detectErr == nil && detected != nil {
+				return detected, nil
+			}
+		}
+		if detected, detectErr := s.DetectGroupAuthMode(ctx, id); detectErr == nil && detected != nil {
+			return detected, nil
 		}
 	}
 	return s.groupKeys.FindByID(id)
@@ -1156,6 +1204,12 @@ func (s *Service) DetectGroupRequestMode(ctx context.Context, id uint) (*storage
 	if err != nil {
 		return nil, err
 	}
+	// A manually selected protocol is an administrator repair, not a hint for
+	// the detector. It remains in force until the administrator explicitly
+	// chooses "auto" again through UpdateGroupKey.
+	if strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
+		return key, nil
+	}
 	switch normalizeClientFormat(key.ClientFormat) {
 	case "openai":
 		return s.detectOpenAIGroupRequestMode(ctx, key)
@@ -1176,10 +1230,39 @@ func (s *Service) DetectOpenAIGroupRequestMode(ctx context.Context, id uint) (*s
 	if err != nil {
 		return nil, err
 	}
+	if strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
+		return key, nil
+	}
 	if normalizeClientFormat(key.ClientFormat) != "openai" {
 		return key, nil
 	}
 	return s.detectOpenAIGroupRequestMode(ctx, key)
+}
+
+// DetectGroupAuthMode rechecks authentication for the existing request
+// protocol. It is used after replacing a key whose protocol was manually
+// selected: protocol configuration stays intact, while Bearer/x-api-key is
+// discovered independently for that concrete key.
+func (s *Service) DetectGroupAuthMode(ctx context.Context, id uint) (*storage.UpstreamGroupKey, error) {
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, manualRequestModeDetectTimeout)
+	defer cancel()
+	for _, authMode := range upstreamAuthModesForProbe(key) {
+		candidate := *key
+		candidate.AuthMode = authMode
+		status, body, _, probeErr := s.healthProbeCandidate(probeCtx, &candidate)
+		if !healthProbeSucceeded(status, body, probeErr) {
+			continue
+		}
+		if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
+			return nil, err
+		}
+		return s.groupKeys.FindByID(key.ID)
+	}
+	return key, errors.New("could not detect a working authentication header for this upstream key")
 }
 
 // DetectManualGroupKeyRequestMode remains the narrow public helper used by
@@ -1211,13 +1294,17 @@ func (s *Service) detectOpenAIGroupRequestMode(ctx context.Context, key *storage
 	// Only after the two tiny default probes fail do we ask /v1/models and try
 	// one advertised text model. This preserves the low-cost fast path while
 	// still discovering a compatible protocol for model-limited channels.
-	if model, _, _, err := s.discoverHealthProbeModel(probeCtx, key); err == nil {
-		before := len(models)
-		models = appendDistinctHealthProbeModel(models, model)
-		if detected, ok, detectErr := s.detectOpenAIGroupRequestModeForModels(probeCtx, key, models[before:]); detectErr != nil {
-			return nil, detectErr
-		} else if ok {
-			return detected, nil
+	for _, authMode := range upstreamAuthModesForProbe(key) {
+		candidate := *key
+		candidate.AuthMode = authMode
+		if model, _, _, err := s.discoverHealthProbeModel(probeCtx, &candidate); err == nil {
+			before := len(models)
+			models = appendDistinctHealthProbeModel(models, model)
+			if detected, ok, detectErr := s.detectOpenAIGroupRequestModeForModels(probeCtx, &candidate, models[before:]); detectErr != nil {
+				return nil, detectErr
+			} else if ok {
+				return detected, nil
+			}
 		}
 	}
 	return key, errors.New("could not detect a working responses or chat endpoint for this upstream key")
@@ -1233,15 +1320,22 @@ func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key
 			if mode == "chat" {
 				request = request.alt()
 			}
-			status, _, body, probeErr := s.requestHealthProbeCandidate(ctx, request, key, healthProbeTimeout)
-			if !healthProbeSucceeded(status, body, probeErr) {
-				continue
+			for _, authMode := range upstreamAuthModesForProbe(key) {
+				candidate := *key
+				candidate.AuthMode = authMode
+				status, _, body, probeErr := s.requestHealthProbeCandidate(ctx, request, &candidate, healthProbeTimeout)
+				if !healthProbeSucceeded(status, body, probeErr) {
+					continue
+				}
+				if err := s.groupKeys.UpdateRequestMode(key.ID, mode); err != nil {
+					return nil, false, err
+				}
+				if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
+					return nil, false, err
+				}
+				detected, err := s.groupKeys.FindByID(key.ID)
+				return detected, true, err
 			}
-			if err := s.groupKeys.UpdateRequestMode(key.ID, mode); err != nil {
-				return nil, false, err
-			}
-			detected, err := s.groupKeys.FindByID(key.ID)
-			return detected, true, err
 		}
 	}
 	return key, false, nil
@@ -1263,26 +1357,34 @@ func appendDistinctHealthProbeModel(models []string, model string) []string {
 func (s *Service) detectFixedGroupRequestMode(ctx context.Context, key *storage.UpstreamGroupKey, mode string) (*storage.UpstreamGroupKey, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, manualRequestModeDetectTimeout)
 	defer cancel()
-	var (
-		status int
-		body   []byte
-		err    error
-	)
-	switch normalizeClientFormat(key.ClientFormat) {
-	case "claude":
-		status, body, _, err = s.healthProbeClaude(probeCtx, key)
-	case "grok":
-		status, body, _, err = s.healthProbeGrok(probeCtx, key)
-	default:
-		return key, errors.New("unsupported fixed-protocol channel format")
+	for _, authMode := range upstreamAuthModesForProbe(key) {
+		candidate := *key
+		candidate.AuthMode = authMode
+		var (
+			status int
+			body   []byte
+			err    error
+		)
+		switch normalizeClientFormat(candidate.ClientFormat) {
+		case "claude":
+			status, body, _, err = s.healthProbeClaude(probeCtx, &candidate)
+		case "grok":
+			status, body, _, err = s.healthProbeGrok(probeCtx, &candidate)
+		default:
+			return key, errors.New("unsupported fixed-protocol channel format")
+		}
+		if !healthProbeSucceeded(status, body, err) {
+			continue
+		}
+		if err := s.groupKeys.UpdateRequestMode(key.ID, mode); err != nil {
+			return nil, err
+		}
+		if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
+			return nil, err
+		}
+		return s.groupKeys.FindByID(key.ID)
 	}
-	if err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices {
-		return key, healthProbeError(status, body, err)
-	}
-	if err := s.groupKeys.UpdateRequestMode(key.ID, mode); err != nil {
-		return nil, err
-	}
-	return s.groupKeys.FindByID(key.ID)
+	return key, errors.New("could not detect a working request protocol or authentication header for this upstream key")
 }
 
 func healthProbeSucceeded(status int, body []byte, err error) bool {
@@ -1312,6 +1414,10 @@ func (s *Service) detectGroupRequestModes(ids []uint) {
 		go func(groupID uint) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			key, err := s.groupKeys.FindByID(groupID)
+			if err != nil || key == nil || strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
+				return
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), manualRequestModeDetectTimeout)
 			defer cancel()
 			_, _ = s.DetectGroupRequestMode(ctx, groupID)
@@ -1331,7 +1437,7 @@ type ManualGroupKeyInput struct {
 	Key          string  `json:"key"`           // 上游 key 明文（必填，存库前加密）
 	Ratio        float64 `json:"ratio"`         // 倍率
 	ClientFormat string  `json:"client_format"` // openai / claude
-	RequestMode  string  `json:"request_mode"`  // auto (OpenAI/GPT is detected); responses / chat are legacy values
+	RequestMode  string  `json:"request_mode"`  // auto, responses, chat, or messages (format-dependent)
 	Charity      bool    `json:"charity"`
 	Priority     int     `json:"priority"`
 }
@@ -1388,13 +1494,27 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 	}
 
 	format := normalizeClientFormat(input.ClientFormat)
-	mode := normalizeUpstreamRequestMode(input.RequestMode)
+	mode, modeSource, err := requestModeConfigForClientFormat(format, input.RequestMode)
+	if err != nil {
+		return nil, err
+	}
 	ratio := input.Ratio
 	if ratio <= 0 {
 		ratio = 1
 	}
-	// groupRef 用分组名归一化，保证同渠道下唯一。
+	// A manual channel can legitimately contain multiple keys for the same
+	// visible group. Keep the first stable reference for editing, then attach a
+	// non-reversible key fingerprint for additional keys so their independent
+	// request protocol and authentication header are never overwritten.
 	groupRef := "manual:" + strings.ToLower(groupName)
+	if existing, findErr := s.groupKeys.FindByChannelGroup(ch.ID, groupRef); findErr != nil {
+		return nil, findErr
+	} else if existing != nil {
+		existingSecret, decryptErr := s.cipher.Decrypt(existing.KeyCipher)
+		if decryptErr != nil || subtle.ConstantTimeCompare([]byte(existingSecret), []byte(rawKey)) != 1 {
+			groupRef += ":" + HashKey(rawKey)[:12]
+		}
+	}
 	rec := &storage.UpstreamGroupKey{
 		ChannelID:             ch.ID,
 		ChannelName:           ch.Name,
@@ -1402,6 +1522,8 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 		ChannelType:           ch.Type,
 		ClientFormat:          format,
 		RequestMode:           mode,
+		RequestModeSource:     modeSource,
+		AuthMode:              defaultAuthModeForClientFormat(format),
 		GroupRef:              groupRef,
 		GroupName:             groupName,
 		GroupDesc:             strings.TrimSpace(input.GroupDesc),
@@ -1421,9 +1543,14 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 	if err != nil || saved == nil {
 		return saved, err
 	}
-	// Every manual upstream determines its protocol from a real generation
-	// probe. Do not let a form default or an old caller pin it to a wrong path.
-	if detected, detectErr := s.DetectGroupRequestMode(ctx, saved.ID); detectErr == nil && detected != nil {
+	// Only automatic protocol configuration is probed. A manual protocol still
+	// receives a header-only probe, because the replacement key may require a
+	// different auth header from other keys at the same URL.
+	if modeSource == "auto" {
+		if detected, detectErr := s.DetectGroupRequestMode(ctx, saved.ID); detectErr == nil && detected != nil {
+			return detected, nil
+		}
+	} else if detected, detectErr := s.DetectGroupAuthMode(ctx, saved.ID); detectErr == nil && detected != nil {
 		return detected, nil
 	}
 	return saved, nil
@@ -2305,25 +2432,23 @@ func shouldPreferChatBridgeForResponsesStream(request normalizedRequest, candida
 	return false
 }
 
-// applyUpstreamAuthHeaders sets the common API headers and the headers xAI
-// expects for Grok's OpenAI-compatible endpoints.
+// applyUpstreamAuthHeaders applies the credential contract detected for this
+// exact upstream key. Do not derive it only from the channel: one relay can
+// have both a Bearer key and an x-api-key key at the same time.
 func applyUpstreamAuthHeaders(header http.Header, key *storage.UpstreamGroupKey, upstreamKey string) {
-	if key != nil && normalizeClientFormat(key.ClientFormat) == "claude" {
-		// Anthropic-compatible upstreams require x-api-key rather than the
-		// OpenAI Bearer header.  Keep the protocol version explicit so relays
-		// do not silently select an incompatible default.
-		header.Del("Authorization")
+	header.Del("Authorization")
+	header.Del("X-Api-Key")
+	if upstreamAuthModeForKey(key) == "x_api_key" {
 		header.Set("X-Api-Key", strings.TrimSpace(upstreamKey))
-		if header.Get("Anthropic-Version") == "" {
-			header.Set("Anthropic-Version", "2023-06-01")
-		}
-		header.Set("Content-Type", "application/json")
-		return
+	} else {
+		header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
 	}
-	header.Set("Authorization", "Bearer "+strings.TrimSpace(upstreamKey))
 	header.Set("Content-Type", "application/json")
 	if key != nil {
 		header.Set("X-UpstreamOps-Group", key.GroupName)
+	}
+	if key != nil && normalizeClientFormat(key.ClientFormat) == "claude" && header.Get("Anthropic-Version") == "" {
+		header.Set("Anthropic-Version", "2023-06-01")
 	}
 	if key != nil && normalizeClientFormat(key.ClientFormat) == "grok" {
 		header.Set("Accept", "application/json, text/event-stream")
@@ -2332,6 +2457,41 @@ func applyUpstreamAuthHeaders(header http.Header, key *storage.UpstreamGroupKey,
 	}
 	if header.Get("User-Agent") == "" {
 		header.Set("User-Agent", "codex-cli/0.1 upstream-ops")
+	}
+}
+
+func alternateUpstreamAuthMode(key *storage.UpstreamGroupKey) string {
+	if upstreamAuthModeForKey(key) == "x_api_key" {
+		return "bearer"
+	}
+	return "x_api_key"
+}
+
+func shouldRetryWithAlternateAuthHeader(err error) bool {
+	if err == nil {
+		return false
+	}
+	var gatewayErr *GatewayError
+	if errors.As(err, &gatewayErr) {
+		// Many compatible relays return 403 (rather than 401) when the key is
+		// sent in the wrong header. This is still safe to retry once because no
+		// upstream generation bytes have been sent to the client yet.
+		if gatewayErr.Status == http.StatusUnauthorized || gatewayErr.Status == http.StatusForbidden {
+			return true
+		}
+		return looksLikeAuthFailure(gatewayErr.Status, string(gatewayErr.Body))
+	}
+	return looksLikeAuthFailure(0, err.Error())
+}
+
+func (s *Service) persistDetectedAuthMode(key *storage.UpstreamGroupKey, mode string) {
+	if key == nil {
+		return
+	}
+	mode = normalizeUpstreamAuthMode(mode)
+	key.AuthMode = mode
+	if err := s.groupKeys.UpdateAuthMode(key.ID, mode); err != nil && s.log != nil {
+		s.log.Warn("persist detected upstream authentication header", "group_key_id", key.ID, "err", err)
 	}
 }
 
@@ -2387,6 +2547,14 @@ func (s *Service) attemptStream(
 		return candOutcome{kind: candFatal, err: err, errMsg: errMsg, markFailure: markFailure}
 	}
 	retry, usage, err := s.streamProxyCandidate(ctx, normalized, candidate, timedWriter)
+	if err != nil && !timedWriter.Started() && shouldRetryWithAlternateAuthHeader(err) {
+		alternate := *candidate
+		alternate.AuthMode = alternateUpstreamAuthMode(candidate)
+		retry, usage, err = s.streamProxyCandidate(ctx, normalized, &alternate, timedWriter)
+		if err == nil {
+			s.persistDetectedAuthMode(candidate, alternate.AuthMode)
+		}
+	}
 	if err == nil {
 		duration := time.Since(start)
 		s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
@@ -2485,6 +2653,14 @@ func (s *Service) attemptNonStream(
 ) candOutcome {
 	start := time.Now()
 	status, header, respBody, retry, err := s.tryProxyCandidate(ctx, normalized, candidate)
+	if err != nil && shouldRetryWithAlternateAuthHeader(err) {
+		alternate := *candidate
+		alternate.AuthMode = alternateUpstreamAuthMode(candidate)
+		status, header, respBody, retry, err = s.tryProxyCandidate(ctx, normalized, &alternate)
+		if err == nil {
+			s.persistDetectedAuthMode(candidate, alternate.AuthMode)
+		}
+	}
 	if err == nil {
 		duration := time.Since(start)
 		s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
@@ -2718,13 +2894,16 @@ func upstreamGroupKeyFrom(ch storage.Channel, group connector.APIKeyGroup, group
 	if groupRef == "" {
 		groupRef, _ = groupRefFor(ch.Type, group)
 	}
+	format := inferGroupClientFormat(group.Name, group.Description)
 	return &storage.UpstreamGroupKey{
 		ChannelID:             ch.ID,
 		ChannelName:           ch.Name,
 		ChannelURL:            ch.SiteURL,
 		ChannelType:           ch.Type,
-		ClientFormat:          inferGroupClientFormat(group.Name, group.Description),
+		ClientFormat:          format,
 		RequestMode:           "responses",
+		RequestModeSource:     "auto",
+		AuthMode:              defaultAuthModeForClientFormat(format),
 		GroupRef:              groupRef,
 		GroupName:             strings.TrimSpace(group.Name),
 		GroupDesc:             strings.TrimSpace(group.Description),
@@ -2786,6 +2965,30 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 		attempts = append(attempts, healthProbeAttempt{err: errors.New("health probe did not run")})
 	}
 	last := attempts[len(attempts)-1]
+	// A manual key can be valid while a relay rejects the first probe because
+	// that particular key uses the other common authentication header. Before a
+	// 401/403 is persisted as an unusable channel, re-detect on the same key and
+	// rerun the probe. This mirrors the live request fallback and prevents the
+	// add-channel dialog from poisoning a working manual key.
+	if !last.succeeded() && isManualGroupKey(key) {
+		initialStatus := healthFailureStatus(last.status, last.body, last.err)
+		if initialStatus == "auth_failed" || initialStatus == "forbidden" {
+			var detected *storage.UpstreamGroupKey
+			var detectErr error
+			if strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
+				detected, detectErr = s.DetectGroupAuthMode(ctx, key.ID)
+			} else {
+				detected, detectErr = s.DetectGroupRequestMode(ctx, key.ID)
+			}
+			if detectErr == nil && detected != nil {
+				key = detected
+				attempts, retriesCompleted = s.healthProbeAttempts(ctx, key)
+				if len(attempts) > 0 {
+					last = attempts[len(attempts)-1]
+				}
+			}
+		}
+	}
 	item.LatencyMS = last.latencyMS
 	now := time.Now()
 	item.CheckedAt = &now
@@ -2801,6 +3004,14 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 	item.Error = healthProbeAttemptsError(attempts, retriesCompleted, lastErr)
 
 	if healthProbeFailureIsInconclusive(last.status, last.body, last.err, failureStatus) {
+		item.Status = "unknown"
+		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
+		return item
+	}
+	if isManualGroupKey(key) && (failureStatus == "auth_failed" || failureStatus == "forbidden") {
+		// Do not make a manual key unavailable merely because the fixed probe
+		// contract was refused. The first real request still has the one-shot
+		// Bearer/x-api-key fallback and will disable only a genuinely invalid key.
 		item.Status = "unknown"
 		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
 		return item
@@ -2999,7 +3210,8 @@ func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.Upstr
 			if fallback.ResponseMode == "responses_from_chat" {
 				mode = "chat"
 			}
-			if normalizeUpstreamRequestMode(key.RequestMode) != mode {
+			if normalizeUpstreamRequestMode(key.RequestMode) != mode &&
+				!strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
 				_ = s.groupKeys.UpdateRequestMode(key.ID, mode)
 			}
 			return fallbackStatus, fallbackBody, nil
@@ -3593,10 +3805,15 @@ func looksLikeAuthFailure(status int, text string) bool {
 	if status == http.StatusUnauthorized {
 		return true
 	}
+	text = strings.ToLower(text)
 	markers := []string{
 		"invalid api key",
 		"incorrect api key",
 		"invalid x-api-key",
+		"invalid token",
+		"token invalid",
+		"token is invalid",
+		"invalid access token",
 		"unauthorized",
 		"authentication failed",
 		"authentication error",
@@ -8147,6 +8364,87 @@ func normalizeUpstreamRequestMode(mode string) string {
 	default:
 		return "responses"
 	}
+}
+
+// defaultRequestModeForClientFormat returns a safe protocol before an automatic
+// capability probe completes. It deliberately returns a real forwarding mode:
+// "auto" is configuration metadata, never a protocol sent to an upstream.
+func defaultRequestModeForClientFormat(format string) string {
+	switch normalizeClientFormat(format) {
+	case "claude":
+		return "messages"
+	case "grok":
+		return "chat"
+	default:
+		return "responses"
+	}
+}
+
+// requestModeConfigForClientFormat validates a protocol override against the
+// selected channel format. Supplying "auto" (or omitting the value) restores
+// automatic detection while retaining a usable default protocol if the probe
+// cannot run or the upstream rejects the probe request.
+func requestModeConfigForClientFormat(format, requested string) (mode, source string, err error) {
+	requested = strings.ToLower(strings.TrimSpace(requested))
+	if requested == "" || requested == "auto" {
+		return defaultRequestModeForClientFormat(format), "auto", nil
+	}
+
+	mode = normalizeUpstreamRequestMode(requested)
+	switch normalizeClientFormat(format) {
+	case "openai":
+		if mode == "responses" || mode == "chat" {
+			return mode, "manual", nil
+		}
+		return "", "", errors.New("OpenAI channels only support Responses or Chat Completions")
+	case "claude":
+		if mode == "messages" {
+			return mode, "manual", nil
+		}
+		return "", "", errors.New("Claude channels only support Claude Messages")
+	case "grok":
+		if mode == "chat" {
+			return mode, "manual", nil
+		}
+		return "", "", errors.New("Grok channels only support Chat Completions")
+	default:
+		return "", "", errors.New("unsupported channel format for request mode")
+	}
+}
+
+func defaultAuthModeForClientFormat(format string) string {
+	if normalizeClientFormat(format) == "claude" {
+		return "x_api_key"
+	}
+	return "bearer"
+}
+
+func normalizeUpstreamAuthMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "x-api-key", "x_api_key", "xapikey", "api_key", "apikey":
+		return "x_api_key"
+	default:
+		return "bearer"
+	}
+}
+
+func upstreamAuthModeForKey(key *storage.UpstreamGroupKey) string {
+	if key == nil || strings.TrimSpace(key.AuthMode) == "" {
+		if key != nil {
+			return defaultAuthModeForClientFormat(key.ClientFormat)
+		}
+		return "bearer"
+	}
+	return normalizeUpstreamAuthMode(key.AuthMode)
+}
+
+func upstreamAuthModesForProbe(key *storage.UpstreamGroupKey) []string {
+	preferred := upstreamAuthModeForKey(key)
+	other := "bearer"
+	if preferred == "bearer" {
+		other = "x_api_key"
+	}
+	return []string{preferred, other}
 }
 
 func encodeUintList(values []uint) string {

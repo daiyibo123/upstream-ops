@@ -3579,6 +3579,9 @@ func TestDetectGroupRequestModeUsesNativeClaudeMessages(t *testing.T) {
 	if detected.RequestMode != "messages" {
 		t.Fatalf("request mode = %q, want messages", detected.RequestMode)
 	}
+	if detected.AuthMode != "x_api_key" {
+		t.Fatalf("auth mode = %q, want x_api_key", detected.AuthMode)
+	}
 }
 
 func TestDetectGroupRequestModeUsesGrokChat(t *testing.T) {
@@ -3661,7 +3664,206 @@ func TestUpdateGroupKeyReplacesManualKey(t *testing.T) {
 	}
 }
 
-func TestUpdateGroupKeyRejectsOpenAIRequestModeOverride(t *testing.T) {
+func TestReplacingManualKeyRedetectsAuthenticationHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if got := r.Header.Get("X-Api-Key"); got != "sk-new" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"2\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("h", 32))
+	channel := &storage.Channel{Name: "manual-auth-refresh", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-old")
+	if err != nil {
+		t.Fatalf("encrypt old key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", RequestModeSource: "manual", AuthMode: "bearer",
+		GroupRef: "manual:auth-refresh", GroupName: "auth-refresh", Ratio: 1, KeyCipher: cipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:auth-refresh")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+	nextKey := "sk-new"
+	updated, err := env.svc.UpdateGroupKey(group.ID, UpdateGroupKeyInput{Key: &nextKey})
+	if err != nil {
+		t.Fatalf("replace manual key: %v", err)
+	}
+	if updated.RequestMode != "responses" || updated.RequestModeSource != "manual" {
+		t.Fatalf("manual protocol should survive replacement: %#v", updated)
+	}
+	if updated.AuthMode != "x_api_key" {
+		t.Fatalf("auth mode after replacement = %q, want x_api_key", updated.AuthMode)
+	}
+}
+
+func TestManualChannelAllowsSameGroupWithIndependentKeysAndAuthModes(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		bearer := r.Header.Get("Authorization") == "Bearer sk-bearer"
+		xAPIKey := r.Header.Get("X-Api-Key") == "sk-x-api-key"
+		if !bearer && !xAPIKey {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"2\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("i", 32))
+	channel := &storage.Channel{Name: "two-auth-keys", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	first, err := env.svc.CreateManualGroupKey(context.Background(), ManualGroupKeyInput{
+		ChannelID: channel.ID, GroupName: "shared", Key: "sk-bearer", Ratio: 1, ClientFormat: "openai", RequestMode: "responses",
+	})
+	if err != nil {
+		t.Fatalf("create first manual key: %v", err)
+	}
+	second, err := env.svc.CreateManualGroupKey(context.Background(), ManualGroupKeyInput{
+		ChannelID: channel.ID, GroupName: "shared", Key: "sk-x-api-key", Ratio: 1, ClientFormat: "openai", RequestMode: "responses",
+	})
+	if err != nil {
+		t.Fatalf("create second manual key: %v", err)
+	}
+	if first.ID == second.ID || first.GroupRef == second.GroupRef {
+		t.Fatalf("manual keys with the same visible group were overwritten: first=%#v second=%#v", first, second)
+	}
+	if first.AuthMode != "bearer" || second.AuthMode != "x_api_key" {
+		t.Fatalf("independent auth modes = (%q, %q), want (bearer, x_api_key)", first.AuthMode, second.AuthMode)
+	}
+}
+
+func TestManualGroupRetriesAlternateAuthHeaderBeforeMarkingAuthFailure(t *testing.T) {
+	var hits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.Header.Get("X-Api-Key") != "sk-manual-x" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"message":"Invalid token"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"2\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("j", 32))
+	channel := &storage.Channel{Name: "manual-auth-fallback", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-manual-x")
+	if err != nil {
+		t.Fatalf("encrypt upstream key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", RequestModeSource: "manual", AuthMode: "bearer",
+		GroupRef: "manual:auth-fallback", GroupName: "auth-fallback", Ratio: 1, KeyCipher: cipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:auth-fallback")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request should recover with alternate auth header: %v", err)
+	}
+	if hits != 2 || rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "response.output_text.delta") {
+		t.Fatalf("manual auth fallback response: hits=%d status=%d body=%s", hits, rec.Code, rec.Body.String())
+	}
+	stored, err := env.groupKeys.FindByID(group.ID)
+	if err != nil {
+		t.Fatalf("reload group key: %v", err)
+	}
+	if stored.AuthMode != "x_api_key" || !stored.Enabled || stored.Status == "auth_failed" {
+		t.Fatalf("manual key was incorrectly left as auth failure: %#v", stored)
+	}
+}
+
+func TestManualHealthProbeDoesNotPersistWrongHeaderAs403(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Api-Key") != "sk-health-x" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":{"message":"Invalid token"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"2\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("k", 32))
+	channel := &storage.Channel{Name: "manual-health-auth", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-health-x")
+	if err != nil {
+		t.Fatalf("encrypt upstream key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", RequestModeSource: "manual", AuthMode: "bearer",
+		GroupRef: "manual:health-auth", GroupName: "health-auth", Ratio: 1, KeyCipher: cipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:health-auth")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+
+	result, err := env.svc.TestGroupKey(group.ID)
+	if err != nil {
+		t.Fatalf("test manual group key: %v", err)
+	}
+	if result.Status != "alive" {
+		t.Fatalf("health status = %q, want alive: %#v", result.Status, result)
+	}
+	stored, err := env.groupKeys.FindByID(group.ID)
+	if err != nil {
+		t.Fatalf("reload group key: %v", err)
+	}
+	if stored.AuthMode != "x_api_key" || stored.Status != "alive" {
+		t.Fatalf("manual health probe persisted wrong auth state: %#v", stored)
+	}
+}
+
+func TestUpdateGroupKeyAllowsManualOpenAIRequestModeOverride(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("o", 32))
 	channel := &storage.Channel{Name: "auto-protocol", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.com", MonitorEnabled: true}
 	if err := env.channels.Create(channel); err != nil {
@@ -3683,8 +3885,56 @@ func TestUpdateGroupKeyRejectsOpenAIRequestModeOverride(t *testing.T) {
 		t.Fatalf("find group key: %v", err)
 	}
 	mode := "chat"
-	if _, err := env.svc.UpdateGroupKey(group.ID, UpdateGroupKeyInput{RequestMode: &mode}); err == nil {
-		t.Fatal("OpenAI request mode override should be rejected")
+	updated, err := env.svc.UpdateGroupKey(group.ID, UpdateGroupKeyInput{RequestMode: &mode})
+	if err != nil {
+		t.Fatalf("manually set OpenAI request mode: %v", err)
+	}
+	if updated.RequestMode != "chat" || updated.RequestModeSource != "manual" {
+		t.Fatalf("request mode config = (%q, %q), want (chat, manual)", updated.RequestMode, updated.RequestModeSource)
+	}
+	// Background and explicit capability probes must not undo an administrator's
+	// manual protocol repair.
+	detected, err := env.svc.DetectGroupRequestMode(context.Background(), group.ID)
+	if err != nil {
+		t.Fatalf("detect manually configured mode: %v", err)
+	}
+	if detected.RequestMode != "chat" || detected.RequestModeSource != "manual" {
+		t.Fatalf("manual request mode was overwritten by detection: %#v", detected)
+	}
+}
+
+func TestRequestModeConfigForClientFormat(t *testing.T) {
+	tests := []struct {
+		format     string
+		requested  string
+		wantMode   string
+		wantSource string
+		wantErr    bool
+	}{
+		{format: "openai", requested: "auto", wantMode: "responses", wantSource: "auto"},
+		{format: "openai", requested: "chat", wantMode: "chat", wantSource: "manual"},
+		{format: "openai", requested: "messages", wantErr: true},
+		{format: "claude", requested: "", wantMode: "messages", wantSource: "auto"},
+		{format: "claude", requested: "messages", wantMode: "messages", wantSource: "manual"},
+		{format: "claude", requested: "chat", wantErr: true},
+		{format: "grok", requested: "auto", wantMode: "chat", wantSource: "auto"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.format+"/"+tt.requested, func(t *testing.T) {
+			mode, source, err := requestModeConfigForClientFormat(tt.format, tt.requested)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected an invalid protocol error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("request mode config: %v", err)
+			}
+			if mode != tt.wantMode || source != tt.wantSource {
+				t.Fatalf("request mode config = (%q, %q), want (%q, %q)", mode, source, tt.wantMode, tt.wantSource)
+			}
+		})
 	}
 }
 

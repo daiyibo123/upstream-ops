@@ -26,6 +26,7 @@ import { apiFetch } from "@/lib/api"
 import type { Channel, GatewayHealthResult, UpstreamGroupKey } from "@/lib/api-types"
 
 type ManualClientFormat = "openai" | "claude" | "grok"
+type ManualRequestMode = "auto" | "responses" | "chat" | "messages"
 
 interface ManualDraft {
   sourceMode: "new" | "existing"
@@ -37,6 +38,7 @@ interface ManualDraft {
   key: string
   ratio: string
   clientFormat: ManualClientFormat
+  requestMode: ManualRequestMode
   charity: boolean
   priority: string
 }
@@ -52,6 +54,7 @@ function createDefaultManualDraft(): ManualDraft {
     key: "",
     ratio: "1",
     clientFormat: "openai",
+    requestMode: "auto",
     charity: false,
     priority: "0",
   }
@@ -70,6 +73,27 @@ function normalizeManualClientFormat(value?: string | null): ManualClientFormat 
       return "grok"
     default:
       return "openai"
+  }
+}
+
+function requestModeOptions(format: ManualClientFormat): Array<{ value: ManualRequestMode; label: string }> {
+  switch (format) {
+    case "claude":
+      return [
+        { value: "auto", label: "自动检测（Claude Messages）" },
+        { value: "messages", label: "手动：Claude Messages" },
+      ]
+    case "grok":
+      return [
+        { value: "auto", label: "自动检测（Chat Completions）" },
+        { value: "chat", label: "手动：Chat Completions" },
+      ]
+    default:
+      return [
+        { value: "auto", label: "自动检测（Responses / Chat）" },
+        { value: "responses", label: "手动：Responses" },
+        { value: "chat", label: "手动：Chat Completions" },
+      ]
   }
 }
 
@@ -140,7 +164,7 @@ export function ManualGroupKeyDialog({
           key: draft.key.trim(),
           ratio: Number(draft.ratio) || 0,
           client_format: draft.clientFormat,
-          request_mode: "auto",
+          request_mode: draft.requestMode,
           charity: draft.charity,
           priority: Math.max(0, Math.floor(Number(draft.priority) || 0)),
         }),
@@ -288,7 +312,11 @@ export function ManualGroupKeyDialog({
             <Select
               value={draft.clientFormat}
               onValueChange={(value) =>
-                setDraft((prev) => ({ ...prev, clientFormat: normalizeManualClientFormat(value) }))
+                setDraft((prev) => ({
+                  ...prev,
+                  clientFormat: normalizeManualClientFormat(value),
+                  requestMode: "auto",
+                }))
               }
             >
               <SelectTrigger>
@@ -302,14 +330,22 @@ export function ManualGroupKeyDialog({
             </Select>
           </div>
           <div className="space-y-1.5">
-            <Label>上游接口（自动检测）</Label>
-            <div className="flex h-10 items-center rounded-md border border-border bg-muted/20 px-3 text-xs text-muted-foreground">
-              {draft.clientFormat === "openai"
-                ? "自动检测 Responses / Chat"
-                : draft.clientFormat === "claude"
-                  ? "自动使用 Claude Messages"
-                  : "自动使用 Grok Chat"}
-            </div>
+            <Label>上游请求方式</Label>
+            <Select
+              value={draft.requestMode}
+              onValueChange={(value) => setDraft((prev) => ({ ...prev, requestMode: value as ManualRequestMode }))}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {requestModeOptions(draft.clientFormat).map((option) => (
+                  <SelectItem key={option.value} value={option.value}>
+                    {option.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="manual-priority">调度优先级</Label>

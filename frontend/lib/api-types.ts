@@ -613,6 +613,8 @@ export interface UpstreamGroupKey {
   channel_type: ChannelType
   client_format?: "openai" | "claude" | "grok" | "any" | string
   request_mode?: "responses" | "chat" | string
+  request_mode_source?: "auto" | "manual" | string
+  auth_mode?: "bearer" | "x_api_key" | string
   group_ref: string
   group_name: string
   group_description?: string

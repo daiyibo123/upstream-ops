@@ -395,20 +395,28 @@ func (GatewayAffinity) TableName() string { return "gateway_affinities" }
 // UpstreamGroupKey stores one upstream API key bound to a channel group. The
 // gateway scheduler chooses among these records by live status and ratio.
 type UpstreamGroupKey struct {
-	ID                    uint        `gorm:"primaryKey" json:"id"`
-	ChannelID             uint        `gorm:"not null;uniqueIndex:idx_upstream_group_key;index" json:"channel_id"`
-	ChannelName           string      `gorm:"size:128" json:"channel_name,omitempty"`
-	ChannelURL            string      `gorm:"size:1024" json:"channel_url,omitempty"`
-	ChannelType           ChannelType `gorm:"size:32;not null" json:"channel_type"`
-	ClientFormat          string      `gorm:"size:16;not null;default:'openai';index" json:"client_format"`
-	RequestMode           string      `gorm:"size:16;not null;default:'responses';index" json:"request_mode"`
-	GroupRef              string      `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
-	GroupName             string      `gorm:"size:256;not null" json:"group_name"`
-	GroupDesc             string      `gorm:"size:512" json:"group_description,omitempty"`
-	Ratio                 float64     `gorm:"not null;default:1" json:"ratio"`
-	InputPricePerMillion  float64     `gorm:"not null;default:5" json:"input_price_per_million"`
-	OutputPricePerMillion float64     `gorm:"not null;default:30" json:"output_price_per_million"`
-	Priority              int         `gorm:"not null;default:0;index" json:"priority"`
+	ID           uint        `gorm:"primaryKey" json:"id"`
+	ChannelID    uint        `gorm:"not null;uniqueIndex:idx_upstream_group_key;index" json:"channel_id"`
+	ChannelName  string      `gorm:"size:128" json:"channel_name,omitempty"`
+	ChannelURL   string      `gorm:"size:1024" json:"channel_url,omitempty"`
+	ChannelType  ChannelType `gorm:"size:32;not null" json:"channel_type"`
+	ClientFormat string      `gorm:"size:16;not null;default:'openai';index" json:"client_format"`
+	RequestMode  string      `gorm:"size:16;not null;default:'responses';index" json:"request_mode"`
+	// RequestModeSource records whether RequestMode came from an endpoint probe
+	// or an explicit administrator override. Keeping the source separate lets
+	// automatic sync refresh auto groups without overwriting a manual fix.
+	RequestModeSource string `gorm:"size:16;not null;default:'auto';index" json:"request_mode_source"`
+	// AuthMode is stored per concrete upstream key. The same URL can accept
+	// different credentials through different headers, so it cannot be kept on
+	// the shared channel record.
+	AuthMode              string  `gorm:"size:16;not null;default:'bearer';index" json:"auth_mode"`
+	GroupRef              string  `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
+	GroupName             string  `gorm:"size:256;not null" json:"group_name"`
+	GroupDesc             string  `gorm:"size:512" json:"group_description,omitempty"`
+	Ratio                 float64 `gorm:"not null;default:1" json:"ratio"`
+	InputPricePerMillion  float64 `gorm:"not null;default:5" json:"input_price_per_million"`
+	OutputPricePerMillion float64 `gorm:"not null;default:30" json:"output_price_per_million"`
+	Priority              int     `gorm:"not null;default:0;index" json:"priority"`
 	// Charity 标记这个分组是"公益/免费"渠道。调度时公益永远优先于付费，
 	// 公益内部再按倍率高低（这里沿用 ratio 低者优先）排序，公益全挂了才轮到付费。
 	Charity          bool       `gorm:"not null;default:false;index" json:"charity"`

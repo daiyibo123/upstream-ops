@@ -41,7 +41,7 @@ docker compose pull && docker compose up -d
 
 ```bash
 cd /root/upstream-ops
-curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.22.6/docker-compose.yml
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.22.7/docker-compose.yml
 sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=latest/' .env
 docker compose pull && docker compose up -d
 ```

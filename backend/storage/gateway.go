@@ -240,6 +240,7 @@ func groupKeysWithChannelSource(q *gorm.DB) *gorm.DB {
 
 func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 	normalizeGroupKeyPrices(key)
+	key.RequestModeSource = normalizeRequestModeSource(key.RequestModeSource)
 	var existing UpstreamGroupKey
 	err := r.db.Where("channel_id = ? AND group_ref = ?", key.ChannelID, key.GroupRef).First(&existing).Error
 	switch {
@@ -248,7 +249,16 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 		existing.ChannelURL = key.ChannelURL
 		existing.ChannelType = key.ChannelType
 		existing.ClientFormat = key.ClientFormat
-		existing.RequestMode = key.RequestMode
+		// Automatic upstream sync must not overwrite a manual protocol repair.
+		// A manual group may intentionally be changed back to auto, so only the
+		// non-manual synchronization path preserves the existing override.
+		preserveManualMode := !strings.HasPrefix(strings.ToLower(strings.TrimSpace(key.GroupRef)), "manual:") &&
+			normalizeRequestModeSource(existing.RequestModeSource) == "manual" &&
+			key.RequestModeSource == "auto"
+		if !preserveManualMode {
+			existing.RequestMode = key.RequestMode
+			existing.RequestModeSource = key.RequestModeSource
+		}
 		existing.GroupName = key.GroupName
 		existing.GroupDesc = key.GroupDesc
 		existing.Ratio = key.Ratio
@@ -260,6 +270,10 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 		if existing.RequestMode == "" {
 			existing.RequestMode = "responses"
 		}
+		if existing.AuthMode == "" {
+			existing.AuthMode = "bearer"
+		}
+		existing.RequestModeSource = normalizeRequestModeSource(existing.RequestModeSource)
 		if key.UpstreamKeyID > 0 {
 			existing.UpstreamKeyID = key.UpstreamKeyID
 		}
@@ -280,6 +294,10 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 		if key.RequestMode == "" {
 			key.RequestMode = "responses"
 		}
+		if key.AuthMode == "" {
+			key.AuthMode = "bearer"
+		}
+		key.RequestModeSource = normalizeRequestModeSource(key.RequestModeSource)
 		if key.Status == "" {
 			key.Status = "unknown"
 		}
@@ -486,6 +504,35 @@ func (r *UpstreamGroupKeys) UpdateRequestMode(id uint, mode string) error {
 		mode = "responses"
 	}
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("request_mode", mode).Error
+}
+
+func (r *UpstreamGroupKeys) UpdateRequestModeConfig(id uint, mode, source string) error {
+	if strings.TrimSpace(mode) == "" {
+		mode = "responses"
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+		"request_mode":        mode,
+		"request_mode_source": normalizeRequestModeSource(source),
+	}).Error
+}
+
+// UpdateAuthMode records the authentication header contract detected for a
+// single upstream key. Different keys on the same channel may legitimately
+// need different headers, so this is intentionally not channel-scoped.
+func (r *UpstreamGroupKeys) UpdateAuthMode(id uint, mode string) error {
+	if strings.EqualFold(strings.TrimSpace(mode), "x-api-key") || strings.EqualFold(strings.TrimSpace(mode), "x_api_key") {
+		mode = "x_api_key"
+	} else {
+		mode = "bearer"
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("auth_mode", mode).Error
+}
+
+func normalizeRequestModeSource(source string) string {
+	if strings.EqualFold(strings.TrimSpace(source), "manual") {
+		return "manual"
+	}
+	return "auto"
 }
 
 // UpdateManualKey replaces a manually maintained upstream secret. Updating a

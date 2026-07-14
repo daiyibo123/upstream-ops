@@ -624,14 +624,18 @@ export function ChannelAPIKeysDialog({
         method: "PATCH",
         body: JSON.stringify({ key: nextKey }),
       })
-      try {
-        updated = await apiFetch<UpstreamGroupKey>(`/gateway/group-keys/${key.id}/detect-request-mode`, {
-          method: "POST",
-        })
-        toast.success(`Key 已更新，已自动识别为 ${requestModeLabel(updated.request_mode)} 接口`)
-      } catch (detectError) {
-        const err = detectError as Error
-        toast.warning(`Key 已更新，但接口自动识别失败：${err.message || "请稍后单独测活"}`)
+      if ((updated.request_mode_source ?? "auto").toLowerCase() !== "manual") {
+        try {
+          updated = await apiFetch<UpstreamGroupKey>(`/gateway/group-keys/${key.id}/detect-request-mode`, {
+            method: "POST",
+          })
+          toast.success(`Key 已更新，已自动识别为 ${requestModeLabel(updated.request_mode)} 接口`)
+        } catch (detectError) {
+          const err = detectError as Error
+          toast.warning(`Key 已更新，但接口自动识别失败：${err.message || "请稍后单独测活"}`)
+        }
+      } else {
+        toast.success(`Key 已更新，保留手动指定的 ${requestModeLabel(updated.request_mode)} 接口`)
       }
       setManualKeys((items) => items.map((item) => (item.id === key.id ? updated : item)))
       setRevealedKeys((prev) => ({ ...prev, [key.id]: nextKey }))
