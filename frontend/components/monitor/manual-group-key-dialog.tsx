@@ -26,7 +26,6 @@ import { apiFetch } from "@/lib/api"
 import type { Channel, GatewayHealthResult, UpstreamGroupKey } from "@/lib/api-types"
 
 type ManualClientFormat = "openai" | "claude" | "grok"
-type UpstreamRequestMode = "responses" | "chat"
 
 interface ManualDraft {
   sourceMode: "new" | "existing"
@@ -38,7 +37,6 @@ interface ManualDraft {
   key: string
   ratio: string
   clientFormat: ManualClientFormat
-  requestMode: UpstreamRequestMode
   charity: boolean
   priority: string
 }
@@ -54,7 +52,6 @@ function createDefaultManualDraft(): ManualDraft {
     key: "",
     ratio: "1",
     clientFormat: "openai",
-    requestMode: "responses",
     charity: false,
     priority: "0",
   }
@@ -76,34 +73,38 @@ function normalizeManualClientFormat(value?: string | null): ManualClientFormat 
   }
 }
 
-function normalizeRequestMode(value?: string | null): UpstreamRequestMode {
-  switch ((value ?? "").toLowerCase()) {
-    case "chat":
-    case "chat_completions":
-    case "chat-completions":
-      return "chat"
-    default:
-      return "responses"
-  }
-}
-
 export function ManualGroupKeyDialog({
   open,
   onOpenChange,
   channels,
+  fixedChannel,
+  initialClientFormat,
   onCreated,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   channels: Channel[]
+  fixedChannel?: Channel | null
+  initialClientFormat?: string | null
   onCreated?: (group: UpstreamGroupKey) => void | Promise<void>
 }) {
   const [draft, setDraft] = useState<ManualDraft>(() => createDefaultManualDraft())
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
-    if (!open) setDraft(createDefaultManualDraft())
-  }, [open])
+    if (!open) {
+      setDraft(createDefaultManualDraft())
+      return
+    }
+    if (fixedChannel) {
+      setDraft({
+        ...createDefaultManualDraft(),
+        sourceMode: "existing",
+        channelId: String(fixedChannel.id),
+        clientFormat: normalizeManualClientFormat(initialClientFormat),
+      })
+    }
+  }, [open, fixedChannel, initialClientFormat])
 
   async function submit() {
     if (!draft.groupName.trim()) {
@@ -128,7 +129,7 @@ export function ManualGroupKeyDialog({
       const created = await apiFetch<UpstreamGroupKey>("/gateway/group-keys/manual", {
         method: "POST",
         body: JSON.stringify({
-          ...(draft.sourceMode === "existing"
+          ...(fixedChannel || draft.sourceMode === "existing"
             ? { channel_id: Number(draft.channelId) }
             : {
                 channel_name: draft.channelName.trim() || undefined,
@@ -139,7 +140,7 @@ export function ManualGroupKeyDialog({
           key: draft.key.trim(),
           ratio: Number(draft.ratio) || 0,
           client_format: draft.clientFormat,
-          request_mode: draft.requestMode,
+          request_mode: "auto",
           charity: draft.charity,
           priority: Math.max(0, Math.floor(Number(draft.priority) || 0)),
         }),
@@ -174,53 +175,64 @@ export function ManualGroupKeyDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
-          <DialogTitle>手动添加渠道</DialogTitle>
+          <DialogTitle>{fixedChannel ? "添加上游 Key" : "手动添加渠道"}</DialogTitle>
           <DialogDescription>
-            给无法登录、只能拿到 Key 的上游手动创建分组。URL、分组、倍率和对应 Key 会直接写入可用渠道。
+            {fixedChannel
+              ? `为 ${fixedChannel.name} 添加可调度的上游 Key；分组、倍率和 Key 会直接写入可用渠道。`
+              : "给无法登录、只能拿到 Key 的上游手动创建分组。URL、分组、倍率和对应 Key 会直接写入可用渠道。"}
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-3 sm:grid-cols-2">
-          <div className="space-y-1.5">
-            <Label>接入方式</Label>
-            <Select
-              value={draft.sourceMode}
-              onValueChange={(value) =>
-                setDraft((prev) => ({
-                  ...prev,
-                  sourceMode: value === "existing" ? "existing" : "new",
-                }))
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="new">新建渠道</SelectItem>
-                <SelectItem value="existing">选择已有渠道</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          {draft.sourceMode === "existing" ? (
+          {fixedChannel ? (
             <div className="space-y-1.5">
-              <Label>已有渠道</Label>
-              <Select
-                value={draft.channelId}
-                onValueChange={(value) => setDraft((prev) => ({ ...prev, channelId: value }))}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="选择渠道" />
-                </SelectTrigger>
-                <SelectContent>
-                  {channels.map((channel) => (
-                    <SelectItem key={channel.id} value={String(channel.id)}>
-                      {channel.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+              <Label>目标渠道</Label>
+              <div className="flex h-10 items-center rounded-md border border-border bg-muted/20 px-3 text-sm text-foreground">
+                {fixedChannel.name}
+              </div>
             </div>
           ) : (
             <>
+              <div className="space-y-1.5">
+                <Label>接入方式</Label>
+                <Select
+                  value={draft.sourceMode}
+                  onValueChange={(value) =>
+                    setDraft((prev) => ({
+                      ...prev,
+                      sourceMode: value === "existing" ? "existing" : "new",
+                    }))
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="new">新建渠道</SelectItem>
+                    {channels.length > 0 ? <SelectItem value="existing">选择已有渠道</SelectItem> : null}
+                  </SelectContent>
+                </Select>
+              </div>
+              {draft.sourceMode === "existing" ? (
+                <div className="space-y-1.5">
+                  <Label>已有渠道</Label>
+                  <Select
+                    value={draft.channelId}
+                    onValueChange={(value) => setDraft((prev) => ({ ...prev, channelId: value }))}
+                  >
+                    <SelectTrigger>
+                      <SelectValue placeholder="选择渠道" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {channels.map((channel) => (
+                        <SelectItem key={channel.id} value={String(channel.id)}>
+                          {channel.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : (
+                <>
               <div className="space-y-1.5">
                 <Label htmlFor="manual-channel-name">渠道名</Label>
                 <Input
@@ -239,6 +251,8 @@ export function ManualGroupKeyDialog({
                   placeholder="https://..."
                 />
               </div>
+                </>
+              )}
             </>
           )}
           <div className="space-y-1.5">
@@ -270,7 +284,7 @@ export function ManualGroupKeyDialog({
             />
           </div>
           <div className="space-y-1.5">
-            <Label>请求格式</Label>
+            <Label>客户端格式</Label>
             <Select
               value={draft.clientFormat}
               onValueChange={(value) =>
@@ -288,19 +302,14 @@ export function ManualGroupKeyDialog({
             </Select>
           </div>
           <div className="space-y-1.5">
-            <Label>上游接口</Label>
-            <Select
-              value={draft.requestMode}
-              onValueChange={(value) => setDraft((prev) => ({ ...prev, requestMode: normalizeRequestMode(value) }))}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="responses">Responses</SelectItem>
-                <SelectItem value="chat">Chat</SelectItem>
-              </SelectContent>
-            </Select>
+            <Label>上游接口（自动检测）</Label>
+            <div className="flex h-10 items-center rounded-md border border-border bg-muted/20 px-3 text-xs text-muted-foreground">
+              {draft.clientFormat === "openai"
+                ? "自动检测 Responses / Chat"
+                : draft.clientFormat === "claude"
+                  ? "自动使用 Claude Messages"
+                  : "自动使用 Grok Chat"}
+            </div>
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="manual-priority">调度优先级</Label>

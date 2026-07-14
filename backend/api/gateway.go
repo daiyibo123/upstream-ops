@@ -260,6 +260,19 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{"key": key}})
 	})
+	gp.POST("/group-keys/:id/detect-request-mode", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		item, err := d.Gateway.DetectGroupRequestMode(c.Request.Context(), id)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": item})
+	})
 	gp.POST("/group-keys/bootstrap", func(c *gin.Context) {
 		result, err := d.Gateway.BootstrapGroupKeys(c.Request.Context())
 		if err != nil {

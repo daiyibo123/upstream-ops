@@ -303,8 +303,12 @@ export function GatewayStatusDashboard() {
                     <span className="font-semibold text-warning">{rateLimitedGroups}</span>
                   </p>
                   <p className="flex justify-between gap-2">
-                    <span className="text-muted-foreground">403 / 非生成</span>
-                    <span className="font-semibold text-warning">{forbiddenGroups + nonGenerationGroups}</span>
+                    <span className="text-muted-foreground">403 拒绝</span>
+                    <span className="font-semibold text-danger">{forbiddenGroups}</span>
+                  </p>
+                  <p className="flex justify-between gap-2">
+                    <span className="text-muted-foreground">非生成响应</span>
+                    <span className="font-semibold text-warning">{nonGenerationGroups}</span>
                   </p>
                   <p className="flex justify-between gap-2">
                     <span className="text-muted-foreground">其它异常</span>

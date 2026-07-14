@@ -6,7 +6,7 @@
 
 - **聚合调度**：创建密钥请求本站 → 本站在活着的上游里挑最便宜的转发。公益/免费渠道优先，其次按倍率从低到高。
 - **自动故障切换**：请求失败自动切换下一个候选；失败渠道冷却 5 分钟后自动恢复，也可手动解除。
-- **健康检查（测活）**：并发测活、独立超时、极小 token 探针（发 `hi` + `max_tokens:1`）；OpenAI、Claude 与 Grok 渠道分别用各自格式探测，避免误判。活的标绿、死的标红。
+- **健康检查（测活）**：并发测活、独立超时、极小 token 的流式 `1+1=` 探针（最多 2 token）；OpenAI、Claude 与 Grok 渠道分别自动识别并使用各自原生格式探测，避免误判。活的标绿、死的标红。
 - **格式兼容**：客户端可用 `/v1/responses`、`/v1/chat/completions`、`/v1/messages`；上游只支持 chat 时自动降级并把响应转回客户端期望的格式。Codex 直连（不经路由）也能用。
 - **密钥管理**：`sk-` 前缀、命名、启用/停用、过期时间、每日/累计额度（按 M 计），可指定只走某些渠道。
 - **公益 Key**：可在公开首页展示一个可复制的公益 Key，支持复制密码、提示词、到期时间。
@@ -41,7 +41,7 @@ docker compose pull && docker compose up -d
 
 ```bash
 cd /root/upstream-ops
-curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.22.4/docker-compose.yml
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.22.5/docker-compose.yml
 sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=latest/' .env
 docker compose pull && docker compose up -d
 ```

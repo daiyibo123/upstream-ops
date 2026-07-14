@@ -233,7 +233,7 @@ type BootstrapItem struct {
 // text gateway automatically. They can still be added manually if needed.
 // The upstream names are not normalized and may use Chinese names or English
 // aliases such as image / im2, so every listed keyword is matched broadly.
-var bootstrapKeyBlockKeywords = []string{"图", "image", "img", "im2", "ban"}
+var bootstrapKeyBlockKeywords = []string{"图", "image", "img", "im2", "ban", "香蕉"}
 
 func blockedBootstrapKeyKeyword(group connector.APIKeyGroup) (string, bool) {
 	// The exclusion is intentionally scoped to the discovered group. A channel
@@ -300,6 +300,7 @@ type UpdateGroupKeyInput struct {
 	Priority         *int    `json:"priority"`
 	ClientFormat     *string `json:"client_format"`
 	Charity          *bool   `json:"charity"`
+	Key              *string `json:"key"`
 }
 
 type normalizedRequest struct {
@@ -1056,6 +1057,27 @@ func (s *Service) GroupKeyCounts() (storage.UpstreamGroupKeyCounts, error) {
 }
 
 func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.UpstreamGroupKey, error) {
+	if input.Key != nil {
+		key, err := s.groupKeys.FindByID(id)
+		if err != nil {
+			return nil, err
+		}
+		if !isManualGroupKey(key) {
+			return nil, errors.New("only manually added group keys can replace the upstream key")
+		}
+		rawKey := sanitizeManualSecret(*input.Key)
+		if rawKey == "" {
+			return nil, errors.New("upstream key cannot be empty")
+		}
+		cipher, err := s.cipher.Encrypt(rawKey)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt upstream key: %w", err)
+		}
+		if err := s.groupKeys.UpdateManualKey(id, cipher); err != nil {
+			return nil, err
+		}
+		s.clearRuntimeDisable(id)
+	}
 	if input.ConcurrencyLimit != nil {
 		limit := *input.ConcurrencyLimit
 		if limit < 0 {
@@ -1072,9 +1094,7 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 		s.clearRuntimeDisable(id)
 	}
 	if input.RequestMode != nil {
-		if err := s.groupKeys.UpdateRequestMode(id, normalizeUpstreamRequestMode(*input.RequestMode)); err != nil {
-			return nil, err
-		}
+		return nil, errors.New("upstream request mode is detected automatically and cannot be set manually")
 	}
 	if input.Priority != nil {
 		priority := *input.Priority
@@ -1114,6 +1134,180 @@ func isManualGroupKey(key *storage.UpstreamGroupKey) bool {
 	return key != nil && strings.HasPrefix(strings.ToLower(strings.TrimSpace(key.GroupRef)), "manual:")
 }
 
+const manualRequestModeDetectTimeout = 12 * time.Second
+
+// DetectGroupRequestMode probes the protocol that belongs to this channel
+// format. OpenAI relays are detected as Responses or Chat; Claude and Grok are
+// verified with their native Messages and Chat contracts respectively.
+func (s *Service) DetectGroupRequestMode(ctx context.Context, id uint) (*storage.UpstreamGroupKey, error) {
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	switch normalizeClientFormat(key.ClientFormat) {
+	case "openai":
+		return s.detectOpenAIGroupRequestMode(ctx, key)
+	case "claude":
+		return s.detectFixedGroupRequestMode(ctx, key, "messages")
+	case "grok":
+		return s.detectFixedGroupRequestMode(ctx, key, "chat")
+	default:
+		return key, nil
+	}
+}
+
+// DetectOpenAIGroupRequestMode is kept for callers that intentionally need
+// only the OpenAI/GPT branch. The general detector is used by channel sync and
+// manual-key editing.
+func (s *Service) DetectOpenAIGroupRequestMode(ctx context.Context, id uint) (*storage.UpstreamGroupKey, error) {
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if normalizeClientFormat(key.ClientFormat) != "openai" {
+		return key, nil
+	}
+	return s.detectOpenAIGroupRequestMode(ctx, key)
+}
+
+// DetectManualGroupKeyRequestMode remains the narrow public helper used by
+// manual-key editing. It delegates to the general detector after enforcing
+// that the caller is operating on a manually added upstream key.
+func (s *Service) DetectManualGroupKeyRequestMode(ctx context.Context, id uint) (*storage.UpstreamGroupKey, error) {
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if !isManualGroupKey(key) {
+		return nil, errors.New("only manually added group keys support request-mode detection")
+	}
+	return s.DetectGroupRequestMode(ctx, id)
+}
+
+func (s *Service) detectOpenAIGroupRequestMode(ctx context.Context, key *storage.UpstreamGroupKey) (*storage.UpstreamGroupKey, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, manualRequestModeDetectTimeout)
+	defer cancel()
+	models := []string{openAIHealthProbePrimaryModel, openAIHealthProbeFallbackModel}
+	if detected, ok, err := s.detectOpenAIGroupRequestModeForModels(probeCtx, key, models); err != nil {
+		return nil, err
+	} else if ok {
+		return detected, nil
+	}
+
+	// Some OpenAI-compatible relays expose only a newer model (for example
+	// gpt-5.6).  A gpt-5.4 probe must not make those healthy relays look dead.
+	// Only after the two tiny default probes fail do we ask /v1/models and try
+	// one advertised text model. This preserves the low-cost fast path while
+	// still discovering a compatible protocol for model-limited channels.
+	if model, _, _, err := s.discoverHealthProbeModel(probeCtx, key); err == nil {
+		before := len(models)
+		models = appendDistinctHealthProbeModel(models, model)
+		if detected, ok, detectErr := s.detectOpenAIGroupRequestModeForModels(probeCtx, key, models[before:]); detectErr != nil {
+			return nil, detectErr
+		} else if ok {
+			return detected, nil
+		}
+	}
+	return key, errors.New("could not detect a working responses or chat endpoint for this upstream key")
+}
+
+func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key *storage.UpstreamGroupKey, models []string) (*storage.UpstreamGroupKey, bool, error) {
+	for _, model := range models {
+		if strings.TrimSpace(model) == "" {
+			continue
+		}
+		for _, mode := range []string{"responses", "chat"} {
+			request := healthGenerationProbeRequest(model)
+			if mode == "chat" {
+				request = request.alt()
+			}
+			status, _, body, probeErr := s.requestHealthProbeCandidate(probeCtx, request, key, healthProbeTimeout)
+			if !healthProbeSucceeded(status, body, probeErr) {
+				continue
+			}
+			if err := s.groupKeys.UpdateRequestMode(key.ID, mode); err != nil {
+				return nil, false, err
+			}
+			detected, err := s.groupKeys.FindByID(key.ID)
+			return detected, true, err
+		}
+	}
+	return key, false, nil
+}
+
+func appendDistinctHealthProbeModel(models []string, model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return models
+	}
+	for _, existing := range models {
+		if strings.EqualFold(strings.TrimSpace(existing), model) {
+			return models
+		}
+	}
+	return append(models, model)
+}
+
+func (s *Service) detectFixedGroupRequestMode(ctx context.Context, key *storage.UpstreamGroupKey, mode string) (*storage.UpstreamGroupKey, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, manualRequestModeDetectTimeout)
+	defer cancel()
+	var (
+		status int
+		body   []byte
+		err    error
+	)
+	switch normalizeClientFormat(key.ClientFormat) {
+	case "claude":
+		status, body, _, err = s.healthProbeClaude(probeCtx, key)
+	case "grok":
+		status, body, _, err = s.healthProbeGrok(probeCtx, key)
+	default:
+		return key, errors.New("unsupported fixed-protocol channel format")
+	}
+	if err != nil || status < http.StatusOK || status >= http.StatusMultipleChoices {
+		return key, healthProbeError(status, body, err)
+	}
+	if err := s.groupKeys.UpdateRequestMode(key.ID, mode); err != nil {
+		return nil, err
+	}
+	return s.groupKeys.FindByID(key.ID)
+}
+
+func healthProbeSucceeded(status int, body []byte, err error) bool {
+	return err == nil && status >= http.StatusOK && status < http.StatusMultipleChoices &&
+		!isUpstreamErrorBody(body) && looksLikeHealthGenerationSuccess(body)
+}
+
+// detectGroupRequestModes refreshes endpoint capability in parallel so a
+// large one-click group sync does not serially wait on every upstream.
+// Detection failure deliberately keeps the prior mode; forwarding still has
+// its protocol fallback and the next sync can retry the probe.
+func (s *Service) detectGroupRequestModes(ids []uint) {
+	const maxConcurrentDetections = 10
+	seen := make(map[uint]struct{}, len(ids))
+	sem := make(chan struct{}, maxConcurrentDetections)
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		if id == 0 {
+			continue
+		}
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(groupID uint) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ctx, cancel := context.WithTimeout(context.Background(), manualRequestModeDetectTimeout)
+			defer cancel()
+			_, _ = s.DetectGroupRequestMode(ctx, groupID)
+		}(id)
+	}
+	wg.Wait()
+}
+
 // ManualGroupKeyInput 是"手动添加渠道分组"的入参：不登录上游，直接填分组名 + key。
 // 用于那些无法登录、只能拿到 key 的上游。
 type ManualGroupKeyInput struct {
@@ -1125,7 +1319,7 @@ type ManualGroupKeyInput struct {
 	Key          string  `json:"key"`           // 上游 key 明文（必填，存库前加密）
 	Ratio        float64 `json:"ratio"`         // 倍率
 	ClientFormat string  `json:"client_format"` // openai / claude
-	RequestMode  string  `json:"request_mode"`  // responses / chat
+	RequestMode  string  `json:"request_mode"`  // auto (OpenAI/GPT is detected); responses / chat are legacy values
 	Charity      bool    `json:"charity"`
 	Priority     int     `json:"priority"`
 }
@@ -1211,7 +1405,16 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 	if err := s.groupKeys.Upsert(rec); err != nil {
 		return nil, fmt.Errorf("保存分组失败: %w", err)
 	}
-	return s.groupKeys.FindByChannelGroup(ch.ID, groupRef)
+	saved, err := s.groupKeys.FindByChannelGroup(ch.ID, groupRef)
+	if err != nil || saved == nil {
+		return saved, err
+	}
+	// Every manual upstream determines its protocol from a real generation
+	// probe. Do not let a form default or an old caller pin it to a wrong path.
+	if detected, detectErr := s.DetectGroupRequestMode(ctx, saved.ID); detectErr == nil && detected != nil {
+		return detected, nil
+	}
+	return saved, nil
 }
 
 // DeleteGroupKey 删除一个上游分组密钥记录。
@@ -1365,6 +1568,22 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 			}
 		}
 	}
+	// Group metadata defaults to Responses on creation, but the actual protocol
+	// is discovered from the upstream instead of being operator-set.
+	// Run this after reconciliation so every enabled channel key, including
+	// previously created manual keys, has its upstream protocol refreshed from
+	// a real probe. This changes only the local protocol capability flag; it
+	// never syncs, edits, or removes manual channel data.
+	if all, listErr := s.groupKeys.List(); listErr == nil {
+		ids := make([]uint, 0, len(all))
+		for i := range all {
+			key := all[i]
+			if key.Enabled && key.KeyCipher != "" {
+				ids = append(ids, key.ID)
+			}
+		}
+		s.detectGroupRequestModes(ids)
+	}
 	return result, nil
 }
 
@@ -1386,6 +1605,19 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 	// use their own request contracts and remain available through per-group
 	// testing, so they cannot be accidentally probed as an OpenAI model.
 	list = filterOpenAIHealthGroups(list)
+	ids := make([]uint, 0, len(list))
+	for i := range list {
+		ids = append(ids, list[i].ID)
+	}
+	// The protocol is a capability of the upstream, not an operator setting.
+	// Refresh it before every GPT batch test so legacy records are corrected
+	// even when the user has not run a group synchronization recently.
+	s.detectGroupRequestModes(ids)
+	for i := range list {
+		if refreshed, findErr := s.groupKeys.FindByID(list[i].ID); findErr == nil && refreshed != nil {
+			list[i] = *refreshed
+		}
+	}
 
 	batchSize := normalizeHealthProbeBatchSize(opts.BatchSize)
 	observer := progress.FromContext(ctx)
@@ -1695,6 +1927,9 @@ func (s *Service) TestGroupKey(id uint) (*HealthResultItem, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
+	if detected, detectErr := s.DetectGroupRequestMode(ctx, key.ID); detectErr == nil && detected != nil {
+		key = detected
+	}
 	result := s.testGroupKey(ctx, key)
 	return &result, nil
 }
@@ -1845,13 +2080,15 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			continue
 		case candRetryable:
 			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
-			s.markProxyFailure(candidate.ID, outcome.errMsg)
+			if shouldMarkProxyFailure(outcome.errMsg) {
+				s.markProxyFailure(candidate.ID, outcome.errMsg)
+			}
 			continue
 		case candFatal:
 			// 明确"客户端错 / 已写字节无法切换"路径：仍然记一次失败方便下次跳过，
 			// 但不再继续 fail-over，把当前错误吐给调用方。
 			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
-			if outcome.markFailure {
+			if outcome.markFailure && shouldMarkProxyFailure(outcome.errMsg) {
 				s.markProxyFailure(candidate.ID, outcome.errMsg)
 			}
 			finalErr = outcome.err
@@ -2540,6 +2777,12 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 	if shouldRetryHealthWithCompatibleModel(body, err) {
 		status, body, err = s.healthProbeOpenAIModel(ctx, key, openAIHealthProbeFallbackModel, false)
 	}
+	if shouldFallbackHealthModelDiscovery(status, body, err) {
+		if model, _, _, discoverErr := s.discoverHealthProbeModel(ctx, key); discoverErr == nil &&
+			!healthProbeModelIsOneOf(model, openAIHealthProbePrimaryModel, openAIHealthProbeFallbackModel) {
+			status, body, err = s.healthProbeOpenAIModel(ctx, key, model, false)
+		}
+	}
 	latencyMS := time.Since(start).Milliseconds()
 	if err != nil {
 		return status, body, latencyMS, err
@@ -2710,8 +2953,24 @@ func (s *Service) discoverHealthProbeModel(ctx context.Context, key *storage.Ups
 	return selectHealthProbeModel(extractHealthProbeModels(body), key.ClientFormat), status, body, nil
 }
 
-func shouldFallbackHealthModelDiscovery(status int) bool {
-	return status == http.StatusNotFound || status == http.StatusMethodNotAllowed || status == http.StatusNotImplemented
+func shouldFallbackHealthModelDiscovery(status int, body []byte, err error) bool {
+	// Model discovery is deliberately only a fallback for a model capability
+	// miss. Do not turn real 401/403/429, balance, network, or router failures
+	// into extra calls that hide the actual reason or consume more quota.
+	if status == http.StatusUnauthorized || status == http.StatusForbidden ||
+		status == http.StatusTooManyRequests || status == http.StatusPaymentRequired {
+		return false
+	}
+	return looksLikeUnsupportedModelError(healthFailureText(body, err))
+}
+
+func healthProbeModelIsOneOf(model string, values ...string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(model), strings.TrimSpace(value)) {
+			return true
+		}
+	}
+	return false
 }
 
 func healthGenerationProbeRequest(model string) normalizedRequest {
@@ -3457,6 +3716,13 @@ func (s *Service) markProxyFailure(id uint, msg string) {
 			s.log.Warn("disable upstream group key failed", "id", id, "err", err)
 		}
 	}
+}
+
+// A requested model can be unavailable on one otherwise healthy upstream.
+// It should trigger same-request failover, but must not turn the whole group
+// red or put its key into cooldown: the next request may use a supported model.
+func shouldMarkProxyFailure(msg string) bool {
+	return !looksLikeUnsupportedModelError(msg) && !looksLikeClientRequestError(msg)
 }
 
 type proxyFailurePolicy struct {
@@ -5213,6 +5479,8 @@ func friendlyGatewayStreamFailureMessage(message string) string {
 	switch {
 	case lower == "":
 		return "请求暂时无法完成，请稍后重试。"
+	case looksLikeUnsupportedModelError(trimmed):
+		return "当前上游不支持请求的模型，已自动尝试其他兼容渠道；请稍后重试或切换模型。"
 	case strings.Contains(lower, "no alive upstream group keys available") ||
 		strings.Contains(lower, "all upstream group keys failed") ||
 		strings.Contains(lower, "upstreams temporarily unavailable"):
@@ -7465,6 +7733,8 @@ func normalizeClientFormat(format string) string {
 
 func normalizeUpstreamRequestMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "messages", "message":
+		return "messages"
 	case "chat", "chat_completions", "chat-completions", "completions":
 		return "chat"
 	default:

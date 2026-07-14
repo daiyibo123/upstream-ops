@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState, type FormEvent } from "react"
-import { Copy, Loader2, Pencil, Plus, Search, Trash2 } from "lucide-react"
+import { Check, Copy, Loader2, Pencil, Plus, Search, Trash2, X } from "lucide-react"
 import { toast } from "sonner"
 import {
   Dialog,
@@ -46,6 +46,7 @@ import type {
   UpstreamGroupKeyReveal,
 } from "@/lib/api-types"
 import { cn } from "@/lib/utils"
+import { ManualGroupKeyDialog } from "@/components/monitor/manual-group-key-dialog"
 
 interface ChannelAPIKeysDialogProps {
   open: boolean
@@ -166,6 +167,20 @@ function statusClass(status: string) {
   }
 }
 
+function requestModeLabel(mode?: string | null) {
+  switch ((mode ?? "").trim().toLowerCase()) {
+    case "messages":
+    case "message":
+      return "Claude Messages"
+    case "chat":
+    case "chat_completions":
+    case "chat-completions":
+      return "Chat Completions"
+    default:
+      return "Responses"
+  }
+}
+
 function splitLines(value: string): string[] {
   return value
     .split(/\r?\n|,/)
@@ -267,6 +282,10 @@ export function ChannelAPIKeysDialog({
   const [revealedKeys, setRevealedKeys] = useState<Record<number, string>>({})
   const [manualKeys, setManualKeys] = useState<UpstreamGroupKey[]>([])
   const [manualReloadTick, setManualReloadTick] = useState(0)
+  const [editingManualKeyID, setEditingManualKeyID] = useState<number | null>(null)
+  const [manualKeyDraft, setManualKeyDraft] = useState("")
+  const [savingManualKey, setSavingManualKey] = useState(false)
+  const [manualCreateOpen, setManualCreateOpen] = useState(false)
 
   const items = data?.items ?? []
   const totalPages = Math.max(1, data?.pages ?? 1)
@@ -287,6 +306,10 @@ export function ChannelAPIKeysDialog({
     setRevealingID(null)
     setRevealedKeys({})
     setManualKeys([])
+    setEditingManualKeyID(null)
+    setManualKeyDraft("")
+    setSavingManualKey(false)
+    setManualCreateOpen(false)
   }, [open, channel?.id])
 
   useEffect(() => {
@@ -573,6 +596,55 @@ export function ChannelAPIKeysDialog({
     }
   }
 
+  async function beginManualKeyEdit(key: UpstreamGroupKey) {
+    try {
+      const fullKey = await revealManualKey(key)
+      setEditingManualKeyID(key.id)
+      setManualKeyDraft(fullKey)
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "获取完整 Key 失败")
+    }
+  }
+
+  function cancelManualKeyEdit() {
+    setEditingManualKeyID(null)
+    setManualKeyDraft("")
+  }
+
+  async function saveManualKey(key: UpstreamGroupKey) {
+    const nextKey = manualKeyDraft.trim()
+    if (!nextKey) {
+      toast.error("上游 Key 不能为空")
+      return
+    }
+    setSavingManualKey(true)
+    try {
+      let updated = await apiFetch<UpstreamGroupKey>(`/gateway/group-keys/${key.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ key: nextKey }),
+      })
+      try {
+        updated = await apiFetch<UpstreamGroupKey>(`/gateway/group-keys/${key.id}/detect-request-mode`, {
+          method: "POST",
+        })
+        toast.success(`Key 已更新，已自动识别为 ${requestModeLabel(updated.request_mode)} 接口`)
+      } catch (detectError) {
+        const err = detectError as Error
+        toast.warning(`Key 已更新，但接口自动识别失败：${err.message || "请稍后单独测活"}`)
+      }
+      setManualKeys((items) => items.map((item) => (item.id === key.id ? updated : item)))
+      setRevealedKeys((prev) => ({ ...prev, [key.id]: nextKey }))
+      cancelManualKeyEdit()
+      reload()
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "更新手动 Key 失败")
+    } finally {
+      setSavingManualKey(false)
+    }
+  }
+
   async function deleteManualKey(key: UpstreamGroupKey) {
     const ok = await confirm({
       title: `删除手动密钥 ${key.group_name || key.id}？`,
@@ -611,6 +683,16 @@ export function ChannelAPIKeysDialog({
 
           {isManual ? (
             <div className="space-y-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-foreground">该渠道的可用上游 Key</p>
+                  <p className="mt-1 text-xs text-muted-foreground">可直接添加、修改或删除绑定到此渠道的上游 Key。</p>
+                </div>
+                <Button type="button" size="sm" className="shrink-0 gap-1.5" onClick={() => setManualCreateOpen(true)}>
+                  <Plus className="size-4" />
+                  添加 Key
+                </Button>
+              </div>
               <div className="overflow-hidden rounded-lg border border-border">
                 <Table>
                   <TableHeader>
@@ -639,7 +721,8 @@ export function ChannelAPIKeysDialog({
                       </TableRow>
                     ) : (
                       manualKeys.map((item) => {
-                        const displayKey = revealedKeys[item.id] || "点击显示完整 Key"
+                        const editingManualKey = editingManualKeyID === item.id
+                        const displayKey = editingManualKey ? manualKeyDraft : (revealedKeys[item.id] || "点击显示完整 Key")
                         const isRevealing = revealingID === item.id
                         return (
                           <TableRow key={item.id}>
@@ -655,12 +738,15 @@ export function ChannelAPIKeysDialog({
                             </TableCell>
                             <TableCell className="min-w-40">
                               <Input
-                                readOnly
+                                readOnly={!editingManualKey}
                                 value={isRevealing ? "加载中..." : displayKey}
-                                className="h-8 w-40 cursor-pointer truncate font-mono text-xs sm:w-56"
-                                title="点击显示完整 Key"
-                                disabled={isRevealing}
-                                onClick={() => void revealAndShowManual(item)}
+                                className="h-8 w-40 font-mono text-xs sm:w-56"
+                                title={editingManualKey ? "输入新的上游 Key" : "点击显示完整 Key"}
+                                disabled={isRevealing || (savingManualKey && editingManualKey)}
+                                onChange={(event) => setManualKeyDraft(event.target.value)}
+                                onClick={() => {
+                                  if (!editingManualKey) void revealAndShowManual(item)
+                                }}
                               />
                             </TableCell>
                             <TableCell className="text-xs uppercase">{item.client_format || "openai"}</TableCell>
@@ -672,30 +758,63 @@ export function ChannelAPIKeysDialog({
                             </TableCell>
                             <TableCell>
                               <div className="flex justify-end gap-1">
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-sm"
-                                  title="复制完整 Key"
-                                  disabled={isRevealing}
-                                  onClick={() => void revealAndCopyManual(item)}
-                                >
-                                  {isRevealing ? (
-                                    <Loader2 className="size-4 animate-spin" />
-                                  ) : (
-                                    <Copy className="size-4" />
-                                  )}
-                                </Button>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-sm"
-                                  title="删除"
-                                  className="text-destructive hover:text-destructive"
-                                  onClick={() => void deleteManualKey(item)}
-                                >
-                                  <Trash2 className="size-4" />
-                                </Button>
+                                {editingManualKey ? (
+                                  <>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon-sm"
+                                      title="保存并自动识别接口"
+                                      disabled={savingManualKey}
+                                      onClick={() => void saveManualKey(item)}
+                                    >
+                                      {savingManualKey ? <Loader2 className="size-4 animate-spin" /> : <Check className="size-4" />}
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon-sm"
+                                      title="取消修改"
+                                      disabled={savingManualKey}
+                                      onClick={cancelManualKeyEdit}
+                                    >
+                                      <X className="size-4" />
+                                    </Button>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon-sm"
+                                      title="复制完整 Key"
+                                      disabled={isRevealing}
+                                      onClick={() => void revealAndCopyManual(item)}
+                                    >
+                                      {isRevealing ? <Loader2 className="size-4 animate-spin" /> : <Copy className="size-4" />}
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon-sm"
+                                      title="修改 Key"
+                                      disabled={isRevealing}
+                                      onClick={() => void beginManualKeyEdit(item)}
+                                    >
+                                      <Pencil className="size-4" />
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon-sm"
+                                      title="删除"
+                                      className="text-destructive hover:text-destructive"
+                                      onClick={() => void deleteManualKey(item)}
+                                    >
+                                      <Trash2 className="size-4" />
+                                    </Button>
+                                  </>
+                                )}
                               </div>
                             </TableCell>
                           </TableRow>
@@ -968,6 +1087,18 @@ export function ChannelAPIKeysDialog({
           )}
         </DialogContent>
       </Dialog>
+      {isManual && channel ? (
+        <ManualGroupKeyDialog
+          open={manualCreateOpen}
+          onOpenChange={setManualCreateOpen}
+          channels={[channel]}
+          fixedChannel={channel}
+          initialClientFormat={manualKeys[0]?.client_format}
+          onCreated={async () => {
+            reload()
+          }}
+        />
+      ) : null}
       {confirmDialog}
     </>
   )

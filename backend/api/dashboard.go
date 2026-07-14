@@ -448,7 +448,7 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 		if !group.Enabled {
 			status = "disabled"
 		}
-		isOpenAI := dashboardGroupIsOpenAIResponses(group.ClientFormat, group.RequestMode)
+		isOpenAI := dashboardGroupIsOpenAI(group.ClientFormat)
 		if isOpenAI {
 			stat.TotalGroups++
 			switch status {
@@ -507,11 +507,13 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 	return stat
 }
 
-func dashboardGroupIsOpenAIResponses(format, requestMode string) bool {
+func dashboardGroupIsOpenAI(format string) bool {
 	switch strings.ToLower(strings.TrimSpace(format)) {
 	case "", "openai", "any":
-		mode := strings.ToLower(strings.TrimSpace(requestMode))
-		return mode == "" || mode == "responses"
+		// Both native Responses and Chat-completions compatibility upstreams are
+		// OpenAI/GPT channels. Excluding the latter made the dashboard health
+		// numbers disagree with one-click health checks and hide real failures.
+		return true
 	default:
 		return false
 	}

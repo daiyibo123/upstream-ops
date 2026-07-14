@@ -37,6 +37,7 @@ import { apiFetch } from "@/lib/api"
 import { channelTypeLabel, formatRatio, formatTokens, money, relativeTime } from "@/lib/format"
 import { testGatewayHealthStream, type ProgressEvent } from "@/lib/sync-stream"
 import { cn } from "@/lib/utils"
+import { ManualGroupKeyDialog } from "@/components/monitor/manual-group-key-dialog"
 import type {
   GatewayBootstrapResult,
   GatewayHealthResult,
@@ -51,7 +52,7 @@ const TOKEN_M = 1_000_000
 type ClientFormat = "openai" | "claude" | "grok" | "any"
 type ColumnClientFormat = "openai" | "claude" | "grok"
 type GroupScope = "all" | "selected" | "charity" | "normal"
-type UpstreamRequestMode = "responses" | "chat"
+type UpstreamRequestMode = "responses" | "chat" | "messages"
 type GroupFormatFilter = "all" | ColumnClientFormat
 type RateFilter = "all" | "0-0.05" | "0.06-0.1" | "0.1-0.2" | "0.2+"
 type CharityFilter = "all" | "charity" | "normal"
@@ -269,6 +270,9 @@ function groupScopeLabel(value: GroupScope) {
 
 function normalizeRequestMode(value?: string | null): UpstreamRequestMode {
   switch ((value ?? "").toLowerCase()) {
+	case "messages":
+	case "message":
+		return "messages"
     case "chat":
     case "chat_completions":
     case "chat-completions":
@@ -279,7 +283,14 @@ function normalizeRequestMode(value?: string | null): UpstreamRequestMode {
 }
 
 function requestModeLabel(value?: string | null) {
-  return normalizeRequestMode(value) === "chat" ? "Chat" : "Responses"
+  switch (normalizeRequestMode(value)) {
+    case "chat":
+      return "Chat"
+    case "messages":
+      return "Messages"
+    default:
+      return "Responses"
+  }
 }
 
 function groupClientFormat(group: UpstreamGroupKey): ClientFormat {
@@ -426,17 +437,19 @@ function groupSearchText(group: UpstreamGroupKey) {
 }
 
 function groupMatchesFilters(group: UpstreamGroupKey, filters: GroupFilters) {
-  const query = normalizeSearchText(filters.search)
+  const queryTerms = normalizeSearchText(filters.search).split(/\s+/).filter(Boolean)
   const checks: boolean[] = []
-  if (query) checks.push(groupSearchText(group).includes(query))
+  if (queryTerms.length > 0) {
+    const text = groupSearchText(group)
+    checks.push(queryTerms.every((term) => text.includes(term)))
+  }
   if (filters.format !== "all") checks.push(groupMatchesFormatFilter(group, filters.format))
   if (filters.rateBand !== "all") checks.push(groupMatchesRateBand(group, filters.rateBand))
   if (filters.charity !== "all") checks.push(groupMatchesCharity(group, filters.charity))
   if (filters.status !== "all") checks.push(groupMatchesStatus(group, filters.status))
-  // The unified channel filters are intentionally OR conditions.  For example,
-  // selecting Claude and 0.05 finds both matching sets instead of silently
-  // hiding a channel that only meets one of the selected search conditions.
-  return checks.length === 0 || checks.some(Boolean)
+  // Every selected condition narrows the result. The old OR behavior made a
+  // second selector unexpectedly add unrelated channels back into the list.
+  return checks.length === 0 || checks.every(Boolean)
 }
 
 function activeGroupFilterCount(filters: GroupFilters) {
@@ -491,6 +504,7 @@ function healthResultSummaryText(result: GatewayHealthResult) {
 function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
   return groups.slice().sort((a, b) => {
     return (
+      groupDisplayFormatRank(a) - groupDisplayFormatRank(b) ||
       a.ratio - b.ratio ||
       groupStatusRank(effectiveStatus(a)) - groupStatusRank(effectiveStatus(b)) ||
       (b.priority || 0) - (a.priority || 0) ||
@@ -498,6 +512,19 @@ function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
       a.id - b.id
     )
   })
+}
+
+function groupDisplayFormatRank(group: UpstreamGroupKey) {
+  switch (groupClientFormat(group)) {
+    case "openai":
+      return 0
+    case "claude":
+      return 1
+    case "grok":
+      return 2
+    default:
+      return 3
+  }
 }
 
 function cleanGroupIDs(ids: number[], groups: UpstreamGroupKey[], format: ClientFormat, maxRatio: MaxGroupRatioLimit = "0") {
@@ -1059,6 +1086,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [groupPage, setGroupPage] = useState(1)
   const [groupPageSize, setGroupPageSize] = useState(10)
   const [keySearch, setKeySearch] = useState("")
+  const [manualGroupDialogOpen, setManualGroupDialogOpen] = useState(false)
 
   const displayKeys = useMemo(
     () => keys.filter(isOpenAIGatewayKey),
@@ -1118,13 +1146,13 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     () => [...ipPolicies].sort((a, b) => a.ip.localeCompare(b.ip)),
     [ipPolicies],
   )
-  const openAIHealthGroups = useMemo(
-    () => groups.filter(isOpenAIHealthGroup),
-    [groups],
+  const filteredOpenAIHealthGroups = useMemo(
+    () => filteredGroups.filter(isOpenAIHealthGroup),
+    [filteredGroups],
   )
-  const enabledOpenAIHealthGroups = useMemo(
-    () => openAIHealthGroups.filter((group) => group.enabled !== false),
-    [openAIHealthGroups],
+  const enabledFilteredOpenAIHealthGroups = useMemo(
+    () => filteredOpenAIHealthGroups.filter((group) => group.enabled !== false),
+    [filteredOpenAIHealthGroups],
   )
 
   async function load() {
@@ -1365,7 +1393,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   }
 
   async function testGroups() {
-    const enabledTargets = enabledOpenAIHealthGroups
+    // One-click health checks always use OpenAI/GPT groups only, and honour
+    // the currently applied unified filters instead of silently probing every
+    // group in the database.
+    const enabledTargets = enabledFilteredOpenAIHealthGroups
     if (enabledTargets.length === 0) {
       toast.error("没有可测活的 OpenAI 分组")
       return
@@ -1453,7 +1484,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
 
   async function updateGroup(
     group: UpstreamGroupKey,
-    patch: { concurrency_limit?: number; enabled?: boolean; request_mode?: UpstreamRequestMode; priority?: number; client_format?: string; charity?: boolean },
+    patch: { concurrency_limit?: number; enabled?: boolean; priority?: number; client_format?: string; charity?: boolean },
   ) {
     setBusy(`group-${group.id}`)
     try {
@@ -1462,7 +1493,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
         body: JSON.stringify({
           concurrency_limit: patch.concurrency_limit ?? group.concurrency_limit ?? 0,
           ...(patch.enabled == null ? {} : { enabled: patch.enabled }),
-          ...(patch.request_mode == null ? {} : { request_mode: patch.request_mode }),
           ...(patch.priority == null ? {} : { priority: patch.priority }),
           ...(patch.client_format == null ? {} : { client_format: patch.client_format }),
           ...(patch.charity == null ? {} : { charity: patch.charity }),
@@ -1537,17 +1567,16 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
-  async function changeGroupRequestMode(group: UpstreamGroupKey, requestMode: UpstreamRequestMode) {
-    const updated = await updateGroup(group, { request_mode: requestMode })
-    if (updated) {
-      toast.success(`上游接口已切换为 ${requestModeLabel(requestMode)}`)
-    }
-  }
-
   async function changeGroupClientFormat(group: UpstreamGroupKey, format: string) {
-    const updated = await updateGroup(group, { client_format: format })
-    if (updated) {
-      toast.success(`已标记为 ${clientFormatLabel(format)} 渠道`)
+    let updated = await updateGroup(group, { client_format: format })
+    if (!updated) return
+    try {
+      updated = await apiFetch<UpstreamGroupKey>(`/gateway/group-keys/${group.id}/detect-request-mode`, { method: "POST" })
+      setGroups((prev) => sortGroupsForDisplay(prev.map((item) => (item.id === group.id ? updated : item))))
+      toast.success(`已标记为 ${clientFormatLabel(format)} 渠道，接口已自动识别为 ${requestModeLabel(updated.request_mode)}`)
+    } catch (e) {
+      const err = e as Error
+      toast.warning(`已标记为 ${clientFormatLabel(format)} 渠道，但接口自动识别失败：${err.message || "请稍后测活"}`)
     }
   }
 
@@ -1619,19 +1648,16 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               <SelectItem value="grok">Grok</SelectItem>
             </SelectContent>
           </Select>
-          <Select
-            value={normalizeRequestMode(group.request_mode)}
-            disabled={!!busy}
-            onValueChange={(value) => void changeGroupRequestMode(group, normalizeRequestMode(value))}
+          <div
+            className="flex h-8 items-center rounded-md border border-border bg-muted/20 px-2 text-xs text-muted-foreground"
+            title={format === "openai" ? "系统自动探测并保存 Responses 或 Chat" : "由渠道格式自动确定协议"}
           >
-            <SelectTrigger className="h-8 w-full text-xs" aria-label="上游接口">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="responses">Responses</SelectItem>
-              <SelectItem value="chat">Chat</SelectItem>
-            </SelectContent>
-          </Select>
+            {format === "openai"
+              ? `自动：${requestModeLabel(group.request_mode)}`
+              : format === "claude"
+                ? "自动：Claude Messages"
+                : "自动：Grok Chat"}
+          </div>
         </div>
 
         <div className="grid gap-1.5">
@@ -1778,20 +1804,24 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               启用 {displayEnabledCount}/{totalGroups}
             </Badge>
             <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
-              OpenAI/Responses 可测 {enabledOpenAIHealthGroups.length}/{openAIHealthGroups.length}
+              当前筛选 OpenAI 可测 {enabledFilteredOpenAIHealthGroups.length}/{filteredOpenAIHealthGroups.length}
             </Badge>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
               {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
               覆盖同步分组 Key
             </Button>
-            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || enabledOpenAIHealthGroups.length === 0} onClick={testGroups}>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={() => setManualGroupDialogOpen(true)}>
+              <Plus className="size-3.5" />
+              手动添加渠道
+            </Button>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || enabledFilteredOpenAIHealthGroups.length === 0} onClick={testGroups}>
               {busy === "test" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
               一键测活
             </Button>
             {healthProgress ? (
               <div className="w-full rounded-md border border-border bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground sm:w-auto">
                 <span className="font-medium text-foreground">
-                  {healthProgress.completed}/{healthProgress.total || enabledOpenAIHealthGroups.length}
+                  {healthProgress.completed}/{healthProgress.total || enabledFilteredOpenAIHealthGroups.length}
                 </span>
                 <span className="mx-1">·</span>
                 <span>
@@ -2090,7 +2120,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 <div>
                   <p className="text-xs font-medium text-foreground">统一筛选区</p>
                   <p className="mt-1 text-[11px] text-muted-foreground">
-                    搜索、格式、倍率、状态按条件筛选；不填条件时展示全部渠道。
+                    已填写的搜索、格式、倍率、公益和状态条件会同时生效；不填条件时展示全部渠道。
                   </p>
                 </div>
                 <Badge variant="outline" className="border-border bg-background text-muted-foreground">
@@ -2109,7 +2139,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                       }
                     }}
                     className="h-9 pl-8 text-xs"
-                    placeholder="模糊搜索渠道、分组、格式、状态、倍率"
+                    placeholder="模糊搜索渠道、分组、格式、状态、倍率；多个词用空格分隔"
                     aria-label="搜索可用渠道对应的上游分组"
                   />
                 </div>
@@ -2327,6 +2357,15 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <ManualGroupKeyDialog
+        open={manualGroupDialogOpen}
+        onOpenChange={setManualGroupDialogOpen}
+        channels={[]}
+        onCreated={async () => {
+          await load()
+        }}
+      />
     </Card>
   )
 }

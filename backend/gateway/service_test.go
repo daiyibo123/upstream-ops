@@ -789,6 +789,13 @@ func TestProxyFailsOverOnUnsupportedModelBadRequest(t *testing.T) {
 	if badHits != 1 || liveHits != 1 {
 		t.Fatalf("unsupported model did not fail over: bad=%d live=%d", badHits, liveHits)
 	}
+	badGroup, err := env.groupKeys.FindByChannelGroup(badChannel.ID, "bad")
+	if err != nil || badGroup == nil {
+		t.Fatalf("reload unsupported-model group: %v", err)
+	}
+	if badGroup.Status != "alive" || badGroup.FailureCount != 0 {
+		t.Fatalf("unsupported model must not poison healthy group status: %#v", badGroup)
+	}
 }
 
 func TestProxyFailsOverOnOpenAIModelAccessBadRequest(t *testing.T) {
@@ -3101,6 +3108,286 @@ func TestBlockedBootstrapKeyKeywordChecksImageAlias(t *testing.T) {
 	}
 }
 
+func TestBlockedBootstrapKeyKeywordChecksBanana(t *testing.T) {
+	if keyword, blocked := blockedBootstrapKeyKeyword(
+		connector.APIKeyGroup{Name: "香蕉公益线路"},
+	); !blocked || keyword != "香蕉" {
+		t.Fatalf("blocked = %v keyword = %q, want 香蕉 group-name hit", blocked, keyword)
+	}
+}
+
+func TestShouldMarkProxyFailureKeepsUnsupportedModelGroupHealthy(t *testing.T) {
+	if shouldMarkProxyFailure(`HTTP 400: {"error":{"message":"model gpt-5.6 is not enabled for this channel"}}`) {
+		t.Fatal("unsupported requested model must not mark an otherwise healthy group failed")
+	}
+	if !shouldMarkProxyFailure("HTTP 503: upstream temporarily unavailable") {
+		t.Fatal("temporary upstream failure should still be tracked")
+	}
+}
+
+func TestDetectManualGroupKeyRequestModeUsesChat(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"responses endpoint not found"}}`))
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"2\"}}]}\n\ndata: [DONE]\n\n"))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("m", 32))
+	channel := &storage.Channel{Name: "manual-chat", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create manual channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-manual-chat")
+	if err != nil {
+		t.Fatalf("encrypt manual key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", GroupRef: "manual:default", GroupName: "default",
+		Ratio: 1, KeyCipher: cipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:default")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+
+	detected, err := env.svc.DetectManualGroupKeyRequestMode(context.Background(), group.ID)
+	if err != nil {
+		t.Fatalf("detect request mode: %v", err)
+	}
+	if detected.RequestMode != "chat" {
+		t.Fatalf("request mode = %q, want chat", detected.RequestMode)
+	}
+}
+
+func TestDetectGroupRequestModeDiscoversAdvertisedModelAfterDefaultProbeMiss(t *testing.T) {
+	var probeModels []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.6"}]}`))
+		case "/v1/responses", "/v1/chat/completions":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode probe request: %v", err)
+				return
+			}
+			model := stringValue(body["model"])
+			probeModels = append(probeModels, model)
+			if model != "gpt-5.6" {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"message":"model is not supported"}}`))
+				return
+			}
+			if r.URL.Path != "/v1/responses" {
+				t.Errorf("expected discovered model to detect native Responses first, got %s", r.URL.Path)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"2\"}\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("d", 32))
+	channel := &storage.Channel{Name: "discovered-model", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-discovered")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", GroupRef: "manual:discovered", GroupName: "discovered",
+		Ratio: 1, KeyCipher: cipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:discovered")
+	if err != nil || group == nil {
+		t.Fatalf("find group key: %v", err)
+	}
+
+	detected, err := env.svc.DetectGroupRequestMode(context.Background(), group.ID)
+	if err != nil {
+		t.Fatalf("detect request mode: %v", err)
+	}
+	if detected.RequestMode != "responses" {
+		t.Fatalf("request mode = %q, want responses", detected.RequestMode)
+	}
+	if !healthProbeModelIsOneOf("gpt-5.6", probeModels...) {
+		t.Fatalf("probe models = %#v, want discovered gpt-5.6", probeModels)
+	}
+}
+
+func TestDetectGroupRequestModeUsesNativeClaudeMessages(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/messages" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("x-api-key") != "sk-claude" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"2\"}}\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("c", 32))
+	channel := &storage.Channel{Name: "manual-claude", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create manual channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-claude")
+	if err != nil {
+		t.Fatalf("encrypt manual key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "claude", RequestMode: "responses", GroupRef: "manual:claude", GroupName: "claude",
+		Ratio: 1, KeyCipher: cipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:claude")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+
+	detected, err := env.svc.DetectGroupRequestMode(context.Background(), group.ID)
+	if err != nil {
+		t.Fatalf("detect Claude request mode: %v", err)
+	}
+	if detected.RequestMode != "messages" {
+		t.Fatalf("request mode = %q, want messages", detected.RequestMode)
+	}
+}
+
+func TestDetectGroupRequestModeUsesGrokChat(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer sk-grok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"2\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("g", 32))
+	channel := &storage.Channel{Name: "manual-grok", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create manual channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-grok")
+	if err != nil {
+		t.Fatalf("encrypt manual key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "grok", RequestMode: "responses", GroupRef: "manual:grok", GroupName: "grok",
+		Ratio: 1, KeyCipher: cipher, Status: "unknown",
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:grok")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+
+	detected, err := env.svc.DetectGroupRequestMode(context.Background(), group.ID)
+	if err != nil {
+		t.Fatalf("detect Grok request mode: %v", err)
+	}
+	if detected.RequestMode != "chat" {
+		t.Fatalf("request mode = %q, want chat", detected.RequestMode)
+	}
+}
+
+func TestUpdateGroupKeyReplacesManualKey(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("u", 32))
+	channel := &storage.Channel{Name: "manual-edit", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.com", MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create manual channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-old")
+	if err != nil {
+		t.Fatalf("encrypt old manual key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", GroupRef: "manual:default", GroupName: "default",
+		Ratio: 1, KeyCipher: cipher, Enabled: false, Status: "auth_failed", FailureCount: 3,
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:default")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+	newKey := "sk-new"
+	updated, err := env.svc.UpdateGroupKey(group.ID, UpdateGroupKeyInput{Key: &newKey})
+	if err != nil {
+		t.Fatalf("replace manual key: %v", err)
+	}
+	if !updated.Enabled || updated.Status != "unknown" || updated.FailureCount != 0 {
+		t.Fatalf("manual key replacement did not reset scheduler state: %#v", updated)
+	}
+	revealed, err := env.svc.RevealManualGroupKey(group.ID)
+	if err != nil || revealed != newKey {
+		t.Fatalf("revealed key = %q, err = %v", revealed, err)
+	}
+}
+
+func TestUpdateGroupKeyRejectsOpenAIRequestModeOverride(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("o", 32))
+	channel := &storage.Channel{Name: "auto-protocol", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.com", MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-auto-protocol")
+	if err != nil {
+		t.Fatalf("encrypt upstream key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", GroupRef: "default", GroupName: "default",
+		Ratio: 1, KeyCipher: cipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "default")
+	if err != nil || group == nil {
+		t.Fatalf("find group key: %v", err)
+	}
+	mode := "chat"
+	if _, err := env.svc.UpdateGroupKey(group.ID, UpdateGroupKeyInput{RequestMode: &mode}); err == nil {
+		t.Fatal("OpenAI request mode override should be rejected")
+	}
+}
+
 func TestManualBootstrapChannelIsSkipped(t *testing.T) {
 	if !isManualBootstrapChannel(storage.Channel{
 		Username:       "manual",
@@ -3132,8 +3419,8 @@ func TestFilterOpenAIHealthGroupsSkipsClaudeAndGrok(t *testing.T) {
 		{ID: 4, ClientFormat: "openai", RequestMode: "chat"},
 	}
 	filtered := filterOpenAIHealthGroups(groups)
-	if len(filtered) != 1 || filtered[0].ID != 1 {
-		t.Fatalf("filtered groups = %#v, want only OpenAI", filtered)
+	if len(filtered) != 2 || filtered[0].ID != 1 || filtered[1].ID != 4 {
+		t.Fatalf("filtered groups = %#v, want all OpenAI-format groups", filtered)
 	}
 }
 

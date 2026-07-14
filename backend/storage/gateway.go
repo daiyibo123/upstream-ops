@@ -488,6 +488,23 @@ func (r *UpstreamGroupKeys) UpdateRequestMode(id uint, mode string) error {
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("request_mode", mode).Error
 }
 
+// UpdateManualKey replaces a manually maintained upstream secret. Updating a
+// key is an intentional recovery action, so clear stale failure state and put
+// the group back into scheduling without touching any automatic group record.
+func (r *UpstreamGroupKeys) UpdateManualKey(id uint, keyCipher string) error {
+	if strings.TrimSpace(keyCipher) == "" {
+		return errors.New("manual key cipher cannot be empty")
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+		"key_cipher":     keyCipher,
+		"enabled":        true,
+		"status":         "unknown",
+		"failure_count":  0,
+		"disabled_until": nil,
+		"last_error":     "",
+	}).Error
+}
+
 func (r *UpstreamGroupKeys) UpdatePriority(id uint, priority int) error {
 	if priority < 0 {
 		priority = 0
