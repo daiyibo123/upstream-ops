@@ -39,7 +39,9 @@ const (
 
 	proxyAttemptTimeout       = 60 * time.Second
 	healthProbeTimeout        = 15 * time.Second
-	healthProbeRetryJitterMax = 15 * time.Second
+	healthProbeRetryJitterMax = 3 * time.Second
+	healthTransientAttempts   = 3
+	healthPerChannelParallel  = 1
 	// streamFirstEventTimeout 是"等上游吐出第一个有效 SSE 事件"的最长等待。
 	// Codex / o1 / o3 这类带 reasoning 的请求可能长时间没有可见文本；部分
 	// 中转站还会缓冲 response.created。这里给到 5 分钟，避免在上游仍在推理时
@@ -59,7 +61,9 @@ const (
 	proxyNetworkErrorCooldown      = 30 * time.Second
 	proxyRateLimitCooldown         = 90 * time.Second
 	proxyPermanentFailureCooldown  = 30 * time.Minute
-	defaultHealthProbeBatchSize    = 30
+	modelSupportPositiveTTL        = 2 * time.Hour
+	modelSupportNegativeTTL        = 15 * time.Minute
+	defaultHealthProbeBatchSize    = 10
 
 	openAIHealthProbePrimaryModel  = "gpt-5.4"
 	openAIHealthProbeFallbackModel = "gpt-4o-mini"
@@ -70,21 +74,22 @@ const (
 var errResponsesStreamTerminal = errors.New("responses stream terminal event emitted")
 
 type Service struct {
-	channels   *storage.Channels
-	gateway    *storage.GatewayKeys
-	affinities *storage.GatewayAffinities
-	groupKeys  *storage.UpstreamGroupKeys
-	usageLogs  *storage.UsageLogs
-	ipPolicies *storage.IPPolicies
-	cipher     *appcrypto.Cipher
-	channelSvc *channel.Service
-	log        *slog.Logger
-	clients    sync.Map
-	runtime    sync.Map
-	keyRuntime sync.Map
-	ipRuntime  sync.Map
-	configMu   sync.RWMutex
-	upstream   config.UpstreamConfig
+	channels         *storage.Channels
+	gateway          *storage.GatewayKeys
+	affinities       *storage.GatewayAffinities
+	groupKeys        *storage.UpstreamGroupKeys
+	usageLogs        *storage.UsageLogs
+	ipPolicies       *storage.IPPolicies
+	cipher           *appcrypto.Cipher
+	channelSvc       *channel.Service
+	log              *slog.Logger
+	clients          sync.Map
+	runtime          sync.Map
+	keyRuntime       sync.Map
+	ipRuntime        sync.Map
+	healthProbeSlots sync.Map
+	configMu         sync.RWMutex
+	upstream         config.UpstreamConfig
 }
 
 type CreateGatewayKeyInput struct {
@@ -333,11 +338,18 @@ type usageTokens struct {
 }
 
 type groupRuntimeState struct {
-	mu             sync.Mutex
-	disabledUntil  time.Time
-	avgLatencyMS   float64
-	inFlight       int
-	lastObservedAt time.Time
+	mu                sync.Mutex
+	disabledUntil     time.Time
+	avgFirstTokenMS   float64
+	avgLatencyMS      float64
+	inFlight          int
+	lastObservedAt    time.Time
+	modelCapabilities map[string]modelCapability
+}
+
+type modelCapability struct {
+	supported bool
+	expiresAt time.Time
 }
 
 type keyRuntimeState struct {
@@ -1627,6 +1639,7 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 		}
 		enabled = append(enabled, i)
 	}
+	enabled = interleaveHealthTestGroupIndexes(list, enabled)
 	result.Total = len(enabled)
 	for pos, idx := range enabled {
 		item := healthResultItemFromGroup(&list[idx], "queued")
@@ -1687,10 +1700,13 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 					Total:   result.Total,
 				})
 
-				// Timeout starts here, after this item leaves the queue.
-				// Queued groups must never inherit earlier probes' elapsed time.
+				// A queued group starts its timeout only after it owns the upstream
+				// slot.  Otherwise a busy same-site queue would make a healthy group
+				// expire before its first HTTP request.
+				releaseChannelSlot := s.acquireHealthProbeUpstreamSlot(list[idx])
 				itemCtx, cancel := context.WithTimeout(probeCtx, 70*time.Second)
-				item := s.testGroupKey(itemCtx, &list[idx])
+				item := s.testGroupKeyWithUpstreamSlot(itemCtx, &list[idx])
+				releaseChannelSlot()
 				cancel()
 				item.Batch = batchNo
 				result.Items[idx] = item
@@ -1799,12 +1815,80 @@ func filterHealthTestGroupKeys(list []storage.UpstreamGroupKey, ids []uint) []st
 	return out
 }
 
+// interleaveHealthTestGroupIndexes ensures workers do not all block behind the
+// first channel in the DB order.  With per-upstream serialization this keeps
+// up to ten distinct upstreams probing in parallel, while every individual
+// upstream receives only one request at a time.
+func interleaveHealthTestGroupIndexes(list []storage.UpstreamGroupKey, enabled []int) []int {
+	if len(enabled) < 2 {
+		return enabled
+	}
+	queues := make(map[string][]int, len(enabled))
+	order := make([]string, 0, len(enabled))
+	for _, idx := range enabled {
+		if idx < 0 || idx >= len(list) {
+			continue
+		}
+		upstream := healthProbeUpstreamIdentity(list[idx])
+		if upstream == "" {
+			upstream = fmt.Sprintf("group:%d", list[idx].ID)
+		}
+		if _, exists := queues[upstream]; !exists {
+			order = append(order, upstream)
+		}
+		queues[upstream] = append(queues[upstream], idx)
+	}
+	out := make([]int, 0, len(enabled))
+	for len(out) < len(enabled) {
+		for _, upstream := range order {
+			queue := queues[upstream]
+			if len(queue) == 0 {
+				continue
+			}
+			out = append(out, queue[0])
+			queues[upstream] = queue[1:]
+		}
+	}
+	return out
+}
+
+func healthProbeUpstreamIdentity(key storage.UpstreamGroupKey) string {
+	if url := strings.ToLower(strings.TrimRight(strings.TrimSpace(key.ChannelURL), "/")); url != "" {
+		return "url:" + url
+	}
+	if key.ChannelID > 0 {
+		return fmt.Sprintf("channel:%d", key.ChannelID)
+	}
+	return ""
+}
+
+// acquireHealthProbeUpstreamSlot is service-scoped so the one-click check and
+// a per-group check cannot probe the same API Base URL concurrently. Different
+// upstreams still run in parallel through the global batch workers.
+func (s *Service) acquireHealthProbeUpstreamSlot(key storage.UpstreamGroupKey) func() {
+	if s == nil || healthPerChannelParallel <= 0 {
+		return func() {}
+	}
+	upstream := healthProbeUpstreamIdentity(key)
+	if upstream == "" {
+		return func() {}
+	}
+	created := make(chan struct{}, healthPerChannelParallel)
+	actual, _ := s.healthProbeSlots.LoadOrStore(upstream, created)
+	slot := actual.(chan struct{})
+	slot <- struct{}{}
+	return func() { <-slot }
+}
+
 func normalizeHealthProbeBatchSize(size int) int {
 	if size <= 0 {
 		return defaultHealthProbeBatchSize
 	}
-	if size > 100 {
-		return 100
+	// One-click health checks deliberately execute in batches of at most ten.
+	// Higher values made a small number of large upstreams return temporary 5XX
+	// responses even though the same keys worked immediately afterwards.
+	if size > defaultHealthProbeBatchSize {
+		return defaultHealthProbeBatchSize
 	}
 	return size
 }
@@ -2038,6 +2122,15 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	var errorsSeen []string
 	var saturatedSeen []string
 	var disabledSeen []string
+	modelUnsupportedFailures := 0
+	requestedModel := routingRequestModel(normalized)
+	rememberUnsupportedModel := func(candidate storage.UpstreamGroupKey, errMsg string) {
+		if requestedModel == "" || !looksLikeUnsupportedModelError(errMsg) {
+			return
+		}
+		s.rememberCandidateModelCapability(candidate.ID, requestedModel, false)
+		modelUnsupportedFailures++
+	}
 	var cooldownFallback []storage.UpstreamGroupKey
 	attemptedActiveCandidate := false
 	// finalErr 承载"客户端错、换 key 也没用"路径的返回值。
@@ -2068,6 +2161,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			continue
 		case candRetryable:
 			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
+			rememberUnsupportedModel(candidate, outcome.errMsg)
 			if shouldMarkProxyFailure(outcome.errMsg) {
 				s.markProxyFailure(candidate.ID, outcome.errMsg)
 			}
@@ -2076,6 +2170,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			// 明确"客户端错 / 已写字节无法切换"路径：仍然记一次失败方便下次跳过，
 			// 但不再继续 fail-over，把当前错误吐给调用方。
 			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
+			rememberUnsupportedModel(candidate, outcome.errMsg)
 			if outcome.markFailure && shouldMarkProxyFailure(outcome.errMsg) {
 				s.markProxyFailure(candidate.ID, outcome.errMsg)
 			}
@@ -2102,6 +2197,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 				continue
 			case candRetryable:
 				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
+				rememberUnsupportedModel(candidate, outcome.errMsg)
 				// The candidate is already in a cooldown window.  This early
 				// rescue probe is allowed so a recovered upstream can come back
 				// immediately, but a failed rescue must not keep extending the
@@ -2111,6 +2207,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 				continue
 			case candFatal:
 				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
+				rememberUnsupportedModel(candidate, outcome.errMsg)
 				finalErr = outcome.err
 			}
 			break
@@ -2120,6 +2217,9 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		}
 	}
 	message := "all upstream group keys failed: " + strings.Join(errorsSeen, " | ")
+	if requestedModel != "" && len(errorsSeen) > 0 && modelUnsupportedFailures == len(errorsSeen) {
+		message = fmt.Sprintf("no configured upstream supports requested model %q", requestedModel)
+	}
 	if len(errorsSeen) == 0 && len(saturatedSeen) > 0 {
 		message = "all upstream group keys are at concurrency limit: " + strings.Join(saturatedSeen, " | ")
 	}
@@ -2289,9 +2389,10 @@ func (s *Service) attemptStream(
 	retry, usage, err := s.streamProxyCandidate(ctx, normalized, candidate, timedWriter)
 	if err == nil {
 		duration := time.Since(start)
+		s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
 		usage.FirstTokenMS = timedWriter.FirstTokenMS()
 		usage.DurationMS = duration.Milliseconds()
-		s.recordRuntimeSuccess(candidate.ID, duration)
+		s.recordRuntimeSuccess(candidate.ID, duration, time.Duration(usage.FirstTokenMS)*time.Millisecond)
 		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 		_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 		s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
@@ -2326,10 +2427,12 @@ func (s *Service) attemptStream(
 		timedWriter = &timingResponseWriter{ResponseWriter: w, start: start}
 		retry, usage, err = s.streamProxyCandidate(ctx, fallback, candidate, timedWriter)
 		if err == nil {
+			s.rememberSuccessfulProtocolFallback(candidate, normalized, fallback)
 			duration := time.Since(start)
+			s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
 			usage.FirstTokenMS = timedWriter.FirstTokenMS()
 			usage.DurationMS = duration.Milliseconds()
-			s.recordRuntimeSuccess(candidate.ID, duration)
+			s.recordRuntimeSuccess(candidate.ID, duration, time.Duration(usage.FirstTokenMS)*time.Millisecond)
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
@@ -2350,9 +2453,10 @@ func (s *Service) attemptStream(
 		retry, usage, err = s.streamProxyCandidate(ctx, rectified, candidate, timedWriter)
 		if err == nil {
 			duration := time.Since(start)
+			s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
 			usage.FirstTokenMS = timedWriter.FirstTokenMS()
 			usage.DurationMS = duration.Milliseconds()
-			s.recordRuntimeSuccess(candidate.ID, duration)
+			s.recordRuntimeSuccess(candidate.ID, duration, time.Duration(usage.FirstTokenMS)*time.Millisecond)
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
@@ -2383,7 +2487,8 @@ func (s *Service) attemptNonStream(
 	status, header, respBody, retry, err := s.tryProxyCandidate(ctx, normalized, candidate)
 	if err == nil {
 		duration := time.Since(start)
-		s.recordRuntimeSuccess(candidate.ID, duration)
+		s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
+		s.recordRuntimeSuccess(candidate.ID, duration, duration)
 		usage := extractUsage(respBody)
 		usage.FirstTokenMS = duration.Milliseconds()
 		usage.DurationMS = duration.Milliseconds()
@@ -2399,8 +2504,10 @@ func (s *Service) attemptNonStream(
 		start = time.Now()
 		status, header, respBody, retry, err = s.tryProxyCandidate(ctx, fallback, candidate)
 		if err == nil {
+			s.rememberSuccessfulProtocolFallback(candidate, normalized, fallback)
 			duration := time.Since(start)
-			s.recordRuntimeSuccess(candidate.ID, duration)
+			s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
+			s.recordRuntimeSuccess(candidate.ID, duration, duration)
 			usage := extractUsage(respBody)
 			usage.FirstTokenMS = duration.Milliseconds()
 			usage.DurationMS = duration.Milliseconds()
@@ -2421,7 +2528,8 @@ func (s *Service) attemptNonStream(
 		status, header, respBody, retry, err = s.tryProxyCandidate(ctx, rectified, candidate)
 		if err == nil {
 			duration := time.Since(start)
-			s.recordRuntimeSuccess(candidate.ID, duration)
+			s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
+			s.recordRuntimeSuccess(candidate.ID, duration, duration)
 			usage := extractUsage(respBody)
 			usage.FirstTokenMS = duration.Milliseconds()
 			usage.DurationMS = duration.Milliseconds()
@@ -2466,6 +2574,9 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	if request.Stream {
 		req.Header.Set("Accept", "text/event-stream")
 		req.Header.Set("Cache-Control", "no-cache")
+		// Compression may buffer otherwise valid SSE chunks. Identity encoding
+		// lets the first token pass through as soon as the upstream writes it.
+		req.Header.Set("Accept-Encoding", "identity")
 	}
 
 	client := s.httpClientFor(ctx, ch)
@@ -2636,7 +2747,27 @@ func groupRefFor(channelType storage.ChannelType, group connector.APIKeyGroup) (
 	return name, nil
 }
 
+type healthProbeAttempt struct {
+	status    int
+	body      []byte
+	latencyMS int64
+	err       error
+}
+
+func (attempt healthProbeAttempt) succeeded() bool {
+	return attempt.err == nil && attempt.status >= http.StatusOK && attempt.status < http.StatusMultipleChoices
+}
+
 func (s *Service) testGroupKey(ctx context.Context, key *storage.UpstreamGroupKey) HealthResultItem {
+	if key == nil {
+		return HealthResultItem{Status: "disabled"}
+	}
+	release := s.acquireHealthProbeUpstreamSlot(*key)
+	defer release()
+	return s.testGroupKeyWithUpstreamSlot(ctx, key)
+}
+
+func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage.UpstreamGroupKey) HealthResultItem {
 	item := HealthResultItem{
 		ID:          key.ID,
 		ChannelID:   key.ChannelID,
@@ -2649,59 +2780,87 @@ func (s *Service) testGroupKey(ctx context.Context, key *storage.UpstreamGroupKe
 		item.Status = "disabled"
 		return item
 	}
-	status, body, latencyMS, err := s.healthProbeCandidate(ctx, key)
-	item.LatencyMS = latencyMS
+
+	attempts, retriesCompleted := s.healthProbeAttempts(ctx, key)
+	if len(attempts) == 0 {
+		attempts = append(attempts, healthProbeAttempt{err: errors.New("health probe did not run")})
+	}
+	last := attempts[len(attempts)-1]
+	item.LatencyMS = last.latencyMS
 	now := time.Now()
 	item.CheckedAt = &now
-	if err == nil && status >= 200 && status < 300 {
+	if last.succeeded() {
 		item.Status = "alive"
 		_ = s.groupKeys.MarkHealthSuccess(key.ID, item.LatencyMS)
 		return item
 	}
 
-	firstErr := healthProbeError(status, body, err)
-	firstFailureStatus := healthFailureStatus(status, body, err)
-	if shouldSkipHealthRetry(firstFailureStatus) {
-		item.Status = firstFailureStatus
-		item.ErrorType = firstFailureStatus
-		item.Error = firstErr.Error()
+	failureStatus := healthFailureStatus(last.status, last.body, last.err)
+	lastErr := healthProbeError(last.status, last.body, last.err)
+	item.ErrorType = failureStatus
+	item.Error = healthProbeAttemptsError(attempts, retriesCompleted, lastErr)
+
+	if healthProbeFailureIsInconclusive(last.status, last.body, last.err, failureStatus) {
+		item.Status = "unknown"
+		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
+		return item
+	}
+	if shouldSkipHealthRetry(failureStatus) {
+		item.Status = failureStatus
 		s.markHealthFailureWithStatus(key.ID, item.Status, item.Error, item.LatencyMS)
 		return item
 	}
-	delay := healthRetryDelay(key.ID)
-	if waitHealthRetry(ctx, delay) {
-		status, body, retryLatencyMS, err := s.healthProbeCandidate(ctx, key)
-		item.LatencyMS = retryLatencyMS
-		now = time.Now()
-		item.CheckedAt = &now
-		if err == nil && status >= 200 && status < 300 {
-			item.Status = "alive"
-			_ = s.groupKeys.MarkHealthSuccess(key.ID, item.LatencyMS)
-			return item
-		}
-		item.Status = healthFailureStatus(status, body, err)
-		item.ErrorType = item.Status
-		item.Error = fmt.Sprintf("first probe failed: %v; retry after %s failed: %v", firstErr, delay, healthProbeError(status, body, err))
-	} else {
-		// 首探已经明确失败，只是"抖动重试的等待"被 ctx 取消（批量扫描超时 / 关机）。
-		// 关键取舍：绝不能停在 unknown 就 return —— 那样不落库，DB 会保留上一轮的 alive，
-		// 造成"上游已经死了、面板还显示绿色"的僵尸绿（用户明确报过这个 bug）。
-		// 首探失败本身就是可信的失败信号，直接落 dead；下一轮 cron 会用退避后重新复活探测，
-		// 真的活着会在下轮转回 alive，代价只是一轮的延迟，远好过僵尸绿。
-		item.Status = "dead"
-		item.ErrorType = item.Status
-		item.Error = fmt.Sprintf("first probe failed: %v; retry wait canceled: %v", firstErr, ctx.Err())
-		s.markHealthFailureWithStatus(key.ID, item.Status, item.Error, item.LatencyMS)
-		return item
-	}
-	if item.Status == "" {
-		item.Status = "dead"
-	}
-	if item.ErrorType == "" && item.Status != "alive" {
-		item.ErrorType = item.Status
-	}
+
+	item.Status = s.confirmedHealthFailureStatus(key.ID, failureStatus)
 	s.markHealthFailureWithStatus(key.ID, item.Status, item.Error, item.LatencyMS)
 	return item
+}
+
+// healthProbeAttempts runs up to three full generation probes for transient
+// upstream faults.  A second click often succeeding after a 5XX is evidence of
+// overload or a short router flap, not a dead channel; retry it inside the same
+// health run before changing the displayed state.
+func (s *Service) healthProbeAttempts(ctx context.Context, key *storage.UpstreamGroupKey) ([]healthProbeAttempt, bool) {
+	attempts := make([]healthProbeAttempt, 0, healthTransientAttempts)
+	for retry := 0; retry < healthTransientAttempts; retry++ {
+		if retry > 0 {
+			if !waitHealthRetry(ctx, healthRetryDelayForAttempt(key.ID, retry)) {
+				return attempts, false
+			}
+		}
+		status, body, latencyMS, err := s.healthProbeCandidate(ctx, key)
+		attempt := healthProbeAttempt{status: status, body: body, latencyMS: latencyMS, err: err}
+		attempts = append(attempts, attempt)
+		if attempt.succeeded() || !shouldRetryTransientHealthStatus(healthFailureStatus(status, body, err)) {
+			return attempts, true
+		}
+	}
+	return attempts, true
+}
+
+func shouldRetryTransientHealthStatus(status string) bool {
+	switch status {
+	case "dead", "server_error", "timeout", "network_error", "upstream_error":
+		return true
+	default:
+		return false
+	}
+}
+
+func healthProbeAttemptsError(attempts []healthProbeAttempt, retriesCompleted bool, lastErr error) string {
+	if lastErr == nil {
+		lastErr = errors.New("health probe failed")
+	}
+	if len(attempts) <= 1 {
+		if !retriesCompleted {
+			return fmt.Sprintf("probe retry canceled: %v", lastErr)
+		}
+		return lastErr.Error()
+	}
+	if !retriesCompleted {
+		return fmt.Sprintf("probe retry canceled after %d attempts: %v", len(attempts), lastErr)
+	}
+	return fmt.Sprintf("probe failed after %d attempts: %v", len(attempts), lastErr)
 }
 
 func healthFailureStatus(status int, body []byte, err error) string {
@@ -2747,6 +2906,43 @@ func shouldSkipHealthRetry(status string) bool {
 	default:
 		return false
 	}
+}
+
+// healthProbeFailureIsInconclusive identifies failures caused by a probe's
+// fixed model or wire format. They do not prove that the upstream cannot serve
+// a real user request, so keep the group schedulable as unknown rather than
+// painting it dead and excluding it from normal routing.
+func healthProbeFailureIsInconclusive(status int, body []byte, err error, classification string) bool {
+	switch classification {
+	case "model_error", "invalid_request":
+		return true
+	}
+	if status != http.StatusNotFound && status != http.StatusMethodNotAllowed {
+		return false
+	}
+	text := healthFailureText(body, err)
+	return looksLikeEndpointMissingError(text) || looksLikeResponsesEndpointError(text)
+}
+
+// confirmedHealthFailureStatus avoids turning one ambiguous probe into a red
+// "dead" channel.  Permanent states (auth, balance, access and rate limit)
+// are classified separately and keep their immediate status.  A generic death
+// needs the same key to fail three complete health runs before it is shown as
+// dead and put into the normal cooldown path.
+func (s *Service) confirmedHealthFailureStatus(id uint, status string) string {
+	switch status {
+	case "dead", "server_error", "timeout", "network_error", "upstream_error":
+	default:
+		return status
+	}
+	if s == nil || s.groupKeys == nil {
+		return status
+	}
+	current, err := s.groupKeys.FindByID(id)
+	if err != nil || current == nil || current.FailureCount+1 < proxyTransientFailureThreshold {
+		return "unknown"
+	}
+	return "dead"
 }
 
 func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.UpstreamGroupKey) (int, []byte, int64, error) {
@@ -2997,7 +3193,18 @@ func shouldFallbackHealthModelDiscovery(status int, body []byte, err error) bool
 		status == http.StatusTooManyRequests || status == http.StatusPaymentRequired {
 		return false
 	}
-	return looksLikeUnsupportedModelError(healthFailureText(body, err))
+	if status >= http.StatusInternalServerError || looksLikeTimeoutFailure(err, healthFailureText(body, err)) ||
+		looksLikeNetworkFailure(status, err, healthFailureText(body, err)) {
+		return false
+	}
+	text := healthFailureText(body, err)
+	if looksLikeUnsupportedModelError(text) || looksLikeEndpointMissingError(text) || looksLikeResponsesEndpointError(text) {
+		return true
+	}
+	// Several OpenAI-compatible relays hide an unsupported probe model behind a
+	// generic 400/422 message.  One /models lookup followed by one real tiny
+	// generation probe is safer than marking a working model-limited channel dead.
+	return status == http.StatusBadRequest || status == http.StatusUnprocessableEntity
 }
 
 func healthProbeModelIsOneOf(model string, values ...string) bool {
@@ -3522,15 +3729,26 @@ func looksLikeUpstreamRoutingUnavailable(text string) bool {
 	return false
 }
 
-func healthRetryDelay(keyID uint) time.Duration {
+func healthRetryDelayForAttempt(keyID uint, retry int) time.Duration {
 	if healthProbeRetryJitterMax <= 0 {
 		return 0
 	}
 	maxSeconds := int(healthProbeRetryJitterMax / time.Second)
-	if maxSeconds <= 1 {
-		return healthProbeRetryJitterMax
+	if maxSeconds < 1 {
+		maxSeconds = 1
 	}
-	return time.Duration(int(keyID)%maxSeconds+1) * time.Second
+	// retry is one-based here.  The deterministic key jitter keeps a batch
+	// spread over a few seconds, while later attempts back off a little longer.
+	baseSeconds := retry
+	if baseSeconds > maxSeconds {
+		baseSeconds = maxSeconds
+	}
+	jitter := int(keyID) % maxSeconds
+	delaySeconds := baseSeconds + jitter
+	if delaySeconds > maxSeconds {
+		delaySeconds = maxSeconds
+	}
+	return time.Duration(delaySeconds) * time.Second
 }
 
 func waitHealthRetry(ctx context.Context, delay time.Duration) bool {
@@ -3642,6 +3860,12 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 	}
 	copyRequestHeaders(req.Header, request.Header)
 	applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
+	// Health probes are streamed too. Avoid a compressed/buffered probe being
+	// mistaken for an unhealthy upstream merely because its first token arrived
+	// late at the gateway.
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Accept-Encoding", "identity")
 
 	client := s.httpClientFor(ctx, ch)
 	resp, err := client.Do(req)
@@ -3938,6 +4162,13 @@ func (s *Service) markHealthFailureWithStatus(id uint, status string, msg string
 	}
 	if err := s.groupKeys.MarkHealthFailureStatus(id, status, msg, disabledUntil, latencyMS); err != nil && s.log != nil {
 		s.log.Warn("mark upstream health failed", "id", id, "err", err)
+	}
+}
+
+func (s *Service) markHealthInconclusive(id uint, msg string, latencyMS int64) {
+	s.clearRuntimeDisable(id)
+	if err := s.groupKeys.MarkHealthInconclusive(id, msg, latencyMS); err != nil && s.log != nil {
+		s.log.Warn("mark upstream health inconclusive", "id", id, "err", err)
 	}
 }
 
@@ -4472,18 +4703,48 @@ func fallbackRequestAfterFailure(request normalizedRequest, errMsg string) (norm
 		return request.alt(), "upstream native responses fallback", true
 	}
 	if request.ResponseMode == "responses" {
-		// Native Responses requests must stay native.  Automatically downgrading
-		// to chat/completions requires translating the body and can drop
-		// reasoning/tool/instructions/input semantics that Codex relies on.
-		// Explicit RequestMode=chat candidates still use the Chat→Responses
-		// bridge through requestForCandidate; this branch only disables hidden
-		// fallback after a native Responses attempt has already failed.
+		// A saved Responses capability can become stale after an upstream route
+		// change. When the upstream explicitly says the Responses route does not
+		// exist, retry exactly once through the prepared Chat bridge *before any
+		// downstream SSE byte has been written*. This is a protocol recovery path,
+		// not a general model/content fallback: reasoning, tools and input remain
+		// native whenever the Responses endpoint exists.
+		if looksLikeResponsesEndpointError(errMsg) || looksLikeEndpointMissingError(errMsg) {
+			return request.alt(), "upstream chat-completions compatibility", true
+		}
 		return request, "", false
 	}
 	if !looksLikeResponsesEndpointError(errMsg) && !looksLikeEndpointMissingError(errMsg) {
 		return request, "", false
 	}
 	return request.alt(), "upstream chat-completions compatibility", true
+}
+
+// rememberSuccessfulProtocolFallback persists only a proven endpoint
+// capability transition. It runs after a complete upstream success, so a
+// temporary network failure or an unsupported model can never flip a channel
+// from native Responses to Chat.
+func (s *Service) rememberSuccessfulProtocolFallback(
+	candidate *storage.UpstreamGroupKey,
+	original normalizedRequest,
+	fallback normalizedRequest,
+) {
+	if s == nil || candidate == nil || normalizeClientFormat(candidate.ClientFormat) != "openai" {
+		return
+	}
+	mode := ""
+	switch {
+	case original.ResponseMode == "responses" && fallback.ResponseMode == "responses_from_chat":
+		mode = "chat"
+	case original.ResponseMode == "responses_from_chat" && fallback.ResponseMode == "responses":
+		mode = "responses"
+	}
+	if mode == "" || normalizeUpstreamRequestMode(candidate.RequestMode) == mode {
+		return
+	}
+	if err := s.groupKeys.UpdateRequestMode(candidate.ID, mode); err != nil && s.log != nil {
+		s.log.Warn("persist recovered upstream request protocol", "id", candidate.ID, "mode", mode, "err", err)
+	}
 }
 
 func shouldSkipSameKeyRetry(errMsg string) bool {
@@ -4554,7 +4815,7 @@ func looksLikeResponsesEndpointError(msg string) bool {
 }
 
 func (s *Service) orderCandidatesForRequest(candidates []storage.UpstreamGroupKey, request normalizedRequest) []storage.UpstreamGroupKey {
-	ordered := s.orderCandidatesWithRuntime(candidates)
+	ordered := s.orderCandidatesWithRuntime(candidates, routingRequestModel(request))
 	ordered = preferSameGroupSchedulableCandidates(ordered)
 	if s.affinities == nil || request.AffinityKey == "" {
 		return ordered
@@ -4629,8 +4890,12 @@ func affinityIsHard(rawKey string) bool {
 	return rawKey != "" && !strings.HasPrefix(rawKey, "chat:")
 }
 
-func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
+func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupKey, requestModels ...string) []storage.UpstreamGroupKey {
 	out := orderCandidates(candidates)
+	requestModel := ""
+	if len(requestModels) > 0 {
+		requestModel = normalizeModelCapabilityKey(requestModels[0])
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		schedI := candidateSchedulable(out[i])
 		schedJ := candidateSchedulable(out[j])
@@ -4639,6 +4904,9 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		}
 		if schedI && out[i].Charity != out[j].Charity {
 			return out[i].Charity
+		}
+		if supportI, supportJ := s.candidateModelCapabilityRank(out[i].ID, requestModel), s.candidateModelCapabilityRank(out[j].ID, requestModel); supportI != supportJ {
+			return supportI < supportJ
 		}
 		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
 			return rankI < rankJ
@@ -4655,13 +4923,21 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		if out[i].FailureCount != out[j].FailureCount {
 			return out[i].FailureCount < out[j].FailureCount
 		}
-		latI, okI := s.runtimeLatency(out[i].ID)
-		latJ, okJ := s.runtimeLatency(out[j].ID)
+		ttftI, okI := s.runtimeFirstTokenLatency(out[i].ID)
+		ttftJ, okJ := s.runtimeFirstTokenLatency(out[j].ID)
 		switch {
-		case okI && okJ && latI != latJ:
-			return latI < latJ
+		case okI && okJ && ttftI != ttftJ:
+			return ttftI < ttftJ
 		case okI != okJ:
 			return okI
+		}
+		latI, latencyI := s.runtimeLatency(out[i].ID)
+		latJ, latencyJ := s.runtimeLatency(out[j].ID)
+		switch {
+		case latencyI && latencyJ && latI != latJ:
+			return latI < latJ
+		case latencyI != latencyJ:
+			return latencyI
 		default:
 			return out[i].ID < out[j].ID
 		}
@@ -4672,6 +4948,72 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 func (s *Service) runtimeState(id uint) *groupRuntimeState {
 	actual, _ := s.runtime.LoadOrStore(id, &groupRuntimeState{})
 	return actual.(*groupRuntimeState)
+}
+
+func routingRequestModel(request normalizedRequest) string {
+	return firstNonEmpty(request.RequestModel, modelFromRequestBody(request.Body))
+}
+
+func normalizeModelCapabilityKey(model string) string {
+	return strings.ToLower(strings.TrimSpace(model))
+}
+
+// candidateModelCapabilityRank returns supported (0), unknown (1), or known
+// unsupported (2). Unsupported candidates are retained as a last resort: a
+// model list can be stale, but they no longer add a failed first request after
+// the gateway has already observed their real response for this model.
+func (s *Service) candidateModelCapabilityRank(candidateID uint, model string) int {
+	model = normalizeModelCapabilityKey(model)
+	if candidateID == 0 || model == "" {
+		return 1
+	}
+	state, ok := s.runtime.Load(candidateID)
+	if !ok {
+		return 1
+	}
+	stateValue := state.(*groupRuntimeState)
+	stateValue.mu.Lock()
+	defer stateValue.mu.Unlock()
+	capability, ok := stateValue.modelCapabilities[model]
+	if !ok {
+		return 1
+	}
+	if capability.expiresAt.IsZero() || !time.Now().Before(capability.expiresAt) {
+		delete(stateValue.modelCapabilities, model)
+		return 1
+	}
+	if capability.supported {
+		return 0
+	}
+	return 2
+}
+
+func (s *Service) rememberCandidateModelCapability(candidateID uint, model string, supported bool) {
+	model = normalizeModelCapabilityKey(model)
+	if candidateID == 0 || model == "" {
+		return
+	}
+	state := s.runtimeState(candidateID)
+	ttl := modelSupportNegativeTTL
+	if supported {
+		ttl = modelSupportPositiveTTL
+	}
+	state.mu.Lock()
+	if state.modelCapabilities == nil {
+		state.modelCapabilities = make(map[string]modelCapability)
+	}
+	if len(state.modelCapabilities) >= 256 {
+		for key, capability := range state.modelCapabilities {
+			if !time.Now().Before(capability.expiresAt) {
+				delete(state.modelCapabilities, key)
+			}
+		}
+		if len(state.modelCapabilities) >= 256 {
+			state.modelCapabilities = make(map[string]modelCapability)
+		}
+	}
+	state.modelCapabilities[model] = modelCapability{supported: supported, expiresAt: time.Now().Add(ttl)}
+	state.mu.Unlock()
 }
 
 func (s *Service) runtimeDisabled(id uint) bool {
@@ -4748,6 +5090,20 @@ func (s *Service) runtimeLatency(id uint) (float64, bool) {
 		return 0, false
 	}
 	return current.avgLatencyMS, true
+}
+
+func (s *Service) runtimeFirstTokenLatency(id uint) (float64, bool) {
+	state, ok := s.runtime.Load(id)
+	if !ok {
+		return 0, false
+	}
+	current := state.(*groupRuntimeState)
+	current.mu.Lock()
+	defer current.mu.Unlock()
+	if current.avgFirstTokenMS <= 0 {
+		return 0, false
+	}
+	return current.avgFirstTokenMS, true
 }
 
 func (s *Service) tryAcquireCandidate(id uint, limit int) (func(), bool) {
@@ -4910,7 +5266,7 @@ func (s *Service) releaseGatewayKeySlot(state *keyRuntimeState) {
 	}
 }
 
-func (s *Service) recordRuntimeSuccess(id uint, duration time.Duration) {
+func (s *Service) recordRuntimeSuccess(id uint, duration time.Duration, firstToken ...time.Duration) {
 	state := s.runtimeState(id)
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -4922,6 +5278,19 @@ func (s *Service) recordRuntimeSuccess(id uint, duration time.Duration) {
 		state.avgLatencyMS = ms
 	} else {
 		state.avgLatencyMS = state.avgLatencyMS*0.75 + ms*0.25
+	}
+	firstTokenDuration := duration
+	if len(firstToken) > 0 && firstToken[0] > 0 {
+		firstTokenDuration = firstToken[0]
+	}
+	firstTokenMS := float64(firstTokenDuration.Milliseconds())
+	if firstTokenMS < 1 {
+		firstTokenMS = 1
+	}
+	if state.avgFirstTokenMS <= 0 {
+		state.avgFirstTokenMS = firstTokenMS
+	} else {
+		state.avgFirstTokenMS = state.avgFirstTokenMS*0.75 + firstTokenMS*0.25
 	}
 	state.disabledUntil = time.Time{}
 	state.lastObservedAt = time.Now()
@@ -5515,6 +5884,8 @@ func friendlyGatewayStreamFailureMessage(message string) string {
 	switch {
 	case lower == "":
 		return "请求暂时无法完成，请稍后重试。"
+	case strings.Contains(lower, "no configured upstream supports requested model"):
+		return "所有可用上游均不支持当前请求模型，请切换模型后重试。"
 	case looksLikeUnsupportedModelError(trimmed):
 		return "当前上游不支持请求的模型，已自动尝试其他兼容渠道；请稍后重试或切换模型。"
 	case strings.Contains(lower, "no alive upstream group keys available") ||
@@ -8674,6 +9045,16 @@ func looksLikeClientRequestError(msg string) bool {
 		"missing required",
 		"required field",
 		"required parameter",
+		"missing messages",
+		"missing input",
+		"unsupported parameter",
+		"unsupported field",
+		"unknown parameter",
+		"unknown field",
+		"unrecognized parameter",
+		"unrecognized field",
+		"unexpected parameter",
+		"unexpected field",
 		"schema validation",
 		"decode error",
 		"parse error",

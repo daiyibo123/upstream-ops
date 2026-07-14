@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -34,34 +35,9 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 				homepageCheapestEnabled = cfg.App.HomepageCheapestEnabled
 			}
 		}
-		// 公开页每个上游只展示一个当前可用且最便宜的分组，最多十个上游。
-		// 这和调度的优先级策略分开：这里展示的是可对外说明的成本顺序。
-		cheapestByChannel := make(map[uint]dashboardGatewayGroup)
-		for _, group := range gateway.Groups {
-			if group.ClientFormat != "openai" {
-				continue
-			}
-			if !group.Enabled || (group.Status != "alive" && group.Status != "unknown") {
-				continue
-			}
-			best, exists := cheapestByChannel[group.ChannelID]
-			if !exists || group.Ratio < best.Ratio || (group.Ratio == best.Ratio && group.ID < best.ID) {
-				cheapestByChannel[group.ChannelID] = group
-			}
-		}
-		publicGroups := make([]dashboardGatewayGroup, 0, len(cheapestByChannel))
-		for _, group := range cheapestByChannel {
-			publicGroups = append(publicGroups, group)
-		}
-		sort.SliceStable(publicGroups, func(i, j int) bool {
-			if publicGroups[i].Ratio != publicGroups[j].Ratio {
-				return publicGroups[i].Ratio < publicGroups[j].Ratio
-			}
-			return publicGroups[i].ID < publicGroups[j].ID
-		})
-		if len(publicGroups) > 5 {
-			publicGroups = publicGroups[:5]
-		}
+		// 公开页展示所有当前可调度 OpenAI 分组中倍率最低的前五个。
+		// 这和实际调度的优先级策略分开：这里展示的是可对外说明的成本顺序。
+		publicGroups := dashboardPublicDispatchPreview(gateway.Groups)
 		openaiCount := 0
 		claudeCount := 0
 		grokCount := 0
@@ -79,28 +55,28 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			}
 		}
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{
-			"title":                 title,
-			"total_channels":        len(channels),
-			"active_channels":       gateway.AliveGroups,
-			"upstream_groups":       gateway.TotalGroups,
-			"available_groups":      gateway.AliveGroups + gateway.UnknownGroups,
-			"zero_balance_groups":   gateway.ZeroBalanceGroups,
-			"rate_limited_groups":   gateway.RateLimitedGroups,
-			"forbidden_groups":      gateway.ForbiddenGroups,
-			"non_generation_groups": gateway.NonGenerationGroups,
-			"error_groups":          gateway.ErrorGroups,
-			"openai_groups":         openaiCount,
-			"claude_groups":         claudeCount,
-			"grok_groups":           grokCount,
-			"today_tokens":          gateway.TodayTokens,
-			"total_tokens":          gateway.TotalTokens,
-			"cheapest":              gateway.Cheapest,
-			"dispatch_preview":      publicGroups,
+			"title":                     title,
+			"total_channels":            len(channels),
+			"active_channels":           gateway.AliveGroups,
+			"upstream_groups":           gateway.TotalGroups,
+			"available_groups":          gateway.AliveGroups + gateway.UnknownGroups,
+			"zero_balance_groups":       gateway.ZeroBalanceGroups,
+			"rate_limited_groups":       gateway.RateLimitedGroups,
+			"forbidden_groups":          gateway.ForbiddenGroups,
+			"non_generation_groups":     gateway.NonGenerationGroups,
+			"error_groups":              gateway.ErrorGroups,
+			"openai_groups":             openaiCount,
+			"claude_groups":             claudeCount,
+			"grok_groups":               grokCount,
+			"today_tokens":              gateway.TodayTokens,
+			"total_tokens":              gateway.TotalTokens,
+			"cheapest":                  gateway.Cheapest,
+			"dispatch_preview":          publicGroups,
 			"homepage_cheapest_enabled": homepageCheapestEnabled,
-			"supported_formats":     []string{"OpenAI /v1/chat/completions", "OpenAI /v1/responses", "Claude Messages 自动转 Responses"},
-			"gateway_status":        "online",
-			"public_key":            publicKey,
-			"public_key_enabled":    publicKey.Enabled,
+			"supported_formats":         []string{"OpenAI /v1/chat/completions", "OpenAI /v1/responses", "Claude Messages 自动转 Responses"},
+			"gateway_status":            "online",
+			"public_key":                publicKey,
+			"public_key_enabled":        publicKey.Enabled,
 		}})
 	})
 	g.POST("/key/reveal", func(c *gin.Context) {
@@ -132,6 +108,50 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			"expires_at": key.ExpiresAt,
 		}})
 	})
+}
+
+// dashboardPublicDispatchPreview returns the five cheapest available OpenAI
+// websites. A website can expose multiple groups (and even multiple imported
+// channels), but the public overview keeps only that website's cheapest group.
+func dashboardPublicDispatchPreview(groups []dashboardGatewayGroup) []dashboardGatewayGroup {
+	cheapestBySite := make(map[string]dashboardGatewayGroup, len(groups))
+	for _, group := range groups {
+		if !dashboardGroupIsOpenAI(group.ClientFormat) {
+			continue
+		}
+		if !group.Enabled || (group.Status != "alive" && group.Status != "unknown") {
+			continue
+		}
+		site := dashboardPublicPreviewSiteKey(group)
+		best, exists := cheapestBySite[site]
+		if !exists || group.Ratio < best.Ratio || (group.Ratio == best.Ratio && group.ID < best.ID) {
+			cheapestBySite[site] = group
+		}
+	}
+	publicGroups := make([]dashboardGatewayGroup, 0, len(cheapestBySite))
+	for _, group := range cheapestBySite {
+		publicGroups = append(publicGroups, group)
+	}
+	sort.SliceStable(publicGroups, func(i, j int) bool {
+		if publicGroups[i].Ratio != publicGroups[j].Ratio {
+			return publicGroups[i].Ratio < publicGroups[j].Ratio
+		}
+		return publicGroups[i].ID < publicGroups[j].ID
+	})
+	if len(publicGroups) > 5 {
+		return publicGroups[:5]
+	}
+	return publicGroups
+}
+
+func dashboardPublicPreviewSiteKey(group dashboardGatewayGroup) string {
+	if domain := strings.ToLower(strings.TrimSpace(group.SiteDomain)); domain != "" {
+		return "domain:" + domain
+	}
+	if name := strings.ToLower(strings.TrimSpace(group.ChannelName)); name != "" {
+		return "channel:" + name
+	}
+	return fmt.Sprintf("channel-id:%d", group.ChannelID)
 }
 
 func publicDashboardTitle(d *Deps) string {

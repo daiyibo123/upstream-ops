@@ -8,6 +8,20 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, and the Dockerfile version argument before its matching Git tag is pushed.
 
+## v0.22.6 - 2026-07-14
+
+### Fixed
+
+- Fixed System Settings persistence for the homepage cheapest-channel switch; saving now retains the selected state in `config.yaml`. Login session TTL updates are covered by a save/load regression test.
+- Refined the public homepage lowest-price list: it now keeps only one lowest-ratio OpenAI group per website, ranks the five cheapest websites, displays the website domain and ratio only, and loops with stable ranking.
+- Improved upstream health checks for large channel sets: probes are batched in groups of ten, serialized per API Base URL, retried only for transient failures, and avoid marking protocol/model-limited routes as dead prematurely.
+- Improved direct Responses compatibility by retaining safe pre-output fallback and terminal-event protections while recording model capability per upstream.
+
+### Changed
+
+- Improved streaming first-token delivery: SSE upstream requests explicitly request identity encoding to prevent compression buffering, while connection pooling and heartbeats remain in place.
+- For candidates with otherwise equal routing priority and ratio, the scheduler now prefers the lower observed time-to-first-token (TTFT), then uses total latency as a tie-breaker. This reduces perceived response delay without overriding charity, priority, ratio, model support, or session affinity.
+
 ## v0.22.5 - 2026-07-14
 
 ### Fixed

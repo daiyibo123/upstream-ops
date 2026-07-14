@@ -18,9 +18,11 @@ func TestSaveSettingsKeepsAppVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	cfg := &config.Config{
 		App: config.AppConfig{
-			Title:              "Old",
-			NotificationPrefix: "[Old] ",
+			Title:                   "Old",
+			NotificationPrefix:      "[Old] ",
+			HomepageCheapestEnabled: true,
 		},
+		Auth: config.AuthConfig{SessionTTLHours: 168},
 	}
 	if err := config.Save(path, cfg); err != nil {
 		t.Fatalf("save config: %v", err)
@@ -33,8 +35,8 @@ func TestSaveSettingsKeepsAppVersion(t *testing.T) {
 	})
 
 	body := `{
-		"app":{"title":"New","notificationPrefix":"[New] ","publicKey":{"enabled":true,"name":"公益 Key","key":"sk-public","password":"secret","passwordHint":"hint","expiresAt":"2099-01-01"}},
-		"auth":{"enabled":false,"username":"admin","password":"","tokenSecret":"","sessionTTLHours":168},
+		"app":{"title":"New","notificationPrefix":"[New] ","homepageCheapestEnabled":false,"publicKey":{"enabled":true,"name":"公益 Key","key":"sk-public","password":"secret","passwordHint":"hint","expiresAt":"2099-01-01"}},
+		"auth":{"enabled":false,"username":"admin","password":"","tokenSecret":"","sessionTTLHours":24},
 		"scheduler":{"balanceCron":"37 */15 * * * *","rateCron":"13 */30 * * * *","concurrency":4,"retention":{"cron":"0 17 3 * * *","monitorLogsDays":30,"balanceSnapshotsDays":90,"notificationLogsDays":90,"announcementsDays":90,"usageLogsDays":1}},
 		"notifications":{"batchRateChanges":true,"minChangePct":0,"balanceLowCooldownMinutes":60,"subscriptionDailyRemainingThresholdPct":0,"subscriptionWeeklyRemainingThresholdPct":0,"subscriptionMonthlyRemainingThresholdPct":0,"subscriptionExpiryThresholdHours":0,"subscriptionAlertCooldownMinutes":1440,"sendMaxAttempts":3},
 		"proxy":{"enabled":true,"versionCheckEnabled":true,"protocol":"socks5","host":"127.0.0.1","port":1080,"username":"u","password":"p"},
@@ -57,6 +59,12 @@ func TestSaveSettingsKeepsAppVersion(t *testing.T) {
 	}
 	if got.App.NotificationPrefix != "[New] " {
 		t.Fatalf("notification prefix = %q", got.App.NotificationPrefix)
+	}
+	if got.App.HomepageCheapestEnabled {
+		t.Fatal("homepage cheapest flag was not persisted as false")
+	}
+	if got.Auth.SessionTTLHours != 24 {
+		t.Fatalf("session TTL = %d, want 24", got.Auth.SessionTTLHours)
 	}
 	if !got.Proxy.Enabled || !got.Proxy.VersionCheckEnabled || got.Proxy.Protocol != "socks5" || got.Proxy.Host != "127.0.0.1" || got.Proxy.Port != 1080 || got.Proxy.Username != "u" || got.Proxy.Password != "p" {
 		t.Fatalf("proxy = %#v", got.Proxy)

@@ -229,6 +229,7 @@ export default function HomePage() {
   const [publicKeyIntent, setPublicKeyIntent] = useState<"view" | "copy">("view")
   const [publicPasswordVisible, setPublicPasswordVisible] = useState(false)
 	const [cheapestRotation, setCheapestRotation] = useState(0)
+	const [cheapestRotationTransition, setCheapestRotationTransition] = useState(true)
   const appTitle = summary?.title?.trim() || "UpstreamOps"
 
   useEffect(() => {
@@ -245,11 +246,26 @@ export default function HomePage() {
 		const count = summary?.dispatch_preview?.length ?? 0
 		if (count <= 1) {
 			setCheapestRotation(0)
+			setCheapestRotationTransition(true)
 			return
 		}
-		const timer = window.setInterval(() => setCheapestRotation((value) => (value + 1) % count), 3500)
+		const timer = window.setInterval(() => setCheapestRotation((value) => value + 1), 3500)
 		return () => window.clearInterval(timer)
 	}, [summary?.dispatch_preview?.length])
+
+	useEffect(() => {
+		const count = summary?.dispatch_preview?.length ?? 0
+		if (count <= 1 || cheapestRotation < count) return
+
+		// Appended first rows make the final transition smooth. The reset happens
+		// with animation disabled, so the list never visibly jumps back to #1.
+		setCheapestRotationTransition(false)
+		const resetFrame = window.requestAnimationFrame(() => {
+			setCheapestRotation(0)
+			window.requestAnimationFrame(() => setCheapestRotationTransition(true))
+		})
+		return () => window.cancelAnimationFrame(resetFrame)
+	}, [cheapestRotation, summary?.dispatch_preview?.length])
 
   const publicKey = summary?.public_key
   const publicKeyAvailable = Boolean(summary?.public_key_enabled && publicKey?.status === "available")
@@ -485,15 +501,24 @@ export default function HomePage() {
                 </Badge>
               </div>
               {summary?.homepage_cheapest_enabled !== false ? (
-                <div className="h-28 space-y-1.5 overflow-hidden text-xs">
-				  {((summary?.dispatch_preview ?? []).slice(cheapestRotation).concat((summary?.dispatch_preview ?? []).slice(0, cheapestRotation))).map((group, index) => (
-                    <div key={group.id} className="flex items-center gap-2 rounded-md bg-muted/50 px-3 py-2">
-                      <span className="w-5 font-semibold text-brand">#{index + 1}</span>
-                      <span className="min-w-0 flex-1 truncate text-foreground">{group.channel_name} / {group.group_name}</span>
-                      <span className="font-mono font-semibold text-success">{formatRatio(group.ratio)}</span>
+                <div className="h-28 overflow-hidden text-xs" aria-live="polite">
+                  {(summary?.dispatch_preview?.length ?? 0) > 0 ? (
+                    <div
+                      className={cn("flex flex-col gap-1.5", cheapestRotationTransition ? "transition-transform duration-700 ease-in-out" : "transition-none")}
+                      style={{ transform: `translateY(-${cheapestRotation * 38}px)` }}
+                    >
+                      {[...(summary?.dispatch_preview ?? []), ...(summary?.dispatch_preview ?? []).slice(0, 3)].map((group, index) => {
+                        const rank = index % (summary?.dispatch_preview?.length ?? 1) + 1
+                        return (
+                          <div key={`${group.id}-${index}`} className="flex h-8 shrink-0 items-center gap-2 rounded-md bg-muted/50 px-3">
+                            <span className="w-5 font-semibold text-brand">#{rank}</span>
+                            <span className="min-w-0 flex-1 truncate text-foreground">{group.site_domain || group.channel_name || "未知网站"}</span>
+                            <span className="font-mono font-semibold text-success">{formatRatio(group.ratio)}</span>
+                          </div>
+                        )
+                      })}
                     </div>
-                  ))}
-                  {(summary?.dispatch_preview?.length ?? 0) === 0 ? <div className="rounded-md bg-muted/50 p-3 text-muted-foreground">暂无可调度的 OpenAI 渠道</div> : null}
+                  ) : <div className="rounded-md bg-muted/50 p-3 text-muted-foreground">暂无可调度的 OpenAI 渠道</div>}
                 </div>
               ) : (
                 <div className="grid h-28 grid-cols-3 gap-2 text-xs text-muted-foreground">

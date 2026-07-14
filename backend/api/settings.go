@@ -70,6 +70,9 @@ func saveSettingsConfig(c *gin.Context, d *Deps) {
 
 	cfg.App.Title = in.App.Title
 	cfg.App.NotificationPrefix = in.App.NotificationPrefix
+	// The public dashboard reads this flag directly from config.yaml. Keep it
+	// here instead of silently restoring the previous value on every save.
+	cfg.App.HomepageCheapestEnabled = in.App.HomepageCheapestEnabled
 	cfg.Auth = in.Auth
 	cfg.Scheduler = in.Scheduler
 	cfg.Notifications = in.Notifications

@@ -574,6 +574,24 @@ func (r *UpstreamGroupKeys) MarkHealthFailureStatus(id uint, status string, errM
 	}).Error
 }
 
+// MarkHealthInconclusive records a probe result that could not prove an
+// upstream is unusable (for example a probe-model or endpoint mismatch).  It
+// deliberately does not increase failure_count or create a cooldown, so an
+// otherwise working route remains eligible for real user traffic.
+func (r *UpstreamGroupKeys) MarkHealthInconclusive(id uint, errMsg string, latencyMS int64) error {
+	now := time.Now()
+	if latencyMS < 0 {
+		latencyMS = 0
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+		"status":          "unknown",
+		"last_checked_at": &now,
+		"last_latency_ms": latencyMS,
+		"disabled_until":  nil,
+		"last_error":      errMsg,
+	}).Error
+}
+
 func (r *UpstreamGroupKeys) Delete(id uint) error {
 	return r.db.Delete(&UpstreamGroupKey{}, id).Error
 }

@@ -796,6 +796,20 @@ func TestProxyFailsOverOnUnsupportedModelBadRequest(t *testing.T) {
 	if badGroup.Status != "alive" || badGroup.FailureCount != 0 {
 		t.Fatalf("unsupported model must not poison healthy group status: %#v", badGroup)
 	}
+
+	// The first request discovers the two model capabilities. The next request
+	// must use the proven-compatible channel directly instead of paying another
+	// failed request to the lower-ratio channel.
+	req = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("second proxy request: %v", err)
+	}
+	if rec.Code != http.StatusOK || badHits != 1 || liveHits != 2 {
+		t.Fatalf("known model capabilities were not used: status=%d bad=%d live=%d body=%s", rec.Code, badHits, liveHits, rec.Body.String())
+	}
 }
 
 func TestProxyFailsOverOnOpenAIModelAccessBadRequest(t *testing.T) {
@@ -973,10 +987,12 @@ func TestProxyConcurrentRequestsFailOverAndRecordUsage(t *testing.T) {
 	}
 }
 
-func TestOrderCandidatesUsesRuntimeLatencyWithinSamePrice(t *testing.T) {
+func TestOrderCandidatesUsesRuntimeFirstTokenWithinSamePrice(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("i", 32))
-	env.svc.recordRuntimeSuccess(1, 200*time.Millisecond)
-	env.svc.recordRuntimeSuccess(2, 20*time.Millisecond)
+	// Candidate 1 has a longer full response, but it starts producing tokens far
+	// sooner. For interactive streaming this is the better experience.
+	env.svc.recordRuntimeSuccess(1, 200*time.Millisecond, 20*time.Millisecond)
+	env.svc.recordRuntimeSuccess(2, 20*time.Millisecond, 120*time.Millisecond)
 	candidates := []storage.UpstreamGroupKey{
 		{ID: 1, Status: "alive", Ratio: 1},
 		{ID: 2, Status: "alive", Ratio: 1},
@@ -986,8 +1002,8 @@ func TestOrderCandidatesUsesRuntimeLatencyWithinSamePrice(t *testing.T) {
 	if ordered[0].ID != 3 {
 		t.Fatalf("cheapest candidate should still win: %#v", ordered)
 	}
-	if ordered[1].ID != 2 || ordered[2].ID != 1 {
-		t.Fatalf("same-price candidates should prefer lower runtime latency: %#v", ordered)
+	if ordered[1].ID != 1 || ordered[2].ID != 2 {
+		t.Fatalf("same-price candidates should prefer lower first-token latency: %#v", ordered)
 	}
 }
 
@@ -1193,6 +1209,56 @@ func TestHealthTransientFailuresDoNotCooldownBeforeThreshold(t *testing.T) {
 	}
 	if stored.FailureCount != 3 || stored.DisabledUntil == nil || stored.Status != "server_error" {
 		t.Fatalf("third transient health failure should cooldown dispatch, got %#v", stored)
+	}
+}
+
+func TestGenericHealthFailureNeedsThreeCompletedRunsBeforeDead(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("d", 32))
+	channel := &storage.Channel{Name: "generic-health", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.invalid", MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-generic-health")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "generic", GroupName: "generic", Ratio: 0.1, KeyCipher: keyCipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "generic")
+	if err != nil || group == nil {
+		t.Fatalf("load group key: %v", err)
+	}
+
+	for run := 1; run <= proxyTransientFailureThreshold-1; run++ {
+		status := env.svc.confirmedHealthFailureStatus(group.ID, "dead")
+		if status != "unknown" {
+			t.Fatalf("run %d status = %q, want unknown", run, status)
+		}
+		env.svc.markHealthFailureWithStatus(group.ID, status, "generic probe failure", 1)
+	}
+	stored, err := env.groupKeys.FindByID(group.ID)
+	if err != nil {
+		t.Fatalf("reload group after unconfirmed failures: %v", err)
+	}
+	if stored.Status != "unknown" || stored.FailureCount != proxyTransientFailureThreshold-1 || stored.DisabledUntil != nil {
+		t.Fatalf("unconfirmed generic failures should remain schedulable: %#v", stored)
+	}
+	if status := env.svc.confirmedHealthFailureStatus(group.ID, "dead"); status != "dead" {
+		t.Fatalf("third completed generic failure status = %q, want dead", status)
+	}
+
+	beforeFailures := stored.FailureCount
+	env.svc.markHealthInconclusive(group.ID, "probe model not supported", 1)
+	stored, err = env.groupKeys.FindByID(group.ID)
+	if err != nil {
+		t.Fatalf("reload group after inconclusive probe: %v", err)
+	}
+	if stored.Status != "unknown" || stored.FailureCount != beforeFailures || stored.DisabledUntil != nil {
+		t.Fatalf("inconclusive probe must not add a failure or cooldown: %#v", stored)
 	}
 }
 
@@ -1505,6 +1571,69 @@ func TestHealthProbeRetriesCompatibleModelWhenPrimaryRouteLooksUnavailable(t *te
 	}
 }
 
+func TestTestGroupKeysDiscoversActualModelAfterGenericDefaultProbeMiss(t *testing.T) {
+	var modelsHits int
+	probeModels := make([]string, 0, 4)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			modelsHits++
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.6"}]}`))
+		case "/v1/responses":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decode probe: %v", err)
+			}
+			model := stringValue(body["model"])
+			probeModels = append(probeModels, model)
+			w.Header().Set("Content-Type", "application/json")
+			if model != "gpt-5.6" {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"error":{"message":"not found"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":"resp_probe_56","model":"gpt-5.6","output_text":"2"}`))
+		case "/v1/chat/completions":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"not found"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("m", 32))
+	channel := &storage.Channel{Name: "model-limited-health", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-model-limited")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	key := &storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", GroupRef: "default", GroupName: "default",
+		Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+	}
+	if err := env.groupKeys.Upsert(key); err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	result, err := env.svc.TestGroupKeys(context.Background(), HealthTestOptions{BatchSize: 1, GroupIDs: []uint{key.ID}})
+	if err != nil {
+		t.Fatalf("test group: %v", err)
+	}
+	if result.Alive != 1 || result.Dead != 0 || len(result.Items) != 1 || result.Items[0].Status != "alive" {
+		t.Fatalf("model-limited but usable group must not be marked dead: %#v", result)
+	}
+	if modelsHits != 1 || !healthProbeModelIsOneOf("gpt-5.6", probeModels...) {
+		t.Fatalf("probe did not discover the usable model: models=%d probes=%#v", modelsHits, probeModels)
+	}
+}
+
 func TestHealthProbeUsesStreamingClaudeRequest(t *testing.T) {
 	var seen map[string]any
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1604,22 +1733,56 @@ func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
 	if result.Alive != 35 {
 		t.Fatalf("alive = %d, want 35; result=%#v", result.Alive, result)
 	}
-	if result.BatchSize != 30 || result.Batches != 2 {
-		t.Fatalf("batch metadata = size %d batches %d, want 30/2", result.BatchSize, result.Batches)
+	if result.BatchSize != 10 || result.Batches != 4 {
+		t.Fatalf("batch metadata = size %d batches %d, want 10/4", result.BatchSize, result.Batches)
 	}
-	if got := atomic.LoadInt64(&maxInFlight); got > 30 {
-		t.Fatalf("maximum concurrent upstream requests = %d, want at most 30", got)
+	if got := atomic.LoadInt64(&maxInFlight); got > healthPerChannelParallel {
+		t.Fatalf("maximum concurrent requests to one upstream = %d, want at most %d", got, healthPerChannelParallel)
 	}
-	if got := atomic.LoadInt64(&maxInFlight); got < 30 {
-		t.Fatalf("maximum concurrent upstream requests = %d, want first batch to fill 30 slots", got)
+	if got := atomic.LoadInt64(&maxInFlight); got != healthPerChannelParallel {
+		t.Fatalf("maximum concurrent requests to one upstream = %d, want %d", got, healthPerChannelParallel)
 	}
 	for _, item := range result.Items {
 		if item.Status != "alive" {
 			t.Fatalf("group %d status = %s: %s", item.ID, item.Status, item.Error)
 		}
-		if item.Batch < 1 || item.Batch > 2 {
-			t.Fatalf("group %d batch = %d, want 1..2", item.ID, item.Batch)
+		if item.Batch < 1 || item.Batch > 4 {
+			t.Fatalf("group %d batch = %d, want 1..4", item.ID, item.Batch)
 		}
+	}
+}
+
+func TestHealthProbeSlotsSerializeDifferentChannelsWithSameAPIBaseURL(t *testing.T) {
+	svc := &Service{}
+	first := storage.UpstreamGroupKey{ChannelID: 1, ChannelURL: "https://relay.example.com/v1/"}
+	second := storage.UpstreamGroupKey{ChannelID: 2, ChannelURL: "https://RELAY.example.com/v1"}
+
+	releaseFirst := svc.acquireHealthProbeUpstreamSlot(first)
+	firstReleased := false
+	defer func() {
+		if !firstReleased {
+			releaseFirst()
+		}
+	}()
+	releaseSecond := make(chan func(), 1)
+	go func() {
+		releaseSecond <- svc.acquireHealthProbeUpstreamSlot(second)
+	}()
+
+	select {
+	case release := <-releaseSecond:
+		release()
+		t.Fatal("health probes for the same API base URL must not run concurrently")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseFirst()
+	firstReleased = true
+	select {
+	case release := <-releaseSecond:
+		release()
+	case <-time.After(time.Second):
+		t.Fatal("waiting same-upstream health probe did not resume after release")
 	}
 }
 
@@ -1674,6 +1837,62 @@ func TestTestGroupKeysHonorsSelectedGroupIDs(t *testing.T) {
 	defer hitsMu.Unlock()
 	if hits["group-a"] != 1 || hits["group-c"] != 1 || hits["group-b"] != 0 {
 		t.Fatalf("unexpected response hits: %#v", hits)
+	}
+}
+
+func TestTestGroupKeysRecoversChatOnlyUpstreamInsteadOfMarkingItDead(t *testing.T) {
+	var responsesHits, chatHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			responsesHits++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"Responses endpoint not found"}}`))
+		case "/v1/chat/completions":
+			chatHits++
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_probe\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"2\"}}]}\n\ndata: [DONE]\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("h", 32))
+	channel := &storage.Channel{Name: "chat-only-health", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	key := &storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", GroupRef: "default", GroupName: "default",
+		Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+	}
+	if err := env.groupKeys.Upsert(key); err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	result, err := env.svc.TestGroupKeys(context.Background(), HealthTestOptions{BatchSize: 1, GroupIDs: []uint{key.ID}})
+	if err != nil {
+		t.Fatalf("test group: %v", err)
+	}
+	if result.Alive != 1 || result.Dead != 0 || len(result.Items) != 1 || result.Items[0].Status != "alive" {
+		t.Fatalf("chat-only upstream must be alive after compatible probe: %#v", result)
+	}
+	if responsesHits != 1 || chatHits != 1 {
+		t.Fatalf("probe endpoint hits responses=%d chat=%d, want 1/1", responsesHits, chatHits)
+	}
+	stored, err := env.groupKeys.FindByID(key.ID)
+	if err != nil || stored == nil {
+		t.Fatalf("load group: %v", err)
+	}
+	if stored.Status != "alive" || stored.RequestMode != "chat" {
+		t.Fatalf("stored group = %#v, want alive chat capability", stored)
 	}
 }
 
@@ -2007,6 +2226,9 @@ func TestProxyStreamFailsOverOnSSEErrorBeforeWriting(t *testing.T) {
 	var liveHits int
 	liveUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		liveHits++
+		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+			t.Errorf("stream accept-encoding = %q, want identity", got)
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("event: response.output_text.delta\n" +
 			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\",\"response_id\":\"resp_live\"}\n\n" +
@@ -2124,7 +2346,7 @@ func TestAttemptStreamDoesNotFallbackAfterWriterStarted(t *testing.T) {
 		ChannelID:   channel.ID,
 		ChannelName: "started-stream",
 		ChannelType: storage.ChannelTypeSub2API,
-		GroupRef: "started", GroupName: "started", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+		GroupRef:    "started", GroupName: "started", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
 	}
 	normalized := normalizedRequest{
 		Method:       http.MethodPost,
@@ -2255,7 +2477,7 @@ func TestProxySynthesizesFailedWhenUpstreamDropsStreamMidway(t *testing.T) {
 	}
 }
 
-func TestProxyDoesNotDowngradeResponsesToChatWhenUpstreamLacksResponses(t *testing.T) {
+func TestProxyRecoversResponsesEndpointMissingWithChatFallback(t *testing.T) {
 	var responsesHits, chatHits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.URL.Path, "/responses") {
@@ -2295,16 +2517,21 @@ func TestProxyDoesNotDowngradeResponsesToChatWhenUpstreamLacksResponses(t *testi
 	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	err = env.svc.Proxy(rec, req, "/v1/responses")
-	if err == nil {
-		t.Fatalf("proxy unexpectedly succeeded with body=%s", rec.Body.String())
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
 	}
-	gwErr, ok := err.(*GatewayError)
-	if !ok || gwErr.Status != http.StatusServiceUnavailable {
-		t.Fatalf("error = %#v, want 503 GatewayError", err)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "pong") {
+		t.Fatalf("chat fallback response malformed: status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if responsesHits != 1 || chatHits != 0 {
-		t.Fatalf("native responses must not downgrade to chat: responses=%d chat=%d", responsesHits, chatHits)
+	if responsesHits != 1 || chatHits != 1 {
+		t.Fatalf("expected a single endpoint fallback: responses=%d chat=%d", responsesHits, chatHits)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "default")
+	if err != nil || group == nil {
+		t.Fatalf("reload upstream group: %v", err)
+	}
+	if group.RequestMode != "chat" {
+		t.Fatalf("request mode = %q, want recovered chat capability", group.RequestMode)
 	}
 }
 
@@ -2655,6 +2882,79 @@ func TestProxyResponsesStreamNoUpstreamsReturnsFailedTerminal(t *testing.T) {
 		t.Fatalf("missing friendly terminal failure stream: %s", out)
 	}
 	assertResponsesStreamTerminalOnce(t, out, "response.failed")
+}
+
+func TestProxyResponsesStreamRecoversStaleProtocolWithChatAndPersistsIt(t *testing.T) {
+	var responsesHits, chatHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			responsesHits++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"message":"responses endpoint not found"}}`))
+		case "/v1/chat/completions":
+			chatHits++
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"2\"}}]}\n\ndata: [DONE]\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("s", 32))
+	channel := &storage.Channel{Name: "stale-protocol", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-stale-protocol")
+	if err != nil {
+		t.Fatalf("encrypt upstream key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
+		ClientFormat: "openai", RequestMode: "responses", GroupRef: "default", GroupName: "default",
+		Ratio: 1, KeyCipher: cipher, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert upstream group: %v", err)
+	}
+
+	call := func() string {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+		req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("proxy status = %d body=%s", rec.Code, rec.Body.String())
+		}
+		return rec.Body.String()
+	}
+
+	first := call()
+	if !strings.Contains(first, "response.completed") || strings.Contains(first, "response.failed") {
+		t.Fatalf("stale protocol fallback did not complete Responses stream: %s", first)
+	}
+	assertResponsesStreamTerminalOnce(t, first, "response.completed")
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "default")
+	if err != nil || group == nil {
+		t.Fatalf("reload upstream group: %v", err)
+	}
+	if group.RequestMode != "chat" {
+		t.Fatalf("request mode = %q, want recovered chat capability", group.RequestMode)
+	}
+	if responsesHits != 1 || chatHits != 1 {
+		t.Fatalf("first request hits responses=%d chat=%d, want 1/1", responsesHits, chatHits)
+	}
+
+	second := call()
+	assertResponsesStreamTerminalOnce(t, second, "response.completed")
+	if responsesHits != 1 || chatHits != 2 {
+		t.Fatalf("saved chat capability was not reused: responses=%d chat=%d", responsesHits, chatHits)
+	}
 }
 
 func TestProxyResponsesStreamAuthErrorReturnsFailedTerminal(t *testing.T) {
