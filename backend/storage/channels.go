@@ -107,7 +107,12 @@ func (r *Channels) ListPage(page, pageSize int, search string) ([]Channel, int64
 }
 func (r *Channels) ListMonitorEnabled() ([]Channel, error) {
 	var list []Channel
-	if err := r.db.Where("monitor_enabled = ?", true).Order("sort_order DESC").Order("id ASC").Find(&list).Error; err != nil {
+	if err := r.db.
+		Where("monitor_enabled = ?", true).
+		Where("NOT (credential_mode = ? AND LOWER(TRIM(username)) = ?)", CredentialModeToken, "manual").
+		Order("sort_order DESC").
+		Order("id ASC").
+		Find(&list).Error; err != nil {
 		return nil, err
 	}
 	return list, nil

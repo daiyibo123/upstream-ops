@@ -27,6 +27,7 @@ type Config struct {
 type AppConfig struct {
 	Title              string `mapstructure:"title" yaml:"title" json:"title"`
 	NotificationPrefix string `mapstructure:"notificationPrefix" yaml:"notificationPrefix" json:"notificationPrefix"`
+	HomepageCheapestEnabled bool `mapstructure:"homepageCheapestEnabled" yaml:"homepageCheapestEnabled" json:"homepageCheapestEnabled"`
 	PublicKey          PublicKeyConfig `mapstructure:"publicKey" yaml:"publicKey" json:"publicKey"`
 }
 
@@ -363,6 +364,7 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("upstream.timeoutSeconds", DefaultUpstreamTimeoutSeconds)
 	v.SetDefault("upstream.userAgent", DefaultUpstreamUserAgent)
+	v.SetDefault("app.homepageCheapestEnabled", true)
 	v.SetDefault("upstream.requestRectifier.enabled", true)
 	v.SetDefault("upstream.requestRectifier.thinkingSignature", true)
 	v.SetDefault("upstream.requestRectifier.thinkingBudget", true)

@@ -110,6 +110,10 @@ function initialState(c?: Channel | null): FormState {
  * buildTokenCredential 把当前表单里的 token 字段序列化成后端期望的 JSON 字符串。
  * 字段命名与 channel/service.go 里的 NewAPITokenCredential / Sub2APITokenCredential 对齐。
  */
+function isManualChannel(c?: Channel | null) {
+  return !!c?.manual || (c?.credential_mode === "token" && c?.username?.trim().toLowerCase() === "manual")
+}
+
 function buildTokenCredential(form: FormState): string {
   if (form.type === "newapi") {
     if (form.newapi_token_kind === "access_token") {
@@ -145,11 +149,37 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
   }, [open, channel])
 
   const isEdit = !!channel
+  const isManual = isManualChannel(channel)
   const isTokenMode = form.credential_mode === "token"
   const supportsSubscription = form.type === "sub2api"
   // 编辑模式下，若 credential_mode 没变，token / password 都可以留空表示不修改。
   const modeChanged = isEdit && form.credential_mode !== (channel?.credential_mode ?? "password")
   const existingNewAPIUserID = isEdit && channel?.type === "newapi" ? (channel.user_id ?? "").trim() : ""
+
+  async function handleManualSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault()
+    if (!channel) return
+    setError(null)
+    setSubmitting(true)
+    try {
+      if (!form.name.trim()) throw new Error("渠道名不能为空")
+      if (!form.site_url.trim()) throw new Error("网址不能为空")
+      await apiFetch(`/channels/${channel.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          name: form.name.trim(),
+          site_url: form.site_url.trim(),
+        }),
+      })
+      onOpenChange(false)
+      refresh()
+    } catch (e) {
+      const err = e as Error
+      setError(err.message || "保存失败")
+    } finally {
+      setSubmitting(false)
+    }
+  }
 
   async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault()
@@ -295,6 +325,59 @@ export function ChannelFormDialog({ open, onOpenChange, channel }: ChannelFormDi
     } finally {
       setSubmitting(false)
     }
+  }
+
+  if (isManual) {
+    return (
+      <Dialog open={open} onOpenChange={onOpenChange}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>编辑手动渠道</DialogTitle>
+            <DialogDescription>
+              手动添加的渠道只允许修改名称和网址，Key 请在“密钥”里查看或删除。
+            </DialogDescription>
+          </DialogHeader>
+
+          <form onSubmit={handleManualSubmit} className="space-y-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="manual-channel-name">渠道名</Label>
+              <Input
+                id="manual-channel-name"
+                value={form.name}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+                required
+                disabled={submitting}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="manual-channel-url">网址</Label>
+              <Input
+                id="manual-channel-url"
+                value={form.site_url}
+                onChange={(e) => setForm({ ...form, site_url: e.target.value })}
+                required
+                disabled={submitting}
+              />
+            </div>
+
+            {error ? (
+              <p className="text-sm text-destructive" role="alert">
+                {error}
+              </p>
+            ) : null}
+
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={submitting}>
+                取消
+              </Button>
+              <Button type="submit" disabled={submitting}>
+                {submitting ? "保存中..." : "保存"}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    )
   }
 
   return (

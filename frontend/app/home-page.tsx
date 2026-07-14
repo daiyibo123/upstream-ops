@@ -32,6 +32,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { apiFetch } from "@/lib/api"
+import { useAuth } from "@/lib/auth-context"
 import { dateTime, formatPercent, formatRatio, formatTokens } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import type { DashboardGatewayGroup } from "@/lib/api-types"
@@ -75,6 +76,8 @@ interface PublicSummary {
   cheapest?: DashboardGatewayGroup | null
   supported_formats: string[]
   gateway_status: string
+	homepage_cheapest_enabled?: boolean
+  dispatch_preview?: DashboardGatewayGroup[]
   public_key?: PublicKeyStat
   public_key_enabled: boolean
 }
@@ -215,6 +218,7 @@ function PublicGatewayStatusCard({
 }
 
 export default function HomePage() {
+	const { status: authStatus } = useAuth()
   const [summary, setSummary] = useState<PublicSummary | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [publicKeyOpen, setPublicKeyOpen] = useState(false)
@@ -224,6 +228,7 @@ export default function HomePage() {
   const [publicKeyVisible, setPublicKeyVisible] = useState(false)
   const [publicKeyIntent, setPublicKeyIntent] = useState<"view" | "copy">("view")
   const [publicPasswordVisible, setPublicPasswordVisible] = useState(false)
+	const [cheapestRotation, setCheapestRotation] = useState(0)
   const appTitle = summary?.title?.trim() || "UpstreamOps"
 
   useEffect(() => {
@@ -235,6 +240,16 @@ export default function HomePage() {
       .then(setSummary)
       .catch((e: Error) => setError(e.message))
   }, [])
+
+	useEffect(() => {
+		const count = summary?.dispatch_preview?.length ?? 0
+		if (count <= 1) {
+			setCheapestRotation(0)
+			return
+		}
+		const timer = window.setInterval(() => setCheapestRotation((value) => (value + 1) % count), 3500)
+		return () => window.clearInterval(timer)
+	}, [summary?.dispatch_preview?.length])
 
   const publicKey = summary?.public_key
   const publicKeyAvailable = Boolean(summary?.public_key_enabled && publicKey?.status === "available")
@@ -352,8 +367,8 @@ export default function HomePage() {
           <div className="flex items-center gap-2">
             <ThemeToggle className="border-border bg-background/80 text-foreground hover:bg-muted" />
             <Button asChild>
-              <Link to="/login">
-                登录
+              <Link to={authStatus === "authenticated" ? "/dashboard" : "/login"}>
+                {authStatus === "authenticated" ? "控制台" : "登录"}
                 <ArrowRight className="size-4" />
               </Link>
             </Button>
@@ -458,27 +473,35 @@ export default function HomePage() {
             <Card className="app-card p-4">
               <div className="mb-4 flex items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm font-semibold text-foreground">格式覆盖</p>
-                  <p className="text-xs text-muted-foreground">公开页仅展示分组数量概览，不展示具体调度列表。</p>
+                  <p className="text-sm font-semibold text-foreground">
+                    {summary?.homepage_cheapest_enabled !== false ? "OpenAI 最低倍率前五" : "网关服务器状态"}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    {summary?.homepage_cheapest_enabled !== false ? "随监控数据自动更新，仅展示可调度渠道。" : "首页展示服务与调度状态。"}
+                  </p>
                 </div>
                 <Badge variant="outline" className="soft-success">
                   {summary?.gateway_status ?? "online"}
                 </Badge>
               </div>
-              <div className="grid grid-cols-1 gap-2 text-xs text-muted-foreground sm:grid-cols-3">
-                <div className="rounded-md bg-muted/50 p-3">
-                  OpenAI 分组
-                  <span className="mt-1 block text-lg font-semibold text-foreground">{summary?.openai_groups ?? 0}</span>
+              {summary?.homepage_cheapest_enabled !== false ? (
+                <div className="h-28 space-y-1.5 overflow-hidden text-xs">
+				  {((summary?.dispatch_preview ?? []).slice(cheapestRotation).concat((summary?.dispatch_preview ?? []).slice(0, cheapestRotation))).map((group, index) => (
+                    <div key={group.id} className="flex items-center gap-2 rounded-md bg-muted/50 px-3 py-2">
+                      <span className="w-5 font-semibold text-brand">#{index + 1}</span>
+                      <span className="min-w-0 flex-1 truncate text-foreground">{group.channel_name} / {group.group_name}</span>
+                      <span className="font-mono font-semibold text-success">{formatRatio(group.ratio)}</span>
+                    </div>
+                  ))}
+                  {(summary?.dispatch_preview?.length ?? 0) === 0 ? <div className="rounded-md bg-muted/50 p-3 text-muted-foreground">暂无可调度的 OpenAI 渠道</div> : null}
                 </div>
-                <div className="rounded-md bg-muted/50 p-3">
-                  Claude 分组
-                  <span className="mt-1 block text-lg font-semibold text-foreground">{summary?.claude_groups ?? 0}</span>
+              ) : (
+                <div className="grid h-28 grid-cols-3 gap-2 text-xs text-muted-foreground">
+                  <div className="rounded-md bg-muted/50 p-3">状态<span className="mt-1 block text-lg font-semibold text-success">{summary?.gateway_status ?? "online"}</span></div>
+                  <div className="rounded-md bg-muted/50 p-3">可用<span className="mt-1 block text-lg font-semibold text-foreground">{summary?.available_groups ?? 0}</span></div>
+                  <div className="rounded-md bg-muted/50 p-3">分组<span className="mt-1 block text-lg font-semibold text-foreground">{summary?.upstream_groups ?? 0}</span></div>
                 </div>
-                <div className="rounded-md bg-muted/50 p-3">
-                  Grok 分组
-                  <span className="mt-1 block text-lg font-semibold text-foreground">{summary?.grok_groups ?? 0}</span>
-                </div>
-              </div>
+              )}
             </Card>
           </div>
         </section>

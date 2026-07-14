@@ -171,7 +171,7 @@ export function MonitorHeader() {
               <Button
                 variant="outline"
                 size="icon"
-                onClick={() => navigate("/")}
+                onClick={() => navigate(username ? "/dashboard" : "/")}
                 className="size-8 border-border bg-background text-foreground hover:bg-muted"
                 aria-label="主页"
               >

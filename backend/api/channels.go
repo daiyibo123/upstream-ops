@@ -92,6 +92,7 @@ type channelUpdateInput struct {
 type channelOutput struct {
 	storage.Channel
 	UserID string `json:"user_id,omitempty"`
+	Manual bool   `json:"manual"`
 }
 
 type channelRedeemInput struct {
@@ -186,7 +187,22 @@ func channelOutputs(d *Deps, list []storage.Channel) []channelOutput {
 func channelOutputFor(d *Deps, ch storage.Channel) channelOutput {
 	out := channelOutput{Channel: ch}
 	out.UserID = channelUserID(d, &ch)
+	out.Manual = isManualChannel(&ch)
 	return out
+}
+
+func isManualChannel(ch *storage.Channel) bool {
+	return ch != nil &&
+		ch.CredentialMode == storage.CredentialModeToken &&
+		strings.EqualFold(strings.TrimSpace(ch.Username), "manual")
+}
+
+func rejectManualChannel(c *gin.Context, ch *storage.Channel) bool {
+	if !isManualChannel(ch) {
+		return false
+	}
+	fail(c, http.StatusBadRequest, fmt.Errorf("手动添加渠道不支持该操作"))
+	return true
 }
 
 func channelUserID(d *Deps, ch *storage.Channel) string {
@@ -238,13 +254,25 @@ func updateChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusBadRequest, err)
 		return
 	}
-	subscriptionEnabled := in.SubscriptionEnabled
-	if subscriptionEnabled != nil {
-		current, err := d.Channels.FindByID(id)
+	current, err := d.Channels.FindByID(id)
+	if err != nil {
+		fail(c, http.StatusNotFound, err)
+		return
+	}
+	if isManualChannel(current) {
+		updated, err := d.ChannelSvc.Update(id, channel.UpdateInput{
+			Name:    in.Name,
+			SiteURL: in.SiteURL,
+		})
 		if err != nil {
-			fail(c, http.StatusNotFound, err)
+			fail(c, http.StatusInternalServerError, err)
 			return
 		}
+		c.JSON(http.StatusOK, gin.H{"data": channelOutputFor(d, *updated)})
+		return
+	}
+	subscriptionEnabled := in.SubscriptionEnabled
+	if subscriptionEnabled != nil {
 		enabled := current.Type == storage.ChannelTypeSub2API && *subscriptionEnabled
 		subscriptionEnabled = &enabled
 	}
@@ -294,6 +322,14 @@ func clearChannelLoginInfo(c *gin.Context, d *Deps) {
 		fail(c, http.StatusBadRequest, err)
 		return
 	}
+	ch, err := d.Channels.FindByID(id)
+	if err != nil {
+		fail(c, http.StatusNotFound, err)
+		return
+	}
+	if rejectManualChannel(c, ch) {
+		return
+	}
 	updated, err := d.ChannelSvc.ClearLoginInfo(id)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, err)
@@ -306,6 +342,14 @@ func toggleChannel(c *gin.Context, d *Deps, enabled bool) {
 	id, err := uintParam(c, "id")
 	if err != nil {
 		fail(c, http.StatusBadRequest, err)
+		return
+	}
+	ch, err := d.Channels.FindByID(id)
+	if err != nil {
+		fail(c, http.StatusNotFound, err)
+		return
+	}
+	if rejectManualChannel(c, ch) {
 		return
 	}
 	_, err = d.ChannelSvc.Update(id, channel.UpdateInput{MonitorEnabled: &enabled})
@@ -325,6 +369,9 @@ func testLogin(c *gin.Context, d *Deps) {
 	ch, err := d.Channels.FindByID(id)
 	if err != nil {
 		fail(c, http.StatusNotFound, err)
+		return
+	}
+	if rejectManualChannel(c, ch) {
 		return
 	}
 
@@ -355,6 +402,9 @@ func refreshBalance(c *gin.Context, d *Deps) {
 		fail(c, http.StatusNotFound, err)
 		return
 	}
+	if rejectManualChannel(c, ch) {
+		return
+	}
 	if err := d.Monitor.RefreshBalance(c.Request.Context(), ch); err != nil {
 		c.JSON(http.StatusOK, gin.H{"ok": false, "error": err.Error()})
 		return
@@ -373,6 +423,9 @@ func refreshRates(c *gin.Context, d *Deps) {
 		fail(c, http.StatusNotFound, err)
 		return
 	}
+	if rejectManualChannel(c, ch) {
+		return
+	}
 	if err := d.Monitor.RefreshRates(c.Request.Context(), ch); err != nil {
 		c.JSON(http.StatusOK, gin.H{"ok": false, "error": err.Error()})
 		return
@@ -386,8 +439,12 @@ func redeemChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusBadRequest, err)
 		return
 	}
-	if _, err := d.Channels.FindByID(id); err != nil {
+	ch, err := d.Channels.FindByID(id)
+	if err != nil {
 		fail(c, http.StatusNotFound, err)
+		return
+	}
+	if rejectManualChannel(c, ch) {
 		return
 	}
 
@@ -747,6 +804,9 @@ func syncChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusNotFound, err)
 		return
 	}
+	if rejectManualChannel(c, ch) {
+		return
+	}
 
 	obs := setupSSE(c)
 	ctx := progress.WithObserver(c.Request.Context(), channelScopedObserver{
@@ -774,10 +834,16 @@ func syncChannel(c *gin.Context, d *Deps) {
 }
 
 func syncAllChannels(c *gin.Context, d *Deps) {
-	list, err := d.Channels.List()
+	all, err := d.Channels.List()
 	if err != nil {
 		fail(c, http.StatusInternalServerError, err)
 		return
+	}
+	list := make([]storage.Channel, 0, len(all))
+	for i := range all {
+		if !isManualChannel(&all[i]) {
+			list = append(list, all[i])
+		}
 	}
 
 	obs := setupSSE(c)

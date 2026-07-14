@@ -85,6 +85,10 @@ function statusOf(c: Channel): Status {
   return "healthy"
 }
 
+function isManualChannel(c?: Channel | null) {
+  return !!c?.manual || (c?.credential_mode === "token" && c?.username?.trim().toLowerCase() === "manual")
+}
+
 const statusMap: Record<Status, { label: string; cls: string }> = {
   healthy: { label: "健康", cls: "text-success bg-success/10" },
   low: { label: "低余额", cls: "text-warning bg-warning/10" },
@@ -544,6 +548,7 @@ export function ChannelCards() {
   const anySyncRunning = bulkSync.running || Object.values(syncState).some((s) => s.running)
   const channelPage = pageQuery.data
   const visibleChannels = channelPage?.items ?? []
+  const syncableChannels = (channels ?? []).filter((channel) => !isManualChannel(channel))
   const totalChannels = channelPage?.total ?? 0
   const pageSizeAll = pageSize === "all"
   const totalPages = pageSizeAll ? 1 : (channelPage?.pages ?? 1)
@@ -650,8 +655,11 @@ export function ChannelCards() {
   }
 
   async function startBulkSync() {
-    const list = channels ?? []
-    if (list.length === 0) return
+    const list = syncableChannels
+    if (list.length === 0) {
+      toast.info("没有可同步的登录账号渠道")
+      return
+    }
 
     for (const channel of list) {
       clearHideTimer(channel.id)
@@ -757,7 +765,7 @@ export function ChannelCards() {
             variant="outline"
             size="sm"
             className="gap-1.5 text-xs"
-            disabled={anySyncRunning}
+            disabled={anySyncRunning || syncableChannels.length === 0}
             onClick={() => void startBulkSync()}
           >
             <RefreshCw className={cn("size-3.5", bulkSync.running && "animate-spin")} />
@@ -835,6 +843,7 @@ export function ChannelCards() {
             {visibleChannels.map((c) => {
               const status = statusOf(c)
               const meta = statusMap[status]
+              const manual = isManualChannel(c)
               return (
                 <Card key={c.id} className="flex flex-col gap-0 border border-border p-3 shadow-none sm:p-4">
                   <div className="flex items-start justify-between gap-3">
@@ -856,6 +865,11 @@ export function ChannelCards() {
                       >
                         {channelTypeLabel(c.type)}
                       </span>
+                      {manual ? (
+                        <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-border">
+                          手动
+                        </span>
+                      ) : null}
                       {!c.monitor_enabled ? (
                         <span className="inline-flex items-center rounded bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium text-warning ring-1 ring-inset ring-warning/20">
                           {"已暂停"}
@@ -941,7 +955,7 @@ export function ChannelCards() {
                       variant="outline"
                       size="sm"
                       className="gap-1 text-xs"
-                      disabled={!!syncState[c.id]?.running || anySyncRunning}
+                      disabled={manual || !!syncState[c.id]?.running || anySyncRunning}
                       onClick={() => startStream(c, "sync")}
                     >
                       <RefreshCw
@@ -953,7 +967,7 @@ export function ChannelCards() {
                       variant="outline"
                       size="sm"
                       className="gap-1 text-xs"
-                      disabled={!!syncState[c.id]?.running || anySyncRunning}
+                      disabled={manual || !!syncState[c.id]?.running || anySyncRunning}
                       onClick={() => startStream(c, "test-login")}
                       >
                         <LogIn className="size-3" />
@@ -963,6 +977,7 @@ export function ChannelCards() {
                       variant="outline"
                       size="sm"
                       className="gap-1 text-xs"
+                      disabled={manual}
                       onClick={() => setRedeeming(c)}
                     >
                       <Gift className="size-3" />
@@ -998,7 +1013,7 @@ export function ChannelCards() {
                       variant="ghost"
                       size="sm"
                       className="gap-1 text-xs text-muted-foreground"
-                      disabled={busyAction === `pin-${c.id}`}
+                      disabled={manual || busyAction === `pin-${c.id}`}
                       onClick={() =>
                         withBusy(`pin-${c.id}`, () =>
                           apiFetch(`/channels/${c.id}`, {
@@ -1015,7 +1030,7 @@ export function ChannelCards() {
                       variant="ghost"
                       size="sm"
                       className="gap-1 text-xs text-muted-foreground"
-                      disabled={busyAction === `toggle-${c.id}`}
+                      disabled={manual || busyAction === `toggle-${c.id}`}
                       onClick={() =>
                         withBusy(`toggle-${c.id}`, () =>
                           apiFetch(`/channels/${c.id}/${c.monitor_enabled ? "disable" : "enable"}`, {
@@ -1045,7 +1060,7 @@ export function ChannelCards() {
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="w-44">
                         <DropdownMenuItem
-                          disabled={busyAction === `rates-${c.id}` || !!syncState[c.id]?.running || anySyncRunning}
+                          disabled={manual || busyAction === `rates-${c.id}` || !!syncState[c.id]?.running || anySyncRunning}
                           onSelect={(e) => {
                             e.preventDefault()
                             void withBusy(`rates-${c.id}`, async () => {
@@ -1059,7 +1074,7 @@ export function ChannelCards() {
                         </DropdownMenuItem>
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
-                          disabled={busyAction === `clear-login-${c.id}`}
+                          disabled={manual || busyAction === `clear-login-${c.id}`}
                           onSelect={async (e) => {
                             e.preventDefault()
                             const ok = await confirm({

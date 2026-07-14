@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { CheckCircle2, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, XCircle } from "lucide-react"
+import { CheckCircle2, ChevronLeft, ChevronRight, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, XCircle } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -56,6 +56,7 @@ type GroupFormatFilter = "all" | ColumnClientFormat
 type RateFilter = "all" | "0-0.05" | "0.06-0.1" | "0.1-0.2" | "0.2+"
 type CharityFilter = "all" | "charity" | "normal"
 type GroupStatusFilter = "all" | "alive" | "dead" | "zero_balance" | "rate_limited" | "forbidden"
+type MaxGroupRatioLimit = "0" | "0.05" | "0.1"
 
 interface GroupFilters {
   search: string
@@ -85,6 +86,7 @@ interface KeyDraft {
   totalLimitM: string
   balanceLimit: string
   concurrencyLimit: string
+  maxGroupRatio: MaxGroupRatioLimit
   expiresInDays: string
 }
 
@@ -99,6 +101,7 @@ function createDefaultDraft(): KeyDraft {
     totalLimitM: "",
     balanceLimit: "",
     concurrencyLimit: "",
+    maxGroupRatio: "0",
     expiresInDays: "0",
   }
 }
@@ -161,7 +164,11 @@ function statusTone(status: string) {
 }
 
 function effectiveStatus(group: UpstreamGroupKey) {
-  return group.enabled === false ? "disabled" : group.status
+  if (group.enabled === false) return "disabled"
+  // Existing databases may still contain the historical auth_failed value.
+  // Present it in the single access-refused bucket rather than showing an
+  // obsolete sixth status in the available-channels page.
+  return group.status === "auth_failed" ? "forbidden" : group.status
 }
 
 function statusText(status: string) {
@@ -340,6 +347,28 @@ function groupMatchesRateBand(group: UpstreamGroupKey, band: RateFilter) {
   }
 }
 
+function normalizeMaxGroupRatio(value?: number | string | null): MaxGroupRatioLimit {
+  const ratio = Number(value ?? 0)
+  if (!Number.isFinite(ratio) || ratio <= 0) return "0"
+  if (ratio <= 0.05) return "0.05"
+  if (ratio <= 0.1) return "0.1"
+  return "0"
+}
+
+function maxGroupRatioLabel(value: MaxGroupRatioLimit | number | string | undefined | null) {
+  const normalized = normalizeMaxGroupRatio(value)
+  if (normalized === "0.05") return "0.05 倍率以下"
+  if (normalized === "0.1") return "0.1 倍率以下"
+  return "不限制倍率"
+}
+
+function groupWithinMaxRatio(group: UpstreamGroupKey, limit: MaxGroupRatioLimit) {
+  const max = Number(limit)
+  if (!Number.isFinite(max) || max <= 0) return true
+  const ratio = Number(group.ratio ?? 0)
+  return Number.isFinite(ratio) && ratio <= max + 1e-9
+}
+
 function groupMatchesCharity(group: UpstreamGroupKey, charity: CharityFilter) {
   if (charity === "all") return true
   return charity === "charity" ? group.charity === true : group.charity !== true
@@ -354,6 +383,16 @@ function upstreamKeyLabel(group: UpstreamGroupKey) {
   return id > 0 ? `上游 Key #${id}` : "手动/本地 Key"
 }
 
+function channelSourceLabel(group: UpstreamGroupKey) {
+  const raw = String(group.channel_url ?? "").trim()
+  if (!raw) return group.channel_name || `渠道 #${group.channel_id}`
+  try {
+    return new URL(raw).host || raw
+  } catch {
+    return raw.replace(/^https?:\/\//i, "").replace(/\/$/, "")
+  }
+}
+
 function normalizeSearchText(value: unknown) {
   return String(value ?? "").trim().toLowerCase()
 }
@@ -363,6 +402,7 @@ function groupSearchText(group: UpstreamGroupKey) {
   const status = effectiveStatus(group)
   return [
     group.channel_name,
+	group.channel_url,
     group.channel_id,
     group.channel_type,
     channelTypeLabel(group.channel_type),
@@ -387,12 +427,16 @@ function groupSearchText(group: UpstreamGroupKey) {
 
 function groupMatchesFilters(group: UpstreamGroupKey, filters: GroupFilters) {
   const query = normalizeSearchText(filters.search)
-  if (query && !groupSearchText(group).includes(query)) return false
-  if (!groupMatchesFormatFilter(group, filters.format)) return false
-  if (!groupMatchesRateBand(group, filters.rateBand)) return false
-  if (!groupMatchesCharity(group, filters.charity)) return false
-  if (!groupMatchesStatus(group, filters.status)) return false
-  return true
+  const checks: boolean[] = []
+  if (query) checks.push(groupSearchText(group).includes(query))
+  if (filters.format !== "all") checks.push(groupMatchesFormatFilter(group, filters.format))
+  if (filters.rateBand !== "all") checks.push(groupMatchesRateBand(group, filters.rateBand))
+  if (filters.charity !== "all") checks.push(groupMatchesCharity(group, filters.charity))
+  if (filters.status !== "all") checks.push(groupMatchesStatus(group, filters.status))
+  // The unified channel filters are intentionally OR conditions.  For example,
+  // selecting Claude and 0.05 finds both matching sets instead of silently
+  // hiding a channel that only meets one of the selected search conditions.
+  return checks.length === 0 || checks.some(Boolean)
 }
 
 function activeGroupFilterCount(filters: GroupFilters) {
@@ -456,8 +500,12 @@ function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
   })
 }
 
-function cleanGroupIDs(ids: number[], groups: UpstreamGroupKey[], format: ClientFormat) {
-  const allowed = new Set(groups.filter((group) => groupMatchesFormat(group, format)).map((group) => group.id))
+function cleanGroupIDs(ids: number[], groups: UpstreamGroupKey[], format: ClientFormat, maxRatio: MaxGroupRatioLimit = "0") {
+  const allowed = new Set(
+    groups
+      .filter((group) => groupMatchesFormat(group, format) && groupWithinMaxRatio(group, maxRatio))
+      .map((group) => group.id),
+  )
   return Array.from(new Set(ids.filter((id) => allowed.has(id)))).sort((a, b) => a - b)
 }
 
@@ -546,6 +594,7 @@ function draftFromKey(key: GatewayKey): KeyDraft {
     totalLimitM: tokensToMInput(key.total_limit),
     balanceLimit: key.balance_limit > 0 ? String(key.balance_limit) : "",
     concurrencyLimit: key.concurrency_limit > 0 ? String(key.concurrency_limit) : "",
+    maxGroupRatio: normalizeMaxGroupRatio(key.max_group_ratio),
     expiresInDays: "keep",
   }
 }
@@ -560,6 +609,7 @@ function buildGatewayKeyPayload(draft: KeyDraft, includeEnabled: boolean, includ
     total_limit: mInputToTokens(draft.totalLimitM),
     balance_limit: Math.max(0, Number(draft.balanceLimit) || 0),
     concurrency_limit: Math.max(0, Math.floor(Number(draft.concurrencyLimit) || 0)),
+    max_group_ratio: Number(draft.maxGroupRatio) || 0,
   }
   if (includeEnabled) {
     payload.enabled = draft.enabled
@@ -622,8 +672,8 @@ function KeyDraftFields({
   showKeepExpiry?: boolean
 }) {
   const eligibleGroups = useMemo(
-    () => groups.filter((group) => groupMatchesFormat(group, draft.clientFormat)),
-    [draft.clientFormat, groups],
+    () => groups.filter((group) => groupMatchesFormat(group, draft.clientFormat) && groupWithinMaxRatio(group, draft.maxGroupRatio)),
+    [draft.clientFormat, draft.maxGroupRatio, groups],
   )
   const scopedEligibleGroups = useMemo(() => {
     switch (draft.scope) {
@@ -671,7 +721,7 @@ function KeyDraftFields({
     onChange({
       ...draft,
       clientFormat: format,
-      selectedGroupIds: cleanGroupIDs(draft.selectedGroupIds, groups, format),
+      selectedGroupIds: cleanGroupIDs(draft.selectedGroupIds, groups, format, draft.maxGroupRatio),
     })
   }
 
@@ -679,7 +729,7 @@ function KeyDraftFields({
     const next = checked
       ? [...draft.selectedGroupIds, id]
       : draft.selectedGroupIds.filter((item) => item !== id)
-    onChange({ ...draft, selectedGroupIds: cleanGroupIDs(next, groups, draft.clientFormat) })
+    onChange({ ...draft, selectedGroupIds: cleanGroupIDs(next, groups, draft.clientFormat, draft.maxGroupRatio) })
   }
 
   return (
@@ -759,6 +809,29 @@ function KeyDraftFields({
           />
         </div>
         <div className="space-y-1.5">
+          <Label>渠道倍率限制</Label>
+          <Select
+            value={draft.maxGroupRatio}
+            onValueChange={(value) => {
+              const maxGroupRatio = normalizeMaxGroupRatio(value)
+              onChange({
+                ...draft,
+                maxGroupRatio,
+                selectedGroupIds: cleanGroupIDs(draft.selectedGroupIds, groups, draft.clientFormat, maxGroupRatio),
+              })
+            }}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder="选择倍率限制" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="0">不限制倍率</SelectItem>
+              <SelectItem value="0.05">0.05 倍率以下</SelectItem>
+              <SelectItem value="0.1">0.1 倍率以下</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1.5">
           <Label>过期时间</Label>
           <Select value={draft.expiresInDays} onValueChange={(value) => onChange({ ...draft, expiresInDays: value })}>
             <SelectTrigger>
@@ -811,6 +884,7 @@ function KeyDraftFields({
                         [...draft.selectedGroupIds, ...visibleGroups.map((group) => group.id)],
                         groups,
                         draft.clientFormat,
+                        draft.maxGroupRatio,
                       ),
                     })
                   }
@@ -822,7 +896,17 @@ function KeyDraftFields({
                   size="sm"
                   variant="ghost"
                   className="h-7 px-2 text-xs"
-                  onClick={() => onChange({ ...draft, selectedGroupIds: eligibleGroups.map((group) => group.id) })}
+                  onClick={() =>
+                    onChange({
+                      ...draft,
+                      selectedGroupIds: cleanGroupIDs(
+                        eligibleGroups.map((group) => group.id),
+                        groups,
+                        draft.clientFormat,
+                        draft.maxGroupRatio,
+                      ),
+                    })
+                  }
                 >
                   全选全部
                 </Button>
@@ -972,6 +1056,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [healthProgress, setHealthProgress] = useState<HealthProgress | null>(null)
   const [groupFilterDraft, setGroupFilterDraft] = useState<GroupFilters>(() => createDefaultGroupFilters())
   const [groupFilters, setGroupFilters] = useState<GroupFilters>(() => createDefaultGroupFilters())
+  const [groupPage, setGroupPage] = useState(1)
+  const [groupPageSize, setGroupPageSize] = useState(10)
   const [keySearch, setKeySearch] = useState("")
 
   const displayKeys = useMemo(
@@ -979,7 +1065,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     [keys],
   )
   const displayGroups = useMemo(
-    () => groups.filter(isOpenAIResponsesGroup),
+    () => groups,
     [groups],
   )
   const filteredKeys = useMemo(() => {
@@ -996,6 +1082,12 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const filteredGroups = useMemo(
     () => sortGroupsForDisplay(displayGroups.filter((group) => groupMatchesFilters(group, groupFilters))),
     [displayGroups, groupFilters],
+  )
+  const groupPages = Math.max(1, Math.ceil(filteredGroups.length / groupPageSize))
+  const safeGroupPage = Math.min(groupPage, groupPages)
+  const pagedGroups = useMemo(
+    () => filteredGroups.slice((safeGroupPage - 1) * groupPageSize, safeGroupPage * groupPageSize),
+    [filteredGroups, groupPageSize, safeGroupPage],
   )
   const displayAliveCount = useMemo(
     () => filteredGroups.filter((group) => effectiveStatus(group) === "alive").length,
@@ -1027,8 +1119,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     [ipPolicies],
   )
   const openAIHealthGroups = useMemo(
-    () => displayGroups,
-    [displayGroups],
+    () => groups.filter(isOpenAIHealthGroup),
+    [groups],
   )
   const enabledOpenAIHealthGroups = useMemo(
     () => openAIHealthGroups.filter((group) => group.enabled !== false),
@@ -1064,6 +1156,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   useEffect(() => {
     void load()
   }, [])
+
+  useEffect(() => {
+    setGroupPage(1)
+  }, [groupFilters, groupPageSize])
 
   function validateDraft(draft: KeyDraft) {
     if (draft.scope === "selected" && draft.selectedGroupIds.length === 0) {
@@ -1258,7 +1354,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     setBusy("bootstrap")
     try {
       const res = await apiFetch<GatewayBootstrapResult>("/gateway/group-keys/bootstrap", { method: "POST" })
-      toast.success(`分组 Key 已同步：新建 ${res.created}，更新 ${res.updated}，删除 ${res.removed || 0}，失败 ${res.failed}`)
+      toast.success(`分组 Key 已覆盖同步：保留/更新 ${res.updated}，新建 ${res.created}，删除 ${res.removed || 0}，跳过 ${res.skipped}，失败 ${res.failed}`)
       await load()
     } catch (e) {
       const err = e as Error
@@ -1341,10 +1437,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   }
 
   async function testGroup(group: UpstreamGroupKey) {
-    if (!isOpenAIHealthGroup(group)) {
-      toast.error("目前只测活 OpenAI 格式渠道")
-      return
-    }
     setBusy(`test-${group.id}`)
     try {
       const result = await apiFetch<GatewayHealthResult["items"][number]>(`/gateway/group-keys/${group.id}/test`, { method: "POST" })
@@ -1472,7 +1564,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     const Icon = status === "alive" ? CheckCircle2 : isFailureHealthStatus(status) ? XCircle : RefreshCw
     const latencyMS = latestHealth?.latency_ms ?? group.last_latency_ms ?? 0
     const format = groupClientFormat(group)
-    const canTest = isOpenAIHealthGroup(group) && group.enabled !== false
+    const canTest = group.enabled !== false
 
     return (
       <div
@@ -1486,6 +1578,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           <div className="flex flex-wrap items-center gap-1.5">
             <p className="truncate text-sm font-semibold text-foreground">{group.group_name}</p>
             <Badge variant="outline" className="bg-background">{clientFormatLabel(format)}</Badge>
+			<Badge variant="outline" className="max-w-44 truncate bg-background text-muted-foreground" title={group.channel_url || group.channel_name}>
+			  {channelSourceLabel(group)}
+			</Badge>
             {group.charity ? (
               <Badge variant="outline" className="gap-1 border-success/20 bg-success/10 px-1.5 text-[10px] text-success">
                 <HeartHandshake className="size-3" />
@@ -1623,7 +1718,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             size="sm"
             className="h-7 gap-1 px-2 text-[11px]"
             disabled={!!busy || !canTest}
-            title={isOpenAIHealthGroup(group) ? "仅测活此 OpenAI 分组" : "目前只测活 OpenAI 格式渠道"}
+            title={`单独测活此 ${clientFormatLabel(format)} 分组`}
             onClick={() => void testGroup(group)}
           >
             {busy === `test-${group.id}` ? <Loader2 className="size-3 animate-spin" /> : <RefreshCw className="size-3" />}
@@ -1687,7 +1782,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             </Badge>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
               {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
-              一键创建分组 Key
+              覆盖同步分组 Key
             </Button>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || enabledOpenAIHealthGroups.length === 0} onClick={testGroups}>
               {busy === "test" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
@@ -1759,7 +1854,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                           <div className="min-w-0">
                             <p className="truncate text-xs font-medium text-foreground">{key.name}</p>
                             <p className={cn("text-[11px]", key.enabled ? "text-success" : "text-muted-foreground")}>
-                              {keyUsageStatusText(key)} · {clientFormatLabel(key.client_format)} · 并发 {formatConcurrencyLimit(key.concurrency_limit)}
+                              {keyUsageStatusText(key)} · {clientFormatLabel(key.client_format)} · 并发 {formatConcurrencyLimit(key.concurrency_limit)} · {maxGroupRatioLabel(key.max_group_ratio)}
                             </p>
                           </div>
                         </TableCell>
@@ -1857,7 +1952,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               <div>
                 <p className="text-xs font-medium text-foreground">IP 黑名单 / 公网并发白名单</p>
                 <p className="mt-1 text-[11px] text-muted-foreground">
-                  黑名单会拒绝所有网关请求；白名单只豁免公网 Key 的单 IP 5 路并发限制。
+                  黑名单会拒绝所有网关请求；白名单只豁免公益 Key 的单 IP 3 路并发限制。
                 </p>
               </div>
               <Badge variant="outline" className="border-border bg-background text-muted-foreground">
@@ -1907,7 +2002,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             </div>
             {sortedIPPolicies.length === 0 ? (
               <div className="mt-3 rounded-md border border-dashed border-border bg-background px-3 py-6 text-center text-xs text-muted-foreground">
-                暂无 IP 规则。公网 Key 默认对同一 IP 最多 5 路并发，超过会排队等待。
+                暂无 IP 规则。公益 Key 默认对同一 IP 最多 3 路并发，超过会排队等待。
               </div>
             ) : (
               <div className="mt-3 overflow-x-auto rounded-md border border-border bg-background">
@@ -2028,8 +2123,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <SelectValue placeholder="格式筛选" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">OpenAI / Responses</SelectItem>
-                    <SelectItem value="openai">OpenAI</SelectItem>
+                    <SelectItem value="all">全部格式</SelectItem>
+                    <SelectItem value="openai">ChatGPT / OpenAI</SelectItem>
+                    <SelectItem value="claude">Claude</SelectItem>
+                    <SelectItem value="grok">Grok</SelectItem>
                   </SelectContent>
                 </Select>
                 <Select
@@ -2059,9 +2156,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <SelectValue placeholder="状态筛选" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="all">全部状态</SelectItem>
-                    <SelectItem value="charity">仅公益 Key</SelectItem>
-                    <SelectItem value="normal">非公益</SelectItem>
+                    <SelectItem value="all">全部渠道</SelectItem>
+                    <SelectItem value="charity">公益渠道</SelectItem>
+                    <SelectItem value="normal">非公益渠道</SelectItem>
                   </SelectContent>
                 </Select>
                 <Select
@@ -2141,9 +2238,32 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               </div>
             ) : (
               <div className="space-y-2">
-                {filteredGroups.map((group) => renderGroupRow(group))}
+                {pagedGroups.map((group) => renderGroupRow(group))}
               </div>
             )}
+            {filteredGroups.length > 0 ? (
+              <div className="flex flex-col gap-2 border-t border-border px-3 py-3 text-xs sm:flex-row sm:items-center sm:justify-between">
+                <span className="text-muted-foreground">
+                  共 {filteredGroups.length} 个渠道，第 {safeGroupPage}/{groupPages} 页
+                </span>
+                <div className="flex items-center gap-2">
+                  <Select value={String(groupPageSize)} onValueChange={(value) => setGroupPageSize(Number(value))}>
+                    <SelectTrigger className="h-8 w-24 text-xs"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="10">10 / 页</SelectItem>
+                      <SelectItem value="50">50 / 页</SelectItem>
+                      <SelectItem value="100">100 / 页</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  <Button size="icon-sm" variant="outline" className="size-8" disabled={safeGroupPage <= 1} onClick={() => setGroupPage((page) => Math.max(1, page - 1))} title="上一页">
+                    <ChevronLeft className="size-4" />
+                  </Button>
+                  <Button size="icon-sm" variant="outline" className="size-8" disabled={safeGroupPage >= groupPages} onClick={() => setGroupPage((page) => Math.min(groupPages, page + 1))} title="下一页">
+                    <ChevronRight className="size-4" />
+                  </Button>
+                </div>
+              </div>
+            ) : null}
           </>
         ) : null}
       </CardContent>

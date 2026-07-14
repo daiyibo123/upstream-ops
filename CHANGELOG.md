@@ -8,6 +8,24 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, and the Dockerfile version argument before its matching Git tag is pushed.
 
+## v0.22.4 - 2026-07-14
+
+### Fixed
+
+- Hardened direct Codex `/v1/responses` streaming: upstream preflight now completes before any downstream event is emitted, allowing safe failover before the first token while guaranteeing a single protocol terminal event for a started stream.
+- Refined upstream cooldown and recovery handling so short-lived 503, timeout, network, and routing failures do not immediately disable an entire group; compatible healthy candidates can be selected before a user-visible failure.
+- Improved health probes to send a minimal streaming `1+1=` generation request with a two-token limit, verify real generated output instead of treating connection establishment as success, and fall back from `gpt-5.4` when an upstream does not expose that model.
+- Fixed stale automatic group records: a successful group sync now reconciles the complete upstream snapshot, including an empty result, and removes groups deleted upstream.
+- Automatic group creation now excludes groups whose name or description contains `图`, `image`, `img`, `im2`, or `ban`; excluded legacy automatic groups are removed during the same sync.
+- Manual channels and `manual:` group keys are excluded from automatic synchronization so they cannot be queried, overwritten, or deleted by the one-click action.
+- Improved Gateway Key expiry, exhausted-balance, IP-ban, and public-IP concurrency handling, returning readable Responses-compatible messages to Codex clients instead of bare protocol disconnects.
+
+### Changed
+
+- Added per-Gateway-Key upstream multiplier limits: unlimited, `<= 0.05`, or `<= 0.1`.
+- Expanded available-channel filtering, paging, format/status display, manual-channel controls, source display, public-key configuration, usage IP/latency columns, and homepage cheapest-OpenAI presentation settings.
+- Changed the group action label to “覆盖同步分组 Key” and now reports preserved/updated, created, removed, skipped, and failed counts.
+
 ## v0.22.3 - 2026-07-14
 
 ### Changed

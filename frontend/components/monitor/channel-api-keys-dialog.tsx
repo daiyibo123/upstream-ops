@@ -42,6 +42,8 @@ import type {
   ChannelAPIKeyPage,
   ChannelAPIKeyReveal,
   ChannelAPIKeyStatus,
+  UpstreamGroupKey,
+  UpstreamGroupKeyReveal,
 } from "@/lib/api-types"
 import { cn } from "@/lib/utils"
 
@@ -207,6 +209,14 @@ function maskKey(key: string) {
   return `${key.slice(0, 8)}…${key.slice(-6)}`
 }
 
+function isManualChannel(channel?: Channel | null) {
+  return !!channel?.manual || (channel?.credential_mode === "token" && channel?.username?.trim().toLowerCase() === "manual")
+}
+
+function isManualGroupKey(group: UpstreamGroupKey) {
+  return group.group_ref?.trim().toLowerCase().startsWith("manual:")
+}
+
 async function copyText(text: string, label = "已复制") {
   const writeClipboard = navigator.clipboard?.writeText?.bind(navigator.clipboard)
   if (writeClipboard) {
@@ -255,10 +265,13 @@ export function ChannelAPIKeysDialog({
   const [error, setError] = useState<string | null>(null)
   const [revealingID, setRevealingID] = useState<number | null>(null)
   const [revealedKeys, setRevealedKeys] = useState<Record<number, string>>({})
+  const [manualKeys, setManualKeys] = useState<UpstreamGroupKey[]>([])
+  const [manualReloadTick, setManualReloadTick] = useState(0)
 
   const items = data?.items ?? []
   const totalPages = Math.max(1, data?.pages ?? 1)
   const isNewAPI = channel?.type === "newapi"
+  const isManual = isManualChannel(channel)
   const groupByName = new Map(groups.map((g) => [g.name, g]))
   const groupByID = new Map(groups.filter((g) => g.id != null).map((g) => [String(g.id), g]))
 
@@ -273,10 +286,11 @@ export function ChannelAPIKeysDialog({
     setError(null)
     setRevealingID(null)
     setRevealedKeys({})
+    setManualKeys([])
   }, [open, channel?.id])
 
   useEffect(() => {
-    if (!open || !channel) return
+    if (!open || !channel || isManual) return
     let cancelled = false
     setGroupsLoading(true)
     apiFetch<ChannelAPIKeyGroup[]>(`/channels/${channel.id}/api-keys/groups`)
@@ -296,10 +310,10 @@ export function ChannelAPIKeysDialog({
     return () => {
       cancelled = true
     }
-  }, [open, channel])
+  }, [open, channel, isManual])
 
   useEffect(() => {
-    if (!open || !channel || mode !== "list") return
+    if (!open || !channel || isManual || mode !== "list") return
     let cancelled = false
     const params = new URLSearchParams({
       page: String(page),
@@ -331,10 +345,39 @@ export function ChannelAPIKeysDialog({
     return () => {
       cancelled = true
     }
-  }, [open, channel, mode, page, search, status, reloadTick])
+  }, [open, channel, isManual, mode, page, search, status, reloadTick])
+
+  useEffect(() => {
+    if (!open || !channel || !isManual || mode !== "list") return
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+    apiFetch<UpstreamGroupKey[]>("/gateway/group-keys")
+      .then((res) => {
+        if (cancelled) return
+        setManualKeys(
+          (Array.isArray(res) ? res : []).filter(
+            (group) => group.channel_id === channel.id && isManualGroupKey(group),
+          ),
+        )
+      })
+      .catch((e) => {
+        if (cancelled) return
+        const err = e as Error
+        setError(err.message || "加载手动密钥失败")
+        setManualKeys([])
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [open, channel, isManual, mode, manualReloadTick])
 
   function reload() {
     setReloadTick((tick) => tick + 1)
+    setManualReloadTick((tick) => tick + 1)
   }
 
   function openCreate() {
@@ -495,6 +538,64 @@ export function ChannelAPIKeysDialog({
     }
   }
 
+  async function revealManualKey(key: UpstreamGroupKey) {
+    const cached = revealedKeys[key.id]
+    if (cached) return cached
+    setRevealingID(key.id)
+    try {
+      const res = await apiFetch<UpstreamGroupKeyReveal>(`/gateway/group-keys/${key.id}/reveal`, {
+        method: "POST",
+      })
+      if (!res?.key) throw new Error("未返回完整 Key")
+      setRevealedKeys((prev) => ({ ...prev, [key.id]: res.key }))
+      return res.key
+    } finally {
+      setRevealingID((current) => (current === key.id ? null : current))
+    }
+  }
+
+  async function revealAndShowManual(key: UpstreamGroupKey) {
+    try {
+      await revealManualKey(key)
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "获取完整 Key 失败")
+    }
+  }
+
+  async function revealAndCopyManual(key: UpstreamGroupKey) {
+    try {
+      const fullKey = await revealManualKey(key)
+      await copyText(fullKey)
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "复制完整 Key 失败")
+    }
+  }
+
+  async function deleteManualKey(key: UpstreamGroupKey) {
+    const ok = await confirm({
+      title: `删除手动密钥 ${key.group_name || key.id}？`,
+      description: "删除后该手动上游分组 Key 将不再参与调度。",
+      confirmLabel: "删除",
+      destructive: true,
+    })
+    if (!ok) return
+    try {
+      await apiFetch(`/gateway/group-keys/${key.id}`, { method: "DELETE" })
+      toast.success("手动密钥已删除")
+      setRevealedKeys((prev) => {
+        const next = { ...prev }
+        delete next[key.id]
+        return next
+      })
+      reload()
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "删除手动密钥失败")
+    }
+  }
+
   const description = channel
     ? `${channel.name} · ${channelTypeLabel(channel.type)}`
     : "管理上游 API 密钥。"
@@ -508,7 +609,105 @@ export function ChannelAPIKeysDialog({
             <DialogDescription>{description}</DialogDescription>
           </DialogHeader>
 
-          {mode === "list" ? (
+          {isManual ? (
+            <div className="space-y-4">
+              <div className="overflow-hidden rounded-lg border border-border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="min-w-36">分组</TableHead>
+                      <TableHead className="min-w-40">密钥</TableHead>
+                      <TableHead className="min-w-24">格式</TableHead>
+                      <TableHead className="min-w-24">倍率</TableHead>
+                      <TableHead className="min-w-24">状态</TableHead>
+                      <TableHead className="min-w-28 text-right">操作</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {loading ? (
+                      <TableRow>
+                        <TableCell colSpan={6} className="h-28 text-center text-muted-foreground">
+                          <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
+                          加载中...
+                        </TableCell>
+                      </TableRow>
+                    ) : manualKeys.length === 0 ? (
+                      <TableRow>
+                        <TableCell colSpan={6} className="h-28 text-center text-muted-foreground">
+                          暂无手动密钥
+                        </TableCell>
+                      </TableRow>
+                    ) : (
+                      manualKeys.map((item) => {
+                        const displayKey = revealedKeys[item.id] || "点击显示完整 Key"
+                        const isRevealing = revealingID === item.id
+                        return (
+                          <TableRow key={item.id}>
+                            <TableCell>
+                              <div className="max-w-56 whitespace-normal">
+                                <p className="break-words text-xs font-medium">{item.group_name}</p>
+                                {item.group_description ? (
+                                  <p className="break-words text-[11px] leading-4 text-muted-foreground">
+                                    {item.group_description}
+                                  </p>
+                                ) : null}
+                              </div>
+                            </TableCell>
+                            <TableCell className="min-w-40">
+                              <Input
+                                readOnly
+                                value={isRevealing ? "加载中..." : displayKey}
+                                className="h-8 w-40 cursor-pointer truncate font-mono text-xs sm:w-56"
+                                title="点击显示完整 Key"
+                                disabled={isRevealing}
+                                onClick={() => void revealAndShowManual(item)}
+                              />
+                            </TableCell>
+                            <TableCell className="text-xs uppercase">{item.client_format || "openai"}</TableCell>
+                            <TableCell className="text-xs tabular-nums">{formatRatio(item.ratio)}</TableCell>
+                            <TableCell>
+                              <Badge variant="outline" className={cn(statusClass(item.status))}>
+                                {statusLabel(item.status)}
+                              </Badge>
+                            </TableCell>
+                            <TableCell>
+                              <div className="flex justify-end gap-1">
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  title="复制完整 Key"
+                                  disabled={isRevealing}
+                                  onClick={() => void revealAndCopyManual(item)}
+                                >
+                                  {isRevealing ? (
+                                    <Loader2 className="size-4 animate-spin" />
+                                  ) : (
+                                    <Copy className="size-4" />
+                                  )}
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="icon-sm"
+                                  title="删除"
+                                  className="text-destructive hover:text-destructive"
+                                  onClick={() => void deleteManualKey(item)}
+                                >
+                                  <Trash2 className="size-4" />
+                                </Button>
+                              </div>
+                            </TableCell>
+                          </TableRow>
+                        )
+                      })
+                    )}
+                  </TableBody>
+                </Table>
+              </div>
+              {error ? <p className="text-sm text-destructive">{error}</p> : null}
+            </div>
+          ) : mode === "list" ? (
             <div className="space-y-4">
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-center">

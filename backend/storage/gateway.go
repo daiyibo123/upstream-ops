@@ -224,10 +224,18 @@ func orderUpstreamGroupKeys(q *gorm.DB, table string) *gorm.DB {
 	return q.
 		Order("CASE " + col("status") + " WHEN 'alive' THEN 0 WHEN 'unknown' THEN 1 WHEN 'rate_limited' THEN 2 WHEN 'dead' THEN 3 WHEN 'server_error' THEN 3 WHEN 'timeout' THEN 3 WHEN 'network_error' THEN 3 WHEN 'upstream_error' THEN 3 WHEN 'zero_balance' THEN 4 WHEN 'forbidden' THEN 4 WHEN 'auth_failed' THEN 4 WHEN 'model_error' THEN 4 WHEN 'invalid_request' THEN 4 WHEN 'non_generation' THEN 4 ELSE 5 END ASC").
 		Order(col("charity") + " DESC").
-		Order(col("priority") + " DESC").
 		Order(col("ratio") + " ASC").
+		Order(col("priority") + " DESC").
 		Order(col("failure_count") + " ASC").
 		Order(col("id") + " ASC")
+}
+
+// groupKeysWithChannelSource makes the provider URL available to the control
+// panel even for groups created before ChannelURL was added to the model.
+func groupKeysWithChannelSource(q *gorm.DB) *gorm.DB {
+	return q.Model(&UpstreamGroupKey{}).
+		Select("upstream_group_keys.*, channels.site_url AS channel_url").
+		Joins("LEFT JOIN channels ON channels.id = upstream_group_keys.channel_id")
 }
 
 func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
@@ -237,6 +245,7 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 	switch {
 	case err == nil:
 		existing.ChannelName = key.ChannelName
+		existing.ChannelURL = key.ChannelURL
 		existing.ChannelType = key.ChannelType
 		existing.ClientFormat = key.ClientFormat
 		existing.RequestMode = key.RequestMode
@@ -294,7 +303,7 @@ func normalizeGroupKeyPrices(key *UpstreamGroupKey) {
 
 func (r *UpstreamGroupKeys) List() ([]UpstreamGroupKey, error) {
 	var list []UpstreamGroupKey
-	if err := orderUpstreamGroupKeys(r.db, "").Find(&list).Error; err != nil {
+	if err := orderUpstreamGroupKeys(groupKeysWithChannelSource(r.db), "upstream_group_keys").Find(&list).Error; err != nil {
 		return nil, err
 	}
 	return list, nil
@@ -303,7 +312,7 @@ func (r *UpstreamGroupKeys) List() ([]UpstreamGroupKey, error) {
 // ListPage filters before pagination so an operator can locate a group even
 // when it belongs to a channel on a later page.
 func (r *UpstreamGroupKeys) ListPage(limit, offset int, search string) ([]UpstreamGroupKey, int64, error) {
-	q := r.db.Model(&UpstreamGroupKey{})
+	q := groupKeysWithChannelSource(r.db)
 	if search = strings.TrimSpace(search); search != "" {
 		like := "%" + strings.ToLower(search) + "%"
 		q = q.Where(`LOWER(channel_name) LIKE ? OR LOWER(group_name) LIKE ? OR LOWER(group_desc) LIKE ? OR LOWER(group_ref) LIKE ?`, like, like, like, like)
@@ -313,7 +322,7 @@ func (r *UpstreamGroupKeys) ListPage(limit, offset int, search string) ([]Upstre
 		return nil, 0, err
 	}
 	var list []UpstreamGroupKey
-	err := orderUpstreamGroupKeys(q, "").Limit(limit).Offset(offset).Find(&list).Error
+	err := orderUpstreamGroupKeys(q, "upstream_group_keys").Limit(limit).Offset(offset).Find(&list).Error
 	if err != nil {
 		return nil, 0, err
 	}
@@ -362,7 +371,6 @@ func (r *UpstreamGroupKeys) ListCandidates(now time.Time) ([]UpstreamGroupKey, e
 		Joins("JOIN channels ON channels.id = upstream_group_keys.channel_id").
 		Where("upstream_group_keys.key_cipher <> ''").
 		Where("upstream_group_keys.enabled = ?", true).
-		Where("channels.monitor_enabled = ?", true).
 		Where("upstream_group_keys.status <> ?", "disabled")
 	q = orderUpstreamGroupKeys(q, "upstream_group_keys")
 	if err := q.Find(&list).Error; err != nil {
@@ -387,7 +395,7 @@ func (r *UpstreamGroupKeys) reactivateExpiredCooldowns(now time.Time) error {
 
 func (r *UpstreamGroupKeys) FindByID(id uint) (*UpstreamGroupKey, error) {
 	var key UpstreamGroupKey
-	if err := r.db.First(&key, id).Error; err != nil {
+	if err := groupKeysWithChannelSource(r.db).Where("upstream_group_keys.id = ?", id).First(&key).Error; err != nil {
 		return nil, err
 	}
 	return &key, nil
@@ -528,10 +536,10 @@ func (r *UpstreamGroupKeys) MarkProxyFailureStatus(id uint, status string, errMs
 }
 
 func (r *UpstreamGroupKeys) MarkHealthFailure(id uint, errMsg string, disabledUntil time.Time, latencyMS int64) error {
-	return r.MarkHealthFailureStatus(id, "dead", errMsg, disabledUntil, latencyMS)
+	return r.MarkHealthFailureStatus(id, "dead", errMsg, &disabledUntil, latencyMS)
 }
 
-func (r *UpstreamGroupKeys) MarkHealthFailureStatus(id uint, status string, errMsg string, disabledUntil time.Time, latencyMS int64) error {
+func (r *UpstreamGroupKeys) MarkHealthFailureStatus(id uint, status string, errMsg string, disabledUntil *time.Time, latencyMS int64) error {
 	now := time.Now()
 	if latencyMS < 0 {
 		latencyMS = 0
@@ -544,7 +552,7 @@ func (r *UpstreamGroupKeys) MarkHealthFailureStatus(id uint, status string, errM
 		"failure_count":   gorm.Expr("failure_count + ?", 1),
 		"last_checked_at": &now,
 		"last_latency_ms": latencyMS,
-		"disabled_until":  &disabledUntil,
+		"disabled_until":  disabledUntil,
 		"last_error":      errMsg,
 	}).Error
 }

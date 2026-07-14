@@ -40,6 +40,7 @@ export interface Channel {
   pinned: boolean
   user_id?: string
   credential_mode: CredentialMode
+  manual?: boolean
   login_extra_params: string
   turnstile_enabled: boolean
   ignore_announcements: boolean
@@ -216,6 +217,7 @@ export interface DashboardGatewayKey {
   cost_per_million: number
   balance_limit: number
   concurrency_limit: number
+  max_group_ratio: number
   balance_remaining: number
   today_cost: number
   total_cost: number
@@ -301,6 +303,7 @@ export interface SystemPublicKeyConfig {
 export interface AppConfig {
   title: string
   notificationPrefix: string
+	homepageCheapestEnabled: boolean
   publicKey: SystemPublicKeyConfig
 }
 
@@ -519,6 +522,10 @@ export interface ChannelAPIKeyReveal {
   key: string
 }
 
+export interface UpstreamGroupKeyReveal {
+  key: string
+}
+
 export interface GatewayKey {
   id: number
   name: string
@@ -541,6 +548,7 @@ export interface GatewayKey {
   cost_per_million: number
   balance_limit: number
   concurrency_limit: number
+  max_group_ratio: number
   balance_remaining: number
   today_cost: number
   total_cost: number
@@ -601,6 +609,7 @@ export interface UpstreamGroupKey {
   id: number
   channel_id: number
   channel_name?: string
+	channel_url?: string
   channel_type: ChannelType
   client_format?: "openai" | "claude" | "grok" | "any" | string
   request_mode?: "responses" | "chat" | string

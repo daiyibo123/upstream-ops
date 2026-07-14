@@ -71,6 +71,7 @@ function withConfigDefaults(cfg: SystemConfig): SystemConfig {
     ...cfg,
     app: {
       ...app,
+		homepageCheapestEnabled: app.homepageCheapestEnabled ?? true,
       publicKey: {
         enabled: publicKey.enabled ?? false,
         name: publicKey.name ?? "公益 Key",
@@ -536,6 +537,17 @@ export default function SettingsPage() {
                       }
                     />
                   </Field>
+                </div>
+                <div className="mt-4">
+                  <InlineSwitch
+                    id="homepage-cheapest-enabled"
+                    label="首页展示 OpenAI 最低倍率前五"
+                    description="关闭后首页同位置展示网关服务器状态。"
+                    checked={form.app.homepageCheapestEnabled}
+                    onCheckedChange={(checked) =>
+                      setForm((prev) => prev ? { ...prev, app: { ...prev.app, homepageCheapestEnabled: checked } } : prev)
+                    }
+                  />
                 </div>
               </SectionCard>
 

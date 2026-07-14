@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { Ban, ChevronLeft, ChevronRight, KeyRound, Loader2, ScrollText, Trash2 } from "lucide-react"
+import { ChevronLeft, ChevronRight, KeyRound, Loader2, ScrollText, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/table"
 import { apiFetch } from "@/lib/api"
 import { dateTime, formatPercent, formatRatio, formatTokens, relativeTime } from "@/lib/format"
-import type { IPPolicy, UsageLogsResponse } from "@/lib/api-types"
+import type { UsageLogsResponse } from "@/lib/api-types"
 
 const PAGE_SIZE = 50
 
@@ -69,9 +69,6 @@ export default function UsagePage() {
   const [loading, setLoading] = useState(true)
   const [clearing, setClearing] = useState(false)
   const [page, setPage] = useState(1)
-  const [policies, setPolicies] = useState<IPPolicy[]>([])
-  const [ipDraft, setIPDraft] = useState("")
-  const [policyBusy, setPolicyBusy] = useState(false)
 
   const items = data?.items ?? []
   const keys = data?.keys ?? []
@@ -98,42 +95,6 @@ export default function UsagePage() {
       cancelled = true
     }
   }, [page])
-
-  useEffect(() => {
-    apiFetch<IPPolicy[]>("/gateway/ip-policies").then(setPolicies).catch(() => undefined)
-  }, [])
-
-  async function saveIPPolicy(blocked: boolean, publicConcurrencyExempt = false) {
-    const ip = ipDraft.trim()
-    if (!ip) return
-    setPolicyBusy(true)
-    try {
-      const item = await apiFetch<IPPolicy>("/gateway/ip-policies", {
-        method: "PUT",
-        body: JSON.stringify({ ip, blocked, public_concurrency_exempt: publicConcurrencyExempt }),
-      })
-      setPolicies((prev) => [item, ...prev.filter((value) => value.ip !== item.ip)])
-      setIPDraft("")
-      toast.success(blocked ? "IP 已封禁" : "IP 已解除公益并发限制")
-    } catch (error) {
-      toast.error((error as Error).message || "IP 规则保存失败")
-    } finally {
-      setPolicyBusy(false)
-    }
-  }
-
-  async function deleteIPPolicy(ip: string) {
-    setPolicyBusy(true)
-    try {
-      await apiFetch(`/gateway/ip-policies/${encodeURIComponent(ip)}`, { method: "DELETE" })
-      setPolicies((prev) => prev.filter((value) => value.ip !== ip))
-      toast.success("IP 规则已解除")
-    } catch (error) {
-      toast.error((error as Error).message || "解除 IP 规则失败")
-    } finally {
-      setPolicyBusy(false)
-    }
-  }
 
   const rows = useMemo(() => items, [items])
   const keyRows = useMemo(
@@ -262,21 +223,6 @@ export default function UsagePage() {
       </Card>
 
       <Card className="border border-border shadow-none">
-        <CardHeader className="pb-3">
-          <CardTitle className="flex items-center gap-2 text-base font-semibold"><Ban className="size-4 text-danger" />IP 防滥用</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3">
-          <div className="flex flex-col gap-2 sm:flex-row">
-            <input value={ipDraft} onChange={(event) => setIPDraft(event.target.value)} placeholder="输入 IPv4 或 IPv6" className="h-9 flex-1 rounded-md border border-input bg-background px-3 text-xs" />
-            <Button size="sm" variant="destructive" disabled={policyBusy || !ipDraft.trim()} onClick={() => void saveIPPolicy(true)}>封禁 IP</Button>
-            <Button size="sm" variant="outline" disabled={policyBusy || !ipDraft.trim()} onClick={() => void saveIPPolicy(false, true)}>解除公益并发限制</Button>
-          </div>
-          <p className="text-[11px] text-muted-foreground">公益 Key 同一 IP 默认最多 5 个并发；解除限制只取消该 IP 的公益并发上限，不会解除封禁。</p>
-          {policies.length ? <div className="flex flex-wrap gap-2">{policies.map((policy) => <div key={policy.ip} className="flex items-center gap-2 rounded-md border border-border px-2 py-1 text-xs"><span>{policy.ip}</span><Badge variant="outline" className={policy.blocked ? "border-danger/20 text-danger" : "border-success/20 text-success"}>{policy.blocked ? "已封禁" : "公益豁免"}</Badge><Button size="sm" variant="ghost" className="h-6 px-1 text-xs" disabled={policyBusy} onClick={() => void deleteIPPolicy(policy.ip)}>解除</Button></div>)}</div> : null}
-        </CardContent>
-      </Card>
-
-      <Card className="border border-border shadow-none">
         <CardHeader className="flex flex-row items-center justify-between pb-3">
           <CardTitle className="flex items-center gap-2 text-base font-semibold">
             <ScrollText className="size-4 text-brand" />
@@ -300,18 +246,18 @@ export default function UsagePage() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="overflow-x-auto rounded-md border border-border">
-            <Table className="min-w-[1080px] table-fixed">
+            <Table className="min-w-[1020px] table-fixed">
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-32">时间</TableHead>
-                  <TableHead className="w-20 text-right">倍率</TableHead>
+                  <TableHead className="w-36">Key</TableHead>
                   <TableHead className="w-44">模型</TableHead>
                   <TableHead className="w-24 text-right">首字时间</TableHead>
                   <TableHead className="w-24 text-right">总耗时</TableHead>
                   <TableHead className="w-36 text-right">Token</TableHead>
                   <TableHead className="w-20 text-center">状态</TableHead>
+                  <TableHead className="w-20 text-right">倍率</TableHead>
                   <TableHead className="w-32">IP</TableHead>
-                  <TableHead>上游 / Key</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -335,8 +281,13 @@ export default function UsagePage() {
                         <span className="block font-medium text-foreground">{dateTime(log.created_at)}</span>
                         <span className="text-[10px]">{relativeTime(log.created_at)}</span>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-xs text-foreground">
-                        {log.ratio != null ? formatRatio(log.ratio) : "—"}
+                      <TableCell className="truncate text-xs" title={log.gateway_key_name || ""}>
+                        <span className="block truncate font-medium text-foreground">
+                          {log.gateway_key_name || (log.gateway_key_id ? `Key #${log.gateway_key_id}` : "未知 Key")}
+                        </span>
+                        {log.gateway_key_id ? (
+                          <span className="block truncate text-[10px] text-muted-foreground">#{log.gateway_key_id}</span>
+                        ) : null}
                       </TableCell>
                       <TableCell className="truncate text-xs text-foreground" title={log.model || ""}>
                         {log.model || "—"}
@@ -362,16 +313,11 @@ export default function UsagePage() {
                           {usageStatusLabel(log.status)}
                         </Badge>
                       </TableCell>
+                      <TableCell className="text-right font-mono text-xs text-foreground">
+                        {log.ratio != null ? formatRatio(log.ratio) : "—"}
+                      </TableCell>
                       <TableCell className="truncate font-mono text-[11px] text-muted-foreground" title={log.request_ip || ""}>
                         {log.request_ip || "—"}
-                      </TableCell>
-                      <TableCell className="min-w-0 text-xs">
-                        <p className="truncate font-medium text-foreground" title={`${log.channel_name || ""} / ${log.group_name || ""}`}>
-                          {log.channel_name || (log.channel_id ? `#${log.channel_id}` : "—")} / {log.group_name || "—"}
-                        </p>
-                        <p className="truncate text-[10px] text-muted-foreground" title={log.gateway_key_name || ""}>
-                          {log.gateway_key_name || (log.gateway_key_id ? `Key #${log.gateway_key_id}` : "未知 Key")}
-                        </p>
                       </TableCell>
                     </TableRow>
                   ))

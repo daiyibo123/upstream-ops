@@ -360,6 +360,7 @@ type GatewayKey struct {
 	CostPerMillion       float64    `gorm:"not null;default:0" json:"cost_per_million"`
 	BalanceLimit         float64    `gorm:"not null;default:0" json:"balance_limit"`
 	ConcurrencyLimit     int        `gorm:"not null;default:0" json:"concurrency_limit"`
+	MaxGroupRatio        float64    `gorm:"not null;default:0" json:"max_group_ratio"`
 	TodayCost            float64    `gorm:"not null;default:0" json:"today_cost"`
 	TotalCost            float64    `gorm:"not null;default:0" json:"total_cost"`
 	UsageDate            string     `gorm:"size:10;index" json:"usage_date,omitempty"`
@@ -397,6 +398,7 @@ type UpstreamGroupKey struct {
 	ID                    uint        `gorm:"primaryKey" json:"id"`
 	ChannelID             uint        `gorm:"not null;uniqueIndex:idx_upstream_group_key;index" json:"channel_id"`
 	ChannelName           string      `gorm:"size:128" json:"channel_name,omitempty"`
+	ChannelURL            string      `gorm:"size:1024" json:"channel_url,omitempty"`
 	ChannelType           ChannelType `gorm:"size:32;not null" json:"channel_type"`
 	ClientFormat          string      `gorm:"size:16;not null;default:'openai';index" json:"client_format"`
 	RequestMode           string      `gorm:"size:16;not null;default:'responses';index" json:"request_mode"`

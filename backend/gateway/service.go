@@ -49,6 +49,7 @@ const (
 	// 之间可能有较长停顿；超过后才认为上游卡死，并由 Responses 兜底逻辑补终态/[DONE]。
 	streamIdleTimeout              = 5 * time.Minute
 	streamHeartbeatInterval        = 15 * time.Second
+	streamPreflightTimeout         = 45 * time.Second
 	streamPreflightMaxEvents       = 16
 	streamPreflightMaxBytes        = 64 << 10
 	proxyTransientFailureThreshold = 3
@@ -59,6 +60,11 @@ const (
 	proxyRateLimitCooldown         = 90 * time.Second
 	proxyPermanentFailureCooldown  = 30 * time.Minute
 	defaultHealthProbeBatchSize    = 30
+
+	openAIHealthProbePrimaryModel  = "gpt-5.4"
+	openAIHealthProbeFallbackModel = "gpt-4o-mini"
+	healthProbePrompt              = "1+1="
+	healthProbeMaxOutputTokens     = 2
 )
 
 var errResponsesStreamTerminal = errors.New("responses stream terminal event emitted")
@@ -91,6 +97,7 @@ type CreateGatewayKeyInput struct {
 	CostPerMillion    float64 `json:"cost_per_million"`
 	BalanceLimit      float64 `json:"balance_limit"`
 	ConcurrencyLimit  int     `json:"concurrency_limit"`
+	MaxGroupRatio     float64 `json:"max_group_ratio"`
 	ExpiresInDays     int     `json:"expires_in_days"`
 }
 
@@ -105,6 +112,7 @@ type UpdateGatewayKeyInput struct {
 	CostPerMillion    *float64   `json:"cost_per_million"`
 	BalanceLimit      *float64   `json:"balance_limit"`
 	ConcurrencyLimit  *int       `json:"concurrency_limit"`
+	MaxGroupRatio     *float64   `json:"max_group_ratio"`
 	ExpiresInDays     *int       `json:"expires_in_days"`
 	ExpiresAt         *time.Time `json:"expires_at"`
 }
@@ -138,6 +146,7 @@ type GatewayKeyOutput struct {
 	CostPerMillion     float64    `json:"cost_per_million"`
 	BalanceLimit       float64    `json:"balance_limit"`
 	ConcurrencyLimit   int        `json:"concurrency_limit"`
+	MaxGroupRatio      float64    `json:"max_group_ratio"`
 	BalanceRemaining   float64    `json:"balance_remaining"`
 	TodayCost          float64    `json:"today_cost"`
 	TotalCost          float64    `json:"total_cost"`
@@ -222,20 +231,25 @@ type BootstrapItem struct {
 
 // These groups are for image/blocked routes and must never be pulled into the
 // text gateway automatically. They can still be added manually if needed.
-var bootstrapKeyBlockKeywords = []string{"图", "img", "im2", "ban"}
+// The upstream names are not normalized and may use Chinese names or English
+// aliases such as image / im2, so every listed keyword is matched broadly.
+var bootstrapKeyBlockKeywords = []string{"图", "image", "img", "im2", "ban"}
 
-func blockedBootstrapKeyKeyword(ch storage.Channel, group connector.APIKeyGroup) (string, bool) {
-	text := strings.ToLower(strings.Join([]string{
-		ch.Name,
-		group.Name,
-		group.Description,
-	}, " "))
+func blockedBootstrapKeyKeyword(group connector.APIKeyGroup) (string, bool) {
+	// The exclusion is intentionally scoped to the discovered group. A channel
+	// title such as "BananAI" must not suppress all of its normal text groups.
+	text := strings.ToLower(strings.Join([]string{group.Name, group.Description}, " "))
 	for _, keyword := range bootstrapKeyBlockKeywords {
 		if strings.Contains(text, strings.ToLower(keyword)) {
 			return keyword, true
 		}
 	}
 	return "", false
+}
+
+func isManualBootstrapChannel(ch storage.Channel) bool {
+	return ch.CredentialMode == storage.CredentialModeToken &&
+		strings.EqualFold(strings.TrimSpace(ch.Username), "manual")
 }
 
 type HealthResult struct {
@@ -450,6 +464,12 @@ func (e *GatewayError) Error() string {
 	return http.StatusText(e.Status)
 }
 
+const (
+	gatewayQuotaExhaustedMessage = "额度已经消耗光"
+	gatewayIPBannedMessage       = "IP已被封禁"
+	publicIPConcurrencyLimit     = 3
+)
+
 func NewService(
 	channels *storage.Channels,
 	gatewayKeys *storage.GatewayKeys,
@@ -518,8 +538,55 @@ func modelFromRequestBody(body []byte) string {
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return ""
 	}
-	if m, ok := raw["model"].(string); ok {
-		return strings.TrimSpace(m)
+	if model := modelFromMap(raw); model != "" {
+		return model
+	}
+	return ""
+}
+
+func modelFromMap(raw map[string]any) string {
+	if raw == nil {
+		return ""
+	}
+	for _, key := range []string{"model", "requested_model", "original_model", "target_model", "codex_model", "openai_model", "model_slug"} {
+		if model := strings.TrimSpace(stringValue(raw[key])); model != "" {
+			return model
+		}
+	}
+	for _, key := range []string{"metadata", "extra", "options", "params", "request"} {
+		if nested, ok := raw[key].(map[string]any); ok {
+			if model := modelFromMap(nested); model != "" {
+				return model
+			}
+		}
+	}
+	return ""
+}
+
+func requestModelFromHTTP(r *http.Request, body []byte, rawQuery string) string {
+	if model := modelFromRequestBody(body); model != "" {
+		return model
+	}
+	for _, name := range []string{
+		"X-Model",
+		"X-OpenAI-Model",
+		"OpenAI-Model",
+		"X-Requested-Model",
+		"X-Codex-Model",
+		"X-CCSwitch-Model",
+		"X-Upstream-Model",
+	} {
+		if model := strings.TrimSpace(r.Header.Get(name)); model != "" {
+			return model
+		}
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err == nil {
+		for _, key := range []string{"model", "requested_model", "original_model"} {
+			if model := strings.TrimSpace(values.Get(key)); model != "" {
+				return model
+			}
+		}
 	}
 	return ""
 }
@@ -670,6 +737,22 @@ func normalizeGatewayGroupSelection(scope string, ids []uint) (string, string) {
 	return normalized, encodeUintList(ids)
 }
 
+func normalizeGatewayMaxGroupRatio(value float64) float64 {
+	if value <= 0 {
+		return 0
+	}
+	if value <= 0.05 {
+		return 0.05
+	}
+	if value <= 0.1 {
+		return 0.1
+	}
+	// The UI exposes only 0 / 0.05 / 0.1.  Keeping unexpected larger API
+	// values unlimited avoids surprising callers by silently allowing a
+	// partially-documented fourth tier.
+	return 0
+}
+
 func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutput, error) {
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
@@ -703,6 +786,7 @@ func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutp
 		CostPerMillion:    math.Max(0, input.CostPerMillion),
 		BalanceLimit:      balanceLimit,
 		ConcurrencyLimit:  concurrencyLimit,
+		MaxGroupRatio:     normalizeGatewayMaxGroupRatio(input.MaxGroupRatio),
 	}
 	if input.ExpiresInDays > 0 {
 		expiresAt := time.Now().AddDate(0, 0, input.ExpiresInDays)
@@ -804,6 +888,9 @@ func (s *Service) UpdateGatewayKey(id uint, input UpdateGatewayKeyInput) (*Gatew
 		if key.ConcurrencyLimit < 0 {
 			key.ConcurrencyLimit = 0
 		}
+	}
+	if input.MaxGroupRatio != nil {
+		key.MaxGroupRatio = normalizeGatewayMaxGroupRatio(*input.MaxGroupRatio)
 	}
 	if input.ExpiresInDays != nil {
 		days := *input.ExpiresInDays
@@ -932,7 +1019,10 @@ func (s *Service) Authenticate(raw string, ip string) (*storage.GatewayKey, erro
 	if key == "" {
 		return nil, errors.New("missing gateway key")
 	}
-	rec, err := s.gateway.FindEnabledByHash(HashKey(key))
+	// A quota-exhausted key is disabled after settlement.  Looking up all keys
+	// first preserves the real quota/expiry reason instead of masking it as an
+	// invalid key on later requests.
+	rec, err := s.gateway.FindByHash(HashKey(key))
 	if err != nil {
 		return nil, err
 	}
@@ -945,6 +1035,9 @@ func (s *Service) Authenticate(raw string, ip string) (*storage.GatewayKey, erro
 	if rec.BalanceLimit > 0 && rec.TotalCost >= rec.BalanceLimit {
 		_ = s.gateway.Disable(rec.ID)
 		return nil, errors.New("gateway key balance exhausted")
+	}
+	if !rec.Enabled {
+		return nil, errors.New("gateway key disabled")
 	}
 	_ = s.gateway.Touch(rec.ID, ip)
 	return rec, nil
@@ -1005,6 +1098,22 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 	return s.groupKeys.FindByID(id)
 }
 
+// RevealManualGroupKey returns the plaintext key for a locally created manual group.
+func (s *Service) RevealManualGroupKey(id uint) (string, error) {
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return "", err
+	}
+	if !isManualGroupKey(key) {
+		return "", errors.New("only manually added group keys can be revealed here")
+	}
+	return s.cipher.Decrypt(key.KeyCipher)
+}
+
+func isManualGroupKey(key *storage.UpstreamGroupKey) bool {
+	return key != nil && strings.HasPrefix(strings.ToLower(strings.TrimSpace(key.GroupRef)), "manual:")
+}
+
 // ManualGroupKeyInput 是"手动添加渠道分组"的入参：不登录上游，直接填分组名 + key。
 // 用于那些无法登录、只能拿到 key 的上游。
 type ManualGroupKeyInput struct {
@@ -1059,7 +1168,7 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 			SiteURL:        siteURL,
 			Username:       "manual",
 			CredentialMode: storage.CredentialModeToken,
-			MonitorEnabled: true,
+			MonitorEnabled: false,
 		}
 		if err := s.channels.Create(newCh); err != nil {
 			return nil, fmt.Errorf("创建渠道失败: %w", err)
@@ -1083,6 +1192,7 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 	rec := &storage.UpstreamGroupKey{
 		ChannelID:             ch.ID,
 		ChannelName:           ch.Name,
+		ChannelURL:            ch.SiteURL,
 		ChannelType:           ch.Type,
 		ClientFormat:          format,
 		RequestMode:           mode,
@@ -1138,6 +1248,11 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 		if ch.Type != storage.ChannelTypeSub2API && ch.Type != storage.ChannelTypeNewAPI {
 			continue
 		}
+		if isManualBootstrapChannel(ch) {
+			// Manual channels have no account-backed group list. Their manually
+			// added keys must not be queried, overwritten, or removed here.
+			continue
+		}
 		groups, err := s.channelSvc.ListAPIKeyGroups(ctx, ch.ID)
 		if err != nil {
 			result.Failed++
@@ -1165,7 +1280,7 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 				continue
 			}
 			upstreamRefs[groupRef] = struct{}{}
-			if keyword, blocked := blockedBootstrapKeyKeyword(ch, group); blocked {
+			if keyword, blocked := blockedBootstrapKeyKeyword(group); blocked {
 				result.Skipped++
 				item.Error = fmt.Sprintf("命中关键词 %q，已跳过创建 Key", keyword)
 				// A group that becomes an image/blocked group must not remain
@@ -1224,31 +1339,28 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 			item.Created = true
 			result.Items = append(result.Items, item)
 		}
-		// 清理残留：上游已经删掉的分组，本地不该继续留着（否则会一直显示 dead）。
-		// 只在上面 ListAPIKeyGroups 成功、且本轮确实拿到过至少一个有效分组时才清理，
-		// 双保险避免"上游临时返回空/token 权限不足只返回部分"时误删用户手动贴的 key。
-		if len(upstreamRefs) > 0 {
-			if locals, err := s.groupKeys.ListByChannel(ch.ID); err == nil {
-				for i := range locals {
-					local := locals[i]
-					// Manual entries are intentionally outside upstream discovery and
-					// must survive every automatic synchronization.
-					if strings.HasPrefix(strings.ToLower(local.GroupRef), "manual:") {
-						continue
-					}
-					if _, stillThere := upstreamRefs[local.GroupRef]; stillThere {
-						continue
-					}
-					if err := s.DeleteGroupKey(local.ID); err == nil {
-						result.Removed++
-						result.Items = append(result.Items, BootstrapItem{
-							ChannelID:   ch.ID,
-							ChannelName: ch.Name,
-							GroupName:   local.GroupName,
-							GroupRef:    local.GroupRef,
-							Removed:     true,
-						})
-					}
+		// A successful ListAPIKeyGroups call is the source of truth for automatic
+		// groups. Delete every stale automatic record even if the returned list is
+		// empty; otherwise groups removed upstream remain schedulable forever.
+		// Manually added records remain intentionally outside this synchronization.
+		if locals, err := s.groupKeys.ListByChannel(ch.ID); err == nil {
+			for i := range locals {
+				local := locals[i]
+				if isManualGroupKey(&local) {
+					continue
+				}
+				if _, stillThere := upstreamRefs[local.GroupRef]; stillThere {
+					continue
+				}
+				if err := s.DeleteGroupKey(local.ID); err == nil {
+					result.Removed++
+					result.Items = append(result.Items, BootstrapItem{
+						ChannelID:   ch.ID,
+						ChannelName: ch.Name,
+						GroupName:   local.GroupName,
+						GroupRef:    local.GroupRef,
+						Removed:     true,
+					})
 				}
 			}
 		}
@@ -1270,10 +1382,9 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 		return nil, err
 	}
 	list = filterHealthTestGroupKeys(list, opts.GroupIDs)
-	// Health checks are intentionally limited to OpenAI / Responses groups.
-	// Claude, Grok and Chat-mode bridges use different upstream contracts and
-	// must not be put through the OpenAI gpt-5.5 probe by either the UI or a
-	// direct API request.
+	// One-click health checks cover only OpenAI-format groups.  Claude and Grok
+	// use their own request contracts and remain available through per-group
+	// testing, so they cannot be accidentally probed as an OpenAI model.
 	list = filterOpenAIHealthGroups(list)
 
 	batchSize := normalizeHealthProbeBatchSize(opts.BatchSize)
@@ -1582,9 +1693,6 @@ func (s *Service) TestGroupKey(id uint) (*HealthResultItem, error) {
 	if err != nil {
 		return nil, err
 	}
-	if normalizeClientFormat(key.ClientFormat) != "openai" || normalizeUpstreamRequestMode(key.RequestMode) != "responses" {
-		return nil, errors.New("one-click health check only supports OpenAI Responses-format groups")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	result := s.testGroupKey(ctx, key)
@@ -1594,7 +1702,7 @@ func (s *Service) TestGroupKey(id uint) (*HealthResultItem, error) {
 func filterOpenAIHealthGroups(groups []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 	result := make([]storage.UpstreamGroupKey, 0, len(groups))
 	for _, group := range groups {
-		if normalizeClientFormat(group.ClientFormat) == "openai" && normalizeUpstreamRequestMode(group.RequestMode) == "responses" {
+		if normalizeClientFormat(group.ClientFormat) == "openai" {
 			result = append(result, group)
 		}
 	}
@@ -1633,18 +1741,24 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		return &GatewayError{Status: http.StatusRequestTimeout, Body: jsonError(message)}
 	}
 
-	policy, err := s.lookupIPPolicy(requestIP)
+	policy, err := s.lookupRequestIPPolicy(r, requestIP)
 	if err != nil {
 		return failGatewayRequest(http.StatusInternalServerError, "gateway_error", err.Error())
 	}
 	if policy != nil && policy.Blocked {
-		return failGatewayRequest(http.StatusForbidden, "gateway_forbidden", "IP has been banned by this gateway")
+		if shouldWriteResponsesTerminalForGatewayFailure(normalized) {
+			return writeResponsesGatewayTextStream(w, normalized.RequestModel, gatewayIPBannedMessage)
+		}
+		return failGatewayRequest(http.StatusForbidden, "gateway_forbidden", gatewayIPBannedMessage)
 	}
 	rawKey := extractGatewayKey(r.Header)
 	gatewayKey, err := s.Authenticate(rawKey, requestIP)
 	if err != nil {
-		if message, ok := s.publicGatewayLimitOrExpiredMessage(rawKey, nil, err); ok && shouldWriteResponsesTerminalForGatewayFailure(normalized) {
-			return writeResponsesGatewayTextStream(w, normalized.RequestModel, message)
+		if message, ok := s.gatewayLimitOrExpiredMessage(rawKey, nil, err); ok {
+			if shouldWriteResponsesTerminalForGatewayFailure(normalized) {
+				return writeResponsesGatewayTextStream(w, normalized.RequestModel, message)
+			}
+			return failGatewayRequest(http.StatusUnauthorized, "gateway_auth_failed", message)
 		}
 		return failGatewayRequest(http.StatusUnauthorized, "gateway_auth_failed", err.Error())
 	}
@@ -1668,14 +1782,20 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	}
 	gatewayKey = refreshedKey
 	if !gatewayKey.Enabled {
-		if message, ok := s.publicGatewayLimitOrExpiredMessage(rawKey, gatewayKey, errors.New("invalid gateway key")); ok && shouldWriteResponsesTerminalForGatewayFailure(normalized) {
-			return writeResponsesGatewayTextStream(w, normalized.RequestModel, message)
+		if message, ok := s.gatewayLimitOrExpiredMessage(rawKey, gatewayKey, errors.New("gateway key disabled")); ok {
+			if shouldWriteResponsesTerminalForGatewayFailure(normalized) {
+				return writeResponsesGatewayTextStream(w, normalized.RequestModel, message)
+			}
+			return failGatewayRequest(http.StatusUnauthorized, "gateway_auth_failed", message)
 		}
 		return failGatewayRequest(http.StatusUnauthorized, "gateway_auth_failed", "invalid gateway key")
 	}
 	if err := enforceGatewayQuota(gatewayKey); err != nil {
-		if message, ok := s.publicGatewayLimitOrExpiredMessage(rawKey, gatewayKey, err); ok && shouldWriteResponsesTerminalForGatewayFailure(normalized) {
-			return writeResponsesGatewayTextStream(w, normalized.RequestModel, message)
+		if message, ok := s.gatewayLimitOrExpiredMessage(rawKey, gatewayKey, err); ok {
+			if shouldWriteResponsesTerminalForGatewayFailure(normalized) {
+				return writeResponsesGatewayTextStream(w, normalized.RequestModel, message)
+			}
+			return failGatewayRequest(http.StatusTooManyRequests, "gateway_quota_exceeded", message)
 		}
 		return failGatewayRequest(http.StatusTooManyRequests, "gateway_quota_exceeded", err.Error())
 	}
@@ -1757,13 +1877,15 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 				continue
 			case candRetryable:
 				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
-				s.markProxyFailure(candidate.ID, outcome.errMsg)
+				// The candidate is already in a cooldown window.  This early
+				// rescue probe is allowed so a recovered upstream can come back
+				// immediately, but a failed rescue must not keep extending the
+				// cooldown under user traffic; the original failure already
+				// accounted for it, and the next normal attempt after cooldown
+				// will record a fresh failure if the upstream is still bad.
 				continue
 			case candFatal:
 				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
-				if outcome.markFailure {
-					s.markProxyFailure(candidate.ID, outcome.errMsg)
-				}
 				finalErr = outcome.err
 			}
 			break
@@ -2146,18 +2268,21 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			return false, extractUsage(respBody), nil
 		}
 		reader := newSSEStreamReader(resp.Body)
+		// Preflight must not write anything downstream.  If we emit even a
+		// heartbeat before proving this upstream can produce a valid event, the
+		// request is pinned to this candidate and we can no longer fail over to a
+		// healthier charity/low-ratio key without corrupting the Codex stream.
+		buffered, err := preflightSSEStream(reader, resp.Body, streamPreflightTimeout)
+		if err != nil {
+			return true, usageTokens{}, err
+		}
 		// 正式转发阶段的 idle 读超时：上游连续 streamIdleTimeout 没有任何新事件就判定卡死，
 		// 主动关连接返回错误，避免 reader.Next() 无限阻塞导致客户端 stream closed。
 		reader.closer = resp.Body
 		reader.idleTimeout = streamIdleTimeout
-		setStreamResponseHeaders(w)
 		reader.heartbeatInterval = streamHeartbeatInterval
 		reader.heartbeat = func() error {
 			return writeSSEHeartbeat(w)
-		}
-		buffered, err := preflightSSEStream(reader, resp.Body)
-		if err != nil {
-			return true, usageTokens{}, err
 		}
 		copyResponseHeaders(w, header, key)
 		setStreamResponseHeaders(w)
@@ -2260,6 +2385,7 @@ func upstreamGroupKeyFrom(ch storage.Channel, group connector.APIKeyGroup, group
 	return &storage.UpstreamGroupKey{
 		ChannelID:             ch.ID,
 		ChannelName:           ch.Name,
+		ChannelURL:            ch.SiteURL,
 		ChannelType:           ch.Type,
 		ClientFormat:          inferGroupClientFormat(group.Name, group.Description),
 		RequestMode:           "responses",
@@ -2363,7 +2489,11 @@ func healthFailureStatus(status int, body []byte, err error) string {
 	case looksLikeForbiddenFailure(status, text):
 		return "forbidden"
 	case looksLikeAuthFailure(status, text):
-		return "auth_failed"
+		// Keep the channels page to the five visible health states: a 401 is an
+		// access refusal just like a 403 and is filtered together with it.
+		return "forbidden"
+	case looksLikeUpstreamRoutingUnavailable(text):
+		return "upstream_error"
 	case looksLikeUnsupportedModelError(text):
 		return "model_error"
 	case looksLikeClientRequestError(text) || status == http.StatusUnprocessableEntity:
@@ -2399,16 +2529,16 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 	if normalizeClientFormat(key.ClientFormat) == "claude" {
 		return s.healthProbeClaude(ctx, key)
 	}
+	if normalizeClientFormat(key.ClientFormat) == "grok" {
+		return s.healthProbeGrok(ctx, key)
+	}
 	start := time.Now()
 	// The one-click check is intentionally OpenAI-only. Use one stable model
 	// instead of /v1/models discovery: model lists are often filtered or stale,
 	// which used to make a healthy channel look dead before the real probe ran.
-	model := "gpt-5.5"
-	req := healthGenerationProbeRequest(model)
-	req = requestForCandidate(req, key)
-	status, _, body, err := s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
-	if fallback, _, ok := healthProbeFallbackRequest(req, status, body, err); ok {
-		status, _, body, err = s.requestHealthProbeCandidate(ctx, fallback, key, healthProbeTimeout)
+	status, body, err := s.healthProbeOpenAIModel(ctx, key, openAIHealthProbePrimaryModel, true)
+	if shouldRetryHealthWithCompatibleModel(body, err) {
+		status, body, err = s.healthProbeOpenAIModel(ctx, key, openAIHealthProbeFallbackModel, false)
 	}
 	latencyMS := time.Since(start).Milliseconds()
 	if err != nil {
@@ -2421,6 +2551,58 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 		return status, body, latencyMS, fmt.Errorf("upstream returned non-generation payload: %s", truncateBody(body, 240))
 	}
 	return status, body, latencyMS, nil
+}
+
+func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.UpstreamGroupKey, model string, allowCompatibleModelRetry bool) (int, []byte, error) {
+	req := healthGenerationProbeRequest(model)
+	req = requestForCandidate(req, key)
+	status, _, body, err := s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
+	if allowCompatibleModelRetry && shouldRetryHealthWithCompatibleModel(body, err) {
+		return status, body, err
+	}
+	if fallback, _, ok := healthProbeFallbackRequest(req, status, body, err); ok {
+		status, _, body, err = s.requestHealthProbeCandidate(ctx, fallback, key, healthProbeTimeout)
+	}
+	return status, body, err
+}
+
+func shouldRetryHealthWithCompatibleModel(body []byte, err error) bool {
+	text := healthFailureText(body, err)
+	if looksLikeUnsupportedModelError(text) {
+		return true
+	}
+	if looksLikeUpstreamRoutingUnavailable(text) {
+		return true
+	}
+	return false
+}
+
+// healthProbeGrok uses xAI's OpenAI-compatible Chat Completions contract.
+// Some Grok relays deliberately expose no Responses endpoint, so using the
+// OpenAI /responses probe would turn a healthy Grok group into a false death.
+func (s *Service) healthProbeGrok(ctx context.Context, key *storage.UpstreamGroupKey) (int, []byte, int64, error) {
+	start := time.Now()
+	body, _ := json.Marshal(map[string]any{
+		"model":      "grok-4.5",
+		"messages":   []map[string]string{{"role": "user", "content": healthProbePrompt}},
+		"max_tokens": healthProbeMaxOutputTokens,
+		"stream":     true,
+	})
+	header := http.Header{}
+	header.Set("Content-Type", "application/json")
+	req := normalizedRequest{Method: http.MethodPost, Path: "/v1/chat/completions", Header: header, Body: body, ResponseMode: "raw", Stream: true}
+	status, _, respBody, err := s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
+	latencyMS := time.Since(start).Milliseconds()
+	if err != nil {
+		return status, respBody, latencyMS, err
+	}
+	if status < 200 || status >= 300 {
+		return status, respBody, latencyMS, healthProbeError(status, respBody, nil)
+	}
+	if isUpstreamErrorBody(respBody) || !looksLikeHealthGenerationSuccess(respBody) {
+		return status, respBody, latencyMS, fmt.Errorf("upstream returned non-generation payload: %s", truncateBody(respBody, 240))
+	}
+	return status, respBody, latencyMS, nil
 }
 
 func healthProbeFallbackRequest(request normalizedRequest, status int, body []byte, err error) (normalizedRequest, string, bool) {
@@ -2449,9 +2631,9 @@ func (s *Service) healthProbeClaude(ctx context.Context, key *storage.UpstreamGr
 	model := defaultHealthProbeModel(key.ClientFormat)
 	body, _ := json.Marshal(map[string]any{
 		"model":      model,
-		"max_tokens": 1,
+		"max_tokens": healthProbeMaxOutputTokens,
 		"messages": []map[string]any{
-			{"role": "user", "content": "hi"},
+			{"role": "user", "content": healthProbePrompt},
 		},
 		"stream": true,
 	})
@@ -2533,19 +2715,19 @@ func shouldFallbackHealthModelDiscovery(status int) bool {
 }
 
 func healthGenerationProbeRequest(model string) normalizedRequest {
-	// 测活探针：发一句 "hi"，并把 max tokens 限到 1，尽量少烧 token（测活是付费的）。
+	// 测活探针：发一道极短数学题，并把输出限制到 2 tokens，验证真实流式生成且尽量少烧 token。
 	responsesBody, _ := json.Marshal(map[string]any{
 		"model":             model,
-		"input":             "hi",
-		"max_output_tokens": 1,
+		"input":             healthProbePrompt,
+		"max_output_tokens": healthProbeMaxOutputTokens,
 		"stream":            true,
 	})
 	chatBody, _ := json.Marshal(map[string]any{
 		"model": model,
 		"messages": []map[string]string{
-			{"role": "user", "content": "hi"},
+			{"role": "user", "content": healthProbePrompt},
 		},
-		"max_tokens": 1,
+		"max_tokens": healthProbeMaxOutputTokens,
 		"stream":     true,
 	})
 	header := http.Header{}
@@ -2662,11 +2844,11 @@ func selectHealthProbeModel(models []string, format string) string {
 func defaultHealthProbeModel(format string) string {
 	switch normalizeClientFormat(format) {
 	case "claude":
-		return "claude-3-haiku-20240307"
+		return "claude-opus-4-7"
 	case "grok":
-		return "grok-3-mini"
+		return "grok-4.5"
 	default:
-		return "gpt-4o-mini"
+		return openAIHealthProbePrimaryModel
 	}
 }
 
@@ -2692,32 +2874,106 @@ func looksLikeNonGenerativeModel(model string) bool {
 }
 
 func looksLikeHealthGenerationSuccess(body []byte) bool {
-	if len(bytes.TrimSpace(body)) == 0 {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
 		return false
 	}
+	if looksLikeHealthMathAnswer(trimmed) {
+		return true
+	}
 	var raw map[string]any
-	if err := json.Unmarshal(body, &raw); err != nil {
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err == nil && looksLikeHealthMathAnswer([]byte(text)) {
+			return true
+		}
+		return false
+	}
+	if _, ok := raw["error"]; ok {
 		return false
 	}
 	if typ := strings.ToLower(stringValue(raw["type"])); typ != "" {
-		if strings.HasPrefix(typ, "response.") || strings.Contains(typ, ".delta") || strings.Contains(typ, "_delta") {
+		if strings.Contains(typ, "failed") || strings.Contains(typ, "error") {
+			return false
+		}
+		if typ == "response.completed" || typ == "response.output_item.done" || typ == "response.content_part.done" {
+			return true
+		}
+		if typ == "response.output_text.delta" {
+			return strings.TrimSpace(stringValue(raw["delta"])) != ""
+		}
+		if strings.Contains(typ, ".delta") || strings.Contains(typ, "_delta") {
+			return strings.TrimSpace(stringValue(raw["delta"])) != "" || raw["content"] != nil || raw["text"] != nil
+		}
+		if typ == "response.incomplete" && (stringValue(raw["output_text"]) != "" || raw["output"] != nil) {
 			return true
 		}
 	}
 	if obj := strings.ToLower(stringValue(raw["object"])); obj == "chat.completion.chunk" {
-		return true
+		return chatCompletionChunkHasGeneration(raw)
 	}
-	for _, key := range []string{"id", "choices", "output", "output_text", "content", "usage"} {
+	if choices, ok := raw["choices"].([]any); ok && len(choices) > 0 {
+		return chatChoicesHaveGeneration(choices)
+	}
+	for _, key := range []string{"output", "output_text", "content"} {
 		if _, ok := raw[key]; ok {
 			return true
 		}
 	}
 	if response, ok := raw["response"].(map[string]any); ok {
-		if id := stringValue(response["id"]); id != "" {
-			return true
+		if _, ok := response["error"]; ok {
+			return false
 		}
 		status := strings.ToLower(stringValue(response["status"]))
-		return status == "completed" || status == "complete" || status == "succeeded"
+		if status == "completed" || status == "complete" || status == "succeeded" {
+			return true
+		}
+		if stringValue(response["output_text"]) != "" || response["output"] != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeHealthMathAnswer(body []byte) bool {
+	text := strings.TrimSpace(string(bytes.Trim(body, `"'`)))
+	text = strings.TrimSuffix(text, ".")
+	text = strings.TrimSpace(text)
+	switch text {
+	case "2", "2.0":
+		return true
+	default:
+		return false
+	}
+}
+
+func chatCompletionChunkHasGeneration(raw map[string]any) bool {
+	choices, ok := raw["choices"].([]any)
+	if !ok {
+		return false
+	}
+	return chatChoicesHaveGeneration(choices)
+}
+
+func chatChoicesHaveGeneration(choices []any) bool {
+	for _, item := range choices {
+		choice, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if finish := strings.TrimSpace(stringValue(choice["finish_reason"])); finish != "" {
+			return true
+		}
+		if delta, ok := choice["delta"].(map[string]any); ok {
+			if strings.TrimSpace(stringValue(delta["content"])) != "" || strings.TrimSpace(stringValue(delta["reasoning_content"])) != "" {
+				return true
+			}
+		}
+		if message, ok := choice["message"].(map[string]any); ok {
+			if strings.TrimSpace(stringValue(message["content"])) != "" {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -2921,6 +3177,56 @@ func looksLikeUpstreamErrorFailure(text string) bool {
 		strings.Contains(text, "upstream stream event")
 }
 
+func looksLikeUpstreamRoutingUnavailable(text string) bool {
+	if text == "" {
+		return false
+	}
+	markers := []string{
+		"all upstream group keys are temporarily disabled",
+		"temporarily disabled by recent failures",
+		"provider agent router",
+		"cc switch local proxy failed",
+		"ccswitch local proxy failed",
+		"no available channel",
+		"no available channels",
+		"no available provider",
+		"no available providers",
+		"no available upstream",
+		"no healthy upstream",
+		"no healthy provider",
+		"no usable upstream",
+		"all upstreams unavailable",
+		"all providers unavailable",
+		"no route available",
+		"route unavailable",
+		"provider unavailable",
+		"upstream temporarily unavailable",
+		"无可用渠道",
+		"没有可用渠道",
+		"暂无可用渠道",
+		"无可用上游",
+		"没有可用上游",
+		"暂无可用上游",
+		"无可用供应商",
+		"没有可用供应商",
+		"上游暂不可用",
+		"渠道暂不可用",
+		"供应商暂不可用",
+		"路由不可用",
+		"无可用路由",
+		"全部上游",
+		"全部渠道",
+		"临时禁用",
+		"暂时禁用",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func healthRetryDelay(keyID uint) time.Duration {
 	if healthProbeRetryJitterMax <= 0 {
 		return 0
@@ -3058,7 +3364,7 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 		return resp.StatusCode, header, respBody, nil
 	}
 	reader := newSSEStreamReader(resp.Body)
-	buffered, err := preflightSSEStream(reader, resp.Body)
+	buffered, err := preflightHealthSSEStream(reader, resp.Body, healthProbeTimeout)
 	body := healthProbeSSEBody(buffered)
 	if err != nil {
 		return resp.StatusCode, header, body, err
@@ -3067,11 +3373,21 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 }
 
 func healthProbeSSEBody(events []sseEvent) []byte {
+	var fallback []byte
 	for _, ev := range events {
 		data := strings.TrimSpace(ev.Data)
 		if data != "" && data != "[DONE]" {
-			return []byte(data)
+			body := []byte(data)
+			if looksLikeHealthGenerationSuccess(body) {
+				return body
+			}
+			if fallback == nil {
+				fallback = body
+			}
 		}
+	}
+	if fallback != nil {
+		return fallback
 	}
 	if len(events) == 0 {
 		return nil
@@ -3305,24 +3621,41 @@ func (s *Service) markHealthFailureWithStatus(id uint, status string, msg string
 	if strings.TrimSpace(status) == "" {
 		status = "dead"
 	}
-	delay := 30 * time.Second
+	currentFailures := 0
 	if current, err := s.groupKeys.FindByID(id); err == nil && current != nil {
-		switch {
-		case current.FailureCount <= 0:
-			delay = 30 * time.Second
-		case current.FailureCount == 1:
-			delay = time.Minute
-		case current.FailureCount == 2:
-			delay = 3 * time.Minute
-		default:
-			delay = time.Duration(math.Min(float64(current.FailureCount), 10)) * time.Minute
-		}
+		currentFailures = current.FailureCount
 	}
-	until := time.Now().Add(delay)
-	s.recordRuntimeFailure(id, until)
-	if err := s.groupKeys.MarkHealthFailureStatus(id, status, msg, until, latencyMS); err != nil && s.log != nil {
+	delay := healthFailureCooldown(status, currentFailures+1)
+	var disabledUntil *time.Time
+	if delay > 0 {
+		until := time.Now().Add(delay)
+		disabledUntil = &until
+		s.recordRuntimeFailure(id, until)
+	} else {
+		s.clearRuntimeDisable(id)
+	}
+	if err := s.groupKeys.MarkHealthFailureStatus(id, status, msg, disabledUntil, latencyMS); err != nil && s.log != nil {
 		s.log.Warn("mark upstream health failed", "id", id, "err", err)
 	}
+}
+
+func healthFailureCooldown(status string, nextFailures int) time.Duration {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "rate_limited":
+		return proxyRateLimitCooldown
+	case "zero_balance", "forbidden", "auth_failed":
+		return proxyPermanentFailureCooldown
+	case "invalid_request", "model_error", "non_generation":
+		return 0
+	}
+	if nextFailures < proxyTransientFailureThreshold {
+		return 0
+	}
+	delay := proxyTransientCooldownBase(status) * time.Duration(nextFailures-proxyTransientFailureThreshold+1)
+	if delay > 3*time.Minute {
+		delay = 3 * time.Minute
+	}
+	return delay
 }
 
 func normalizeProxyRequest(r *http.Request, path string, body []byte) (normalizedRequest, error) {
@@ -3342,7 +3675,7 @@ func normalizeProxyRequest(r *http.Request, path string, body []byte) (normalize
 		Path:         path,
 		Header:       cloneHeader(r.Header),
 		Body:         body,
-		RequestModel: modelFromRequestBody(body),
+		RequestModel: requestModelFromHTTP(r, body, rawQuery),
 		ResponseMode: "raw",
 	}
 	if r.Method == http.MethodGet || strings.TrimSpace(string(body)) == "" {
@@ -3932,19 +4265,18 @@ func (s *Service) orderCandidatesForRequest(candidates []storage.UpstreamGroupKe
 	//   硬亲和 —— previous_response_id / conversation / session 这类"有状态"请求，
 	//            响应 ID 只存在于当初那台上游，换任何别的上游都会直接失败，
 	//            因此必须无条件把原上游顶到最前，绝不能为省钱 / 状态未知而放弃。
-	//   软亲和 —— chat: 前缀，是我们为了上游 prompt 缓存命中率做的"尽量同一台"，
-	//            纯优化、不影响正确性，所以当它明显更贵或已经不健康时可以让位给更便宜的。
+	//   软亲和 —— chat: 前缀，是我们为了上游 prompt 缓存命中率做的"尽量同一台"。
+	//            只要原上游仍可调度就继续使用，避免同一上下文在多个上游之间来回跳，
+	//            降低 provider 侧 prompt cache 命中率。
 	hard := affinityIsHard(request.AffinityKey)
 	for i, item := range ordered {
 		if item.ID != affinity.GroupKeyID {
 			continue
 		}
 		if !hard {
-			// 软亲和：目标已经不是健康态，或比当前最优候选更贵，就放弃粘性、回归成本排序。
+			// 软亲和：只有目标已经不是健康/未知态时才放弃粘性，回归成本排序。
+			// 价格、倍率、优先级变化不应让一个可用的会话频繁换上游。
 			if statusRank(item.Status) > statusRank("unknown") {
-				return ordered
-			}
-			if len(ordered) > 0 && affinityWouldPromoteCostlier(item, ordered[0]) {
 				return ordered
 			}
 		}
@@ -4012,11 +4344,11 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
-		if out[i].Priority != out[j].Priority {
-			return out[i].Priority > out[j].Priority
-		}
 		if out[i].Ratio != out[j].Ratio {
 			return out[i].Ratio < out[j].Ratio
+		}
+		if out[i].Priority != out[j].Priority {
+			return out[i].Priority > out[j].Priority
 		}
 		if out[i].FailureCount != out[j].FailureCount {
 			return out[i].FailureCount < out[j].FailureCount
@@ -4194,6 +4526,26 @@ func (s *Service) lookupIPPolicy(ip string) (*storage.IPPolicy, error) {
 	return s.ipPolicies.Find(ip)
 }
 
+// lookupRequestIPPolicy checks the forwarded chain and the peer address.  The
+// first address remains the canonical address for logs and concurrency; the
+// complete check prevents a blacklist from being bypassed by a forged header
+// or missed because a reverse proxy exposes both X-Forwarded-For and RemoteAddr.
+func (s *Service) lookupRequestIPPolicy(r *http.Request, canonicalIP string) (*storage.IPPolicy, error) {
+	if s.ipPolicies == nil {
+		return nil, nil
+	}
+	for _, ip := range clientIPCandidates(r) {
+		policy, err := s.lookupIPPolicy(ip)
+		if err != nil {
+			return nil, err
+		}
+		if policy != nil && policy.Blocked {
+			return policy, nil
+		}
+	}
+	return s.lookupIPPolicy(canonicalIP)
+}
+
 func (s *Service) acquirePublicIPSlot(ctx context.Context, key *storage.GatewayKey, ip string, policy *storage.IPPolicy) (func(), error) {
 	if key == nil || !key.IsPublic || strings.TrimSpace(ip) == "" || (policy != nil && policy.PublicConcurrencyExempt) {
 		return func() {}, nil
@@ -4201,7 +4553,7 @@ func (s *Service) acquirePublicIPSlot(ctx context.Context, key *storage.GatewayK
 	stateAny, _ := s.ipRuntime.LoadOrStore(ip, &keyRuntimeState{})
 	state := stateAny.(*keyRuntimeState)
 	state.mu.Lock()
-	if state.inFlight < 5 && len(state.queue) == 0 {
+	if state.inFlight < publicIPConcurrencyLimit && len(state.queue) == 0 {
 		state.inFlight++
 		state.lastObservedAt = time.Now()
 		state.mu.Unlock()
@@ -4306,11 +4658,11 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
-		if out[i].Priority != out[j].Priority {
-			return out[i].Priority > out[j].Priority
-		}
 		if out[i].Ratio != out[j].Ratio {
 			return out[i].Ratio < out[j].Ratio
+		}
+		if out[i].Priority != out[j].Priority {
+			return out[i].Priority > out[j].Priority
 		}
 		if out[i].FailureCount != out[j].FailureCount {
 			return out[i].FailureCount < out[j].FailureCount
@@ -4322,22 +4674,6 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 
 func candidateSchedulable(item storage.UpstreamGroupKey) bool {
 	return statusRank(item.Status) <= statusRank("unknown")
-}
-
-func affinityWouldPromoteCostlier(item, best storage.UpstreamGroupKey) bool {
-	if candidateSchedulable(item) && candidateSchedulable(best) && item.Charity != best.Charity {
-		return best.Charity
-	}
-	if statusRank(item.Status) > statusRank(best.Status) {
-		return true
-	}
-	if item.Priority < best.Priority {
-		return true
-	}
-	if item.Priority == best.Priority && item.Ratio > best.Ratio {
-		return true
-	}
-	return false
 }
 
 func (s *Service) rememberAffinity(request normalizedRequest, responseID string, groupKeyID uint) {
@@ -5873,11 +6209,86 @@ func readSSEEvents(buffered []sseEvent, reader *sseStreamReader, emit func(event
 	}
 }
 
-func preflightSSEStream(reader *sseStreamReader, closer io.Closer) ([]sseEvent, error) {
+func preflightHealthSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.Duration) ([]sseEvent, error) {
 	buffered := make([]sseEvent, 0, 4)
 	totalBytes := 0
+	if timeout <= 0 {
+		timeout = healthProbeTimeout
+	}
 	for len(buffered) < streamPreflightMaxEvents && totalBytes < streamPreflightMaxBytes {
-		ev, err := readNextSSEWithTimeout(reader, closer, streamFirstEventTimeout, "first event")
+		ev, err := readNextSSEWithTimeout(reader, closer, timeout, "health generation event")
+		if errors.Is(err, io.EOF) {
+			if len(buffered) == 0 {
+				return nil, errors.New("upstream stream ended before sending health probe data")
+			}
+			if healthBufferedHasGeneration(buffered) {
+				return buffered, nil
+			}
+			return buffered, errors.New("upstream stream ended before generating health probe output")
+		}
+		if err != nil {
+			return nil, err
+		}
+		if ev.Data == "" && ev.Event == "" {
+			continue
+		}
+		if failed, msg := streamEventFailure(ev); failed {
+			return nil, errors.New(msg)
+		}
+		buffered = append(buffered, ev)
+		totalBytes += len(ev.Event) + len(ev.Data)
+		if healthStreamEventReady(ev) {
+			return buffered, nil
+		}
+		if strings.TrimSpace(ev.Data) == "[DONE]" {
+			if healthBufferedHasGeneration(buffered) {
+				return buffered, nil
+			}
+			return buffered, errors.New("upstream stream ended before generating health probe output")
+		}
+	}
+	if len(buffered) == 0 {
+		return nil, errors.New("upstream stream did not send a usable health probe event")
+	}
+	if healthBufferedHasGeneration(buffered) {
+		return buffered, nil
+	}
+	return buffered, errors.New("upstream stream did not send a generation health probe event")
+}
+
+func healthBufferedHasGeneration(events []sseEvent) bool {
+	for _, ev := range events {
+		if healthStreamEventReady(ev) {
+			return true
+		}
+	}
+	return false
+}
+
+func healthStreamEventReady(ev sseEvent) bool {
+	data := strings.TrimSpace(ev.Data)
+	if data == "" || data == "[DONE]" {
+		return false
+	}
+	if looksLikeHealthGenerationSuccess([]byte(data)) {
+		return true
+	}
+	typ := strings.ToLower(sseEventType(ev))
+	switch typ {
+	case "content_block_delta", "message_delta", "message_stop":
+		return true
+	}
+	return false
+}
+
+func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.Duration) ([]sseEvent, error) {
+	buffered := make([]sseEvent, 0, 4)
+	totalBytes := 0
+	if timeout <= 0 {
+		timeout = streamPreflightTimeout
+	}
+	for len(buffered) < streamPreflightMaxEvents && totalBytes < streamPreflightMaxBytes {
+		ev, err := readNextSSEWithTimeout(reader, closer, timeout, "first event")
 		if errors.Is(err, io.EOF) {
 			if len(buffered) == 0 {
 				return nil, errors.New("upstream stream ended before sending data")
@@ -6584,6 +6995,40 @@ func (s *Service) publicGatewayLimitOrExpiredMessage(rawKey string, key *storage
 	return publicGatewayLimitOrExpiredMessage(key, cause, time.Now())
 }
 
+// gatewayLimitOrExpiredMessage is used by the direct Responses gateway.  It is
+// intentionally not limited to public keys: any automatically disabled local
+// key must produce an actionable terminal stream instead of looking invalid.
+func (s *Service) gatewayLimitOrExpiredMessage(rawKey string, key *storage.GatewayKey, cause error) (string, bool) {
+	if key == nil && s != nil && s.gateway != nil {
+		rawKey = strings.TrimSpace(rawKey)
+		if rawKey != "" {
+			found, err := s.gateway.FindByHash(HashKey(rawKey))
+			if err != nil {
+				if s.log != nil {
+					s.log.Warn("lookup gateway key for friendly stream failed", "err", err)
+				}
+				return "", false
+			}
+			key = found
+		}
+	}
+	if key == nil {
+		return "", false
+	}
+	now := time.Now()
+	lower := ""
+	if cause != nil {
+		lower = strings.ToLower(cause.Error())
+	}
+	if publicGatewayKeyExpired(key, now) || strings.Contains(lower, "expired") {
+		return publicGatewayExpiredMessage, true
+	}
+	if publicGatewayKeyQuotaExhausted(key, now) || gatewayQuotaError(cause) {
+		return gatewayQuotaExhaustedMessage, true
+	}
+	return "", false
+}
+
 func publicGatewayLimitOrExpiredMessage(key *storage.GatewayKey, cause error, now time.Time) (string, bool) {
 	if key == nil || !key.IsPublic {
 		return "", false
@@ -6675,6 +7120,7 @@ func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 		CostPerMillion:     key.CostPerMillion,
 		BalanceLimit:       key.BalanceLimit,
 		ConcurrencyLimit:   key.ConcurrencyLimit,
+		MaxGroupRatio:      key.MaxGroupRatio,
 		BalanceRemaining:   balanceRemaining,
 		TodayCost:          todayCost,
 		TotalCost:          key.TotalCost,
@@ -6781,25 +7227,40 @@ func filterCandidatesForGatewayKey(key *storage.GatewayKey, candidates []storage
 	}
 	ids := decodeUintList(key.AllowedGroupIDs)
 	scope := normalizeGatewayGroupScope(key.AllowedGroupScope, ids)
+	scoped := candidates
 	if scope == gatewayGroupScopeAll {
-		return candidates
+		return filterCandidatesForGatewayKeyRatio(key, scoped)
 	}
-	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
+	scoped = make([]storage.UpstreamGroupKey, 0, len(candidates))
 	allowed := decodeUintSet(key.AllowedGroupIDs)
 	for _, candidate := range candidates {
 		switch scope {
 		case gatewayGroupScopeSelected:
 			if allowed[candidate.ID] {
-				out = append(out, candidate)
+				scoped = append(scoped, candidate)
 			}
 		case gatewayGroupScopeCharity:
 			if candidate.Charity {
-				out = append(out, candidate)
+				scoped = append(scoped, candidate)
 			}
 		case gatewayGroupScopeNormal:
 			if !candidate.Charity {
-				out = append(out, candidate)
+				scoped = append(scoped, candidate)
 			}
+		}
+	}
+	return filterCandidatesForGatewayKeyRatio(key, scoped)
+}
+
+func filterCandidatesForGatewayKeyRatio(key *storage.GatewayKey, candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
+	if key == nil || key.MaxGroupRatio <= 0 {
+		return candidates
+	}
+	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
+	maxRatio := key.MaxGroupRatio + 1e-9
+	for _, candidate := range candidates {
+		if candidate.Ratio <= maxRatio {
+			out = append(out, candidate)
 		}
 	}
 	return out
@@ -6869,6 +7330,9 @@ func anyNormalCandidate(candidates []storage.UpstreamGroupKey) bool {
 func gatewayKeyScopeEmptyMessage(key *storage.GatewayKey) string {
 	if key == nil {
 		return "no alive upstream group keys available"
+	}
+	if key.MaxGroupRatio > 0 {
+		return fmt.Sprintf("no upstream group keys at or below %.2f ratio available for this gateway key", key.MaxGroupRatio)
 	}
 	scope := normalizeGatewayGroupScope(key.AllowedGroupScope, decodeUintList(key.AllowedGroupIDs))
 	switch scope {
@@ -7619,23 +8083,42 @@ func unsupportedImageTextBlock() map[string]any {
 }
 
 func clientIP(r *http.Request) string {
-	for _, name := range []string{"X-Forwarded-For", "X-Real-IP"} {
-		raw := strings.TrimSpace(r.Header.Get(name))
-		if raw == "" {
-			continue
-		}
-		if name == "X-Forwarded-For" {
-			raw = strings.TrimSpace(strings.Split(raw, ",")[0])
-		}
-		if raw != "" {
-			return raw
-		}
+	candidates := clientIPCandidates(r)
+	if len(candidates) > 0 {
+		return candidates[0]
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	return ""
+}
+
+func clientIPCandidates(r *http.Request) []string {
+	if r == nil {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	result := make([]string, 0, 4)
+	appendIP := func(raw string) {
+		ip := net.ParseIP(strings.TrimSpace(raw))
+		if ip == nil {
+			return
+		}
+		value := ip.String()
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	for _, raw := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+		appendIP(raw)
+	}
+	appendIP(r.Header.Get("X-Real-IP"))
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err == nil {
-		return host
+		appendIP(host)
+	} else {
+		appendIP(r.RemoteAddr)
 	}
-	return r.RemoteAddr
+	return result
 }
 
 func joinUpstreamURL(siteURL, path string) (string, error) {
@@ -7913,6 +8396,13 @@ func looksLikeUnsupportedModelError(msg string) bool {
 			strings.Contains(s, "model_not_supported") ||
 			strings.Contains(s, "model_not_available") ||
 			strings.Contains(s, "unsupported_model") ||
+			strings.Contains(s, "model is not available") ||
+			strings.Contains(s, "model unavailable") ||
+			strings.Contains(s, "model not available") ||
+			strings.Contains(s, "model not in") ||
+			strings.Contains(s, "model is disabled") ||
+			strings.Contains(s, "model disabled") ||
+			strings.Contains(s, "model access") ||
 			strings.Contains(s, "invalid model") ||
 			strings.Contains(s, "invalid_model") ||
 			strings.Contains(s, "unknown model") ||

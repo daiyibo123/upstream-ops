@@ -28,10 +28,19 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 		gateway := dashboardGateway(d)
 		publicKey := publicKeySummary(d)
 		title := publicDashboardTitle(d)
+		homepageCheapestEnabled := true
+		if d != nil && d.Runtime != nil {
+			if cfg, err := config.LoadFile(d.Runtime.ConfigPath()); err == nil {
+				homepageCheapestEnabled = cfg.App.HomepageCheapestEnabled
+			}
+		}
 		// 公开页每个上游只展示一个当前可用且最便宜的分组，最多十个上游。
 		// 这和调度的优先级策略分开：这里展示的是可对外说明的成本顺序。
 		cheapestByChannel := make(map[uint]dashboardGatewayGroup)
 		for _, group := range gateway.Groups {
+			if group.ClientFormat != "openai" {
+				continue
+			}
 			if !group.Enabled || (group.Status != "alive" && group.Status != "unknown") {
 				continue
 			}
@@ -50,8 +59,8 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			}
 			return publicGroups[i].ID < publicGroups[j].ID
 		})
-		if len(publicGroups) > 10 {
-			publicGroups = publicGroups[:10]
+		if len(publicGroups) > 5 {
+			publicGroups = publicGroups[:5]
 		}
 		openaiCount := 0
 		claudeCount := 0
@@ -87,6 +96,7 @@ func registerPublicDashboard(g *gin.RouterGroup, d *Deps) {
 			"total_tokens":          gateway.TotalTokens,
 			"cheapest":              gateway.Cheapest,
 			"dispatch_preview":      publicGroups,
+			"homepage_cheapest_enabled": homepageCheapestEnabled,
 			"supported_formats":     []string{"OpenAI /v1/chat/completions", "OpenAI /v1/responses", "Claude Messages 自动转 Responses"},
 			"gateway_status":        "online",
 			"public_key":            publicKey,
@@ -291,6 +301,7 @@ type dashboardGatewayKey struct {
 	CostPerMillion    float64    `json:"cost_per_million"`
 	BalanceLimit      float64    `json:"balance_limit"`
 	ConcurrencyLimit  int        `json:"concurrency_limit"`
+	MaxGroupRatio     float64    `json:"max_group_ratio"`
 	BalanceRemaining  float64    `json:"balance_remaining"`
 	TodayCost         float64    `json:"today_cost"`
 	TotalCost         float64    `json:"total_cost"`
@@ -424,6 +435,7 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			CostPerMillion:    key.CostPerMillion,
 			BalanceLimit:      key.BalanceLimit,
 			ConcurrencyLimit:  key.ConcurrencyLimit,
+			MaxGroupRatio:     key.MaxGroupRatio,
 			BalanceRemaining:  key.BalanceRemaining,
 			TodayCost:         key.TodayCost,
 			TotalCost:         key.TotalCost,
