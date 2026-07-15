@@ -149,8 +149,10 @@ func AutoMigrate(db *gorm.DB) error {
 	// Older versions stored such rows as "unknown"; they remain enabled and
 	// will be refreshed by normal health checks, but are immediately eligible
 	// for model-aware routing after upgrade.
-	if err := db.Model(&UpstreamGroupKey{}).Where("status = ?", "unknown").Update("status", "alive").Error; err != nil {
-		return fmt.Errorf("normalize unknown upstream statuses: %w", err)
+	if err := db.Model(&UpstreamGroupKey{}).
+		Where("status IS NULL OR TRIM(status) = '' OR LOWER(TRIM(status)) IN ?", []string{"unknown", "unchecked", "untested", "not_tested", "not-tested"}).
+		Update("status", "alive").Error; err != nil {
+		return fmt.Errorf("normalize unprobed upstream statuses: %w", err)
 	}
 	// Network/TLS/timeout errors describe the probing machine's ability to
 	// reach an upstream at one instant. They are not a stable channel health

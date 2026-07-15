@@ -334,7 +334,7 @@ export default function UsagePage() {
                             <span className="truncate font-medium text-foreground" title={log.channel_name || log.group_name || ""}>
                               {log.channel_name || log.group_name || "未知上游"}
                             </span>
-                            {log.gateway_key_id && publicKeyIDs.has(log.gateway_key_id) ? (
+                            {(log.gateway_key_is_public || (log.gateway_key_id != null && publicKeyIDs.has(log.gateway_key_id))) ? (
                               <HeartHandshake className="size-3 shrink-0 text-amber-500" aria-label="公益 Key" />
                             ) : null}
                           </div>

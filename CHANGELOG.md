@@ -8,6 +8,15 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.8 - 2026-07-15
+
+### Fixed
+
+- GitHub latest-release checks now fall back to the running version when GitHub returns 403 or is unavailable, so the dashboard shows the deployment as up to date instead of exposing a raw API error.
+- Codex Responses-Lite requests now receive `reasoning.context: "all_turns"` when the corresponding internal header is present; Chat fallback requests remove that Responses-only header.
+- Transient proxy network, timeout, 5xx, and routing failures stay schedulable until the same upstream Key reaches the consecutive-failure threshold. Cooldown recovery resets the failure count, preventing a temporary shared outage from leaving all channels red.
+- Chat-compatible Responses bridging now preserves tool-call outputs, `tool_choice`, and parallel-tool-call controls so tool workflows can continue after an edit/tool result.
+
 ## v0.24.7 - 2026-07-15
 
 ### Fixed

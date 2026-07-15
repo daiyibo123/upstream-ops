@@ -2,6 +2,7 @@ package storage
 
 import (
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -54,15 +55,23 @@ func TestUsageLogsClearPreservesGatewayKeyUsage(t *testing.T) {
 		t.Fatalf("add usage: %v", err)
 	}
 	if err := logs.Add(&UsageLog{
-		GatewayKeyID:     key.ID,
-		GatewayKeyName:   key.Name,
-		PromptTokens:     10,
-		CompletionTokens: 5,
-		TotalTokens:      15,
-		CachedTokens:     4,
-		CreatedAt:        now,
+		GatewayKeyID:       key.ID,
+		GatewayKeyName:     key.Name,
+		GatewayKeyIsPublic: true,
+		PromptTokens:       10,
+		CompletionTokens:   5,
+		TotalTokens:        15,
+		CachedTokens:       4,
+		CreatedAt:          now,
 	}); err != nil {
 		t.Fatalf("add usage log: %v", err)
+	}
+	items, total, err := logs.List(50, 0)
+	if err != nil {
+		t.Fatalf("list usage logs: %v", err)
+	}
+	if total != 1 || len(items) != 1 || !items[0].GatewayKeyIsPublic {
+		t.Fatalf("usage log did not preserve public-key snapshot: %#v", items)
 	}
 
 	deleted, err := logs.Clear()
@@ -72,7 +81,7 @@ func TestUsageLogsClearPreservesGatewayKeyUsage(t *testing.T) {
 	if deleted != 1 {
 		t.Fatalf("deleted logs = %d, want 1", deleted)
 	}
-	_, total, err := logs.List(50, 0)
+	_, total, err = logs.List(50, 0)
 	if err != nil {
 		t.Fatalf("list usage logs: %v", err)
 	}
@@ -87,6 +96,50 @@ func TestUsageLogsClearPreservesGatewayKeyUsage(t *testing.T) {
 		updated.TodayPromptTokens != 10 || updated.TotalPromptTokens != 10 ||
 		updated.TodayCachedTokens != 4 || updated.TotalCachedTokens != 4 {
 		t.Fatalf("gateway key usage changed after clear: %#v", updated)
+	}
+}
+
+func TestAutoMigrateNormalizesLegacyUnprobedGroupStatuses(t *testing.T) {
+	db := openTestDB(t)
+	for index, status := range []string{"unknown", "unchecked", "untested", ""} {
+		group := &UpstreamGroupKey{ChannelID: uint(index + 1), GroupRef: "legacy-status-" + strconv.Itoa(index), GroupName: "legacy", Status: status}
+		if err := db.Create(group).Error; err != nil {
+			t.Fatalf("create %q legacy group: %v", status, err)
+		}
+	}
+	if err := AutoMigrate(db); err != nil {
+		t.Fatalf("rerun auto migrate: %v", err)
+	}
+	var remaining int64
+	if err := db.Model(&UpstreamGroupKey{}).Where("status IS NULL OR TRIM(status) = '' OR LOWER(TRIM(status)) IN ?", []string{"unknown", "unchecked", "untested"}).Count(&remaining).Error; err != nil {
+		t.Fatalf("count legacy statuses: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("legacy unprobed statuses remaining = %d", remaining)
+	}
+}
+
+func TestExpiredCooldownResetsTransientFailureCount(t *testing.T) {
+	db := openTestDB(t)
+	past := time.Now().Add(-time.Minute)
+	channel := &Channel{Name: "cooldown-channel", Type: ChannelTypeNewAPI, SiteURL: "https://example.test"}
+	if err := db.Create(channel).Error; err != nil {
+		t.Fatalf("create cooldown channel: %v", err)
+	}
+	group := &UpstreamGroupKey{ChannelID: channel.ID, GroupRef: "cooldown-reset", GroupName: "cooldown-reset", KeyCipher: "cipher", Enabled: true, Status: "network_error", FailureCount: 3, DisabledUntil: &past}
+	if err := db.Create(group).Error; err != nil {
+		t.Fatalf("create cooldown group: %v", err)
+	}
+	repo := NewUpstreamGroupKeys(db)
+	if _, err := repo.ListCandidates(time.Now()); err != nil {
+		t.Fatalf("list candidates: %v", err)
+	}
+	stored, err := repo.FindByID(group.ID)
+	if err != nil {
+		t.Fatalf("reload cooldown group: %v", err)
+	}
+	if stored.Status != "alive" || stored.FailureCount != 0 || stored.DisabledUntil != nil {
+		t.Fatalf("expired cooldown should fully recover the group: %#v", stored)
 	}
 }
 

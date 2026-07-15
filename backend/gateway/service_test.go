@@ -682,8 +682,8 @@ func TestProxyFailsOverOnHTTP200ErrorPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load dead group key: %v", err)
 	}
-	if deadGroup.Status != "upstream_error" || deadGroup.DisabledUntil != nil || !deadGroup.Enabled {
-		t.Fatalf("transient upstream error should be recorded without immediate cooldown/disable: %#v", deadGroup)
+	if deadGroup.Status != "alive" || deadGroup.FailureCount != 1 || deadGroup.DisabledUntil != nil || !deadGroup.Enabled {
+		t.Fatalf("a first transient upstream error must remain schedulable: %#v", deadGroup)
 	}
 }
 
@@ -1257,7 +1257,7 @@ func TestProxyFailurePolicyRequiresThreeTransientFailures(t *testing.T) {
 		if err != nil {
 			t.Fatalf("load group after failure %d: %v", i, err)
 		}
-		if stored.FailureCount != i || stored.DisabledUntil != nil || !stored.Enabled || stored.Status != "server_error" {
+		if stored.FailureCount != i || stored.DisabledUntil != nil || !stored.Enabled || stored.Status != "alive" {
 			t.Fatalf("failure %d should only be recorded, got %#v", i, stored)
 		}
 	}
@@ -1268,6 +1268,28 @@ func TestProxyFailurePolicyRequiresThreeTransientFailures(t *testing.T) {
 	}
 	if stored.FailureCount != 3 || stored.DisabledUntil == nil || !stored.Enabled || stored.Status != "server_error" {
 		t.Fatalf("third transient failure should short-circuit with cooldown but not disable key: %#v", stored)
+	}
+}
+
+func TestCodexResponsesLiteReasoningContextIsAddedForNativeResponses(t *testing.T) {
+	request := normalizedRequest{
+		ResponseMode: "responses",
+		Header:       http.Header{codexResponsesLiteHeader: []string{"1"}},
+		Body:         []byte(`{"model":"gpt-test","reasoning":{"effort":"high"}}`),
+	}
+	updated := ensureCodexResponsesLiteReasoningContext(request)
+	var raw map[string]any
+	if err := json.Unmarshal(updated.Body, &raw); err != nil {
+		t.Fatalf("decode normalized body: %v", err)
+	}
+	reasoning, _ := raw["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" || reasoning["context"] != "all_turns" {
+		t.Fatalf("reasoning contract not preserved: %#v", reasoning)
+	}
+
+	chat := stripCodexResponsesLiteHeader(normalizedRequest{Header: request.Header})
+	if chat.Header.Get(codexResponsesLiteHeader) != "" {
+		t.Fatalf("chat fallback must not forward %s", codexResponsesLiteHeader)
 	}
 }
 
@@ -1929,6 +1951,22 @@ func TestAutomaticHealthRatioFilterUsesEffectiveRatio(t *testing.T) {
 	filtered := filterHealthGroupsByMaxRatio(groups, automaticHealthProbeMaxRatio)
 	if len(filtered) != 2 || filtered[0].ID != 1 || filtered[1].ID != 2 {
 		t.Fatalf("automatic health ratio filter = %#v, want groups 1 and 2", filtered)
+	}
+}
+
+func TestOneClickHealthTestOptionsAreStrictAndLowCost(t *testing.T) {
+	opts := OneClickHealthTestOptions([]uint{3, 7})
+	if !opts.Serial || opts.BatchSize != 1 {
+		t.Fatalf("one-click health options must be serial: %#v", opts)
+	}
+	if opts.MaxRatio != automaticHealthProbeMaxRatio {
+		t.Fatalf("max ratio = %v, want %v", opts.MaxRatio, automaticHealthProbeMaxRatio)
+	}
+	if opts.InterGroupDelay != 2*time.Second {
+		t.Fatalf("inter-group delay = %s, want 2s", opts.InterGroupDelay)
+	}
+	if len(opts.GroupIDs) != 2 || opts.GroupIDs[0] != 3 || opts.GroupIDs[1] != 7 {
+		t.Fatalf("group IDs = %#v", opts.GroupIDs)
 	}
 }
 
@@ -3521,6 +3559,53 @@ func TestResponsesToChatRequestBodyConvertsCodexTools(t *testing.T) {
 	fn, _ := choice["function"].(map[string]any)
 	if stringValue(fn["name"]) != "exec" {
 		t.Fatalf("tool_choice not converted: %#v", raw["tool_choice"])
+	}
+}
+
+func TestResponsesToChatRequestBodyPreservesToolExecutionResults(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-test",
+		"stream":true,
+		"parallel_tool_calls":true,
+		"tool_choice":"required",
+		"input":[
+			{"type":"function_call","call_id":"call_edit","name":"apply_patch","arguments":"{\"patch\":\"*** Begin Patch\"}"},
+			{"type":"function_call_output","call_id":"call_edit","output":{"ok":true,"files":["app.go"]}}
+		]
+	}`)
+	converted, stream, err := responsesToChatRequestBody(body)
+	if err != nil {
+		t.Fatalf("convert responses tool follow-up: %v", err)
+	}
+	if !stream {
+		t.Fatal("stream flag was not preserved")
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(converted, &raw); err != nil {
+		t.Fatalf("decode converted body: %v", err)
+	}
+	if raw["tool_choice"] != "required" || raw["parallel_tool_calls"] != true {
+		t.Fatalf("tool controls were not preserved: %#v", raw)
+	}
+	messages, _ := raw["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages len = %d, want tool call + tool result: %#v", len(messages), raw["messages"])
+	}
+	call, _ := messages[0].(map[string]any)
+	calls, _ := call["tool_calls"].([]any)
+	if call["role"] != "assistant" || len(calls) != 1 {
+		t.Fatalf("prior function call was lost: %#v", call)
+	}
+	result, _ := messages[1].(map[string]any)
+	var output map[string]any
+	if content, ok := result["content"].(string); !ok || json.Unmarshal([]byte(content), &output) != nil || output["ok"] != true {
+		t.Fatalf("tool output JSON was not preserved: %#v", result)
+	}
+	if files, ok := output["files"].([]any); !ok || len(files) != 1 || files[0] != "app.go" {
+		t.Fatalf("tool output files were not preserved: %#v", output)
+	}
+	if result["role"] != "tool" || result["tool_call_id"] != "call_edit" {
+		t.Fatalf("tool output was not converted to a Chat tool message: %#v", result)
 	}
 }
 

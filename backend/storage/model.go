@@ -294,24 +294,28 @@ func (MonitorLog) TableName() string { return "monitor_logs" }
 // UsageLog 记录每次通过网关的请求，用于"使用记录"页展示（渠道/分组/模型/token/时间）。
 // 只在请求成功后写入，保持精简；保留天数由清理任务控制。
 type UsageLog struct {
-	ID               uint      `gorm:"primaryKey" json:"id"`
-	GatewayKeyID     uint      `gorm:"index" json:"gateway_key_id"`
-	GatewayKeyName   string    `gorm:"size:128" json:"gateway_key_name,omitempty"`
-	RequestIP        string    `gorm:"size:64;index" json:"request_ip,omitempty"`
-	ChannelID        uint      `gorm:"index" json:"channel_id"`
-	ChannelName      string    `gorm:"size:128" json:"channel_name,omitempty"`
-	GroupName        string    `gorm:"size:128" json:"group_name,omitempty"`
-	Model            string    `gorm:"size:256;index" json:"model,omitempty"`
-	ClientFormat     string    `gorm:"size:16" json:"client_format,omitempty"`
-	PromptTokens     int64     `json:"prompt_tokens"`
-	CompletionTokens int64     `json:"completion_tokens"`
-	TotalTokens      int64     `json:"total_tokens"`
-	CachedTokens     int64     `gorm:"not null;default:0" json:"cached_tokens"`
-	Ratio            float64   `json:"ratio"`
-	Status           string    `gorm:"size:32;not null;default:'success';index" json:"status"`
-	FirstTokenMS     int64     `gorm:"not null;default:0" json:"first_token_ms"`
-	DurationMS       int64     `gorm:"not null;default:0" json:"duration_ms"`
-	CreatedAt        time.Time `gorm:"index" json:"created_at"`
+	ID             uint   `gorm:"primaryKey" json:"id"`
+	GatewayKeyID   uint   `gorm:"index" json:"gateway_key_id"`
+	GatewayKeyName string `gorm:"size:128" json:"gateway_key_name,omitempty"`
+	// GatewayKeyIsPublic snapshots the local Key's public status at request
+	// time.  A usage row must keep this display attribute even if the Key is
+	// later reconfigured, disabled, or no longer returned by the Key list.
+	GatewayKeyIsPublic bool      `gorm:"not null;default:false;index" json:"gateway_key_is_public"`
+	RequestIP          string    `gorm:"size:64;index" json:"request_ip,omitempty"`
+	ChannelID          uint      `gorm:"index" json:"channel_id"`
+	ChannelName        string    `gorm:"size:128" json:"channel_name,omitempty"`
+	GroupName          string    `gorm:"size:128" json:"group_name,omitempty"`
+	Model              string    `gorm:"size:256;index" json:"model,omitempty"`
+	ClientFormat       string    `gorm:"size:16" json:"client_format,omitempty"`
+	PromptTokens       int64     `json:"prompt_tokens"`
+	CompletionTokens   int64     `json:"completion_tokens"`
+	TotalTokens        int64     `json:"total_tokens"`
+	CachedTokens       int64     `gorm:"not null;default:0" json:"cached_tokens"`
+	Ratio              float64   `json:"ratio"`
+	Status             string    `gorm:"size:32;not null;default:'success';index" json:"status"`
+	FirstTokenMS       int64     `gorm:"not null;default:0" json:"first_token_ms"`
+	DurationMS         int64     `gorm:"not null;default:0" json:"duration_ms"`
+	CreatedAt          time.Time `gorm:"index" json:"created_at"`
 }
 
 func (UsageLog) TableName() string { return "usage_logs" }

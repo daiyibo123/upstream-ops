@@ -353,6 +353,10 @@ function isOpenAIHealthGroup(group: UpstreamGroupKey) {
   return groupClientFormat(group) === "openai"
 }
 
+function isOneClickHealthTarget(group: UpstreamGroupKey) {
+  return isOpenAIHealthGroup(group) && effectiveRatio(group) <= 0.1 + 1e-9
+}
+
 function isOpenAIResponsesGroup(group: UpstreamGroupKey) {
   return isOpenAIHealthGroup(group) && normalizeRequestMode(group.request_mode) === "responses"
 }
@@ -1236,7 +1240,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     [filteredGroups],
   )
   const enabledFilteredOpenAIHealthGroups = useMemo(
-    () => filteredOpenAIHealthGroups.filter((group) => group.enabled !== false),
+    () => filteredOpenAIHealthGroups.filter((group) => group.enabled !== false && isOneClickHealthTarget(group)),
     [filteredOpenAIHealthGroups],
   )
 
@@ -1551,7 +1555,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       total: enabledTargets.length,
       batch: 0,
       batches: 0,
-      batchSize: 30,
+      batchSize: 1,
       message: "测活排队中...",
     })
     try {
@@ -1568,7 +1572,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               total: enabledTargets.length,
               batch: 0,
               batches: 0,
-              batchSize: 30,
+              batchSize: 1,
               message: "测活中...",
           }))
           if (ev.stage === "done" && ev.data && typeof ev.data === "object" && "items" in ev.data) {
@@ -1745,6 +1749,14 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     const format = groupClientFormat(group)
     const requestMode = selectedRequestMode(group)
     const canTest = group.enabled !== false
+    const oneClickHealthTarget = group.enabled !== false && isOneClickHealthTarget(group)
+    const healthCheckLabel = latestHealth?.checked_at
+      ? relativeTime(latestHealth.checked_at)
+      : group.last_checked_at
+        ? relativeTime(group.last_checked_at)
+        : oneClickHealthTarget
+          ? "待一键测活"
+          : "不参与一键测活"
 
     return (
       <div
@@ -1946,7 +1958,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
         </div>
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground lg:col-span-6">
-          <span>测活：{latestHealth?.checked_at ? relativeTime(latestHealth.checked_at) : group.last_checked_at ? relativeTime(group.last_checked_at) : "未测"}</span>
+          <span>测活：{healthCheckLabel}</span>
           <span>延迟：{latencyMS > 0 ? `${latencyMS}ms` : "—"}</span>
           <span>并发：{(group.concurrency_limit || 0) > 0 ? `${group.concurrency_limit} 路` : "不限"}</span>
           <span>优先级：{group.priority || 0}</span>

@@ -48,6 +48,10 @@ const (
 	// user traffic is healthy. Keys at the same API base are already serialized;
 	// leave a small gap before the next key is probed as well.
 	healthProbeUpstreamMinInterval = 500 * time.Millisecond
+	// One-click checks intentionally run one upstream key at a time.  A pause
+	// between completed probes prevents shared relays from treating the batch as
+	// an abusive burst and returning false network/limit statuses.
+	oneClickHealthProbeInterval = 2 * time.Second
 	// streamFirstEventTimeout 是"等上游吐出第一个有效 SSE 事件"的最长等待。
 	// Codex / o1 / o3 这类带 reasoning 的请求可能长时间没有可见文本；部分
 	// 中转站还会缓冲 response.created。这里给到 5 分钟，避免在上游仍在推理时
@@ -320,9 +324,26 @@ type HealthResultItem struct {
 type HealthTestOptions struct {
 	BatchSize int
 	GroupIDs  []uint
-	// MaxRatio applies only to scheduled/background checks. A zero value keeps
-	// explicit one-click and per-channel tests unrestricted.
+	// MaxRatio limits a batch by effective ratio. A zero value leaves direct
+	// service callers unrestricted; the dashboard's one-click policy sets 0.1.
 	MaxRatio float64
+	// Serial makes a batch strictly one-at-a-time. InterGroupDelay is applied
+	// after a completed probe and before the next probe begins.
+	Serial          bool
+	InterGroupDelay time.Duration
+}
+
+// OneClickHealthTestOptions returns the safe policy used by the dashboard's
+// one-click check: OpenAI groups at an effective rate no higher than 0.1 are
+// checked strictly serially, with a two-second gap between upstream requests.
+func OneClickHealthTestOptions(groupIDs []uint) HealthTestOptions {
+	return HealthTestOptions{
+		BatchSize:       1,
+		GroupIDs:        groupIDs,
+		MaxRatio:        automaticHealthProbeMaxRatio,
+		Serial:          true,
+		InterGroupDelay: oneClickHealthProbeInterval,
+	}
 }
 
 type UpdateGroupKeyInput struct {
@@ -694,6 +715,7 @@ func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *stor
 	if gatewayKey != nil {
 		entry.GatewayKeyID = gatewayKey.ID
 		entry.GatewayKeyName = gatewayKey.Name
+		entry.GatewayKeyIsPublic = gatewayKey.IsPublic
 	}
 	if err := s.usageLogs.Add(entry); err != nil && s.log != nil {
 		s.log.Warn("record usage log failed", "err", err)
@@ -1943,6 +1965,9 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 	// legacy records automatically.
 
 	batchSize := normalizeHealthProbeBatchSize(opts.BatchSize)
+	if opts.Serial {
+		batchSize = 1
+	}
 	observer := progress.FromContext(ctx)
 	probeCtx := context.Background()
 
@@ -1959,7 +1984,9 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 		}
 		enabled = append(enabled, i)
 	}
-	enabled = interleaveHealthTestGroupIndexes(list, enabled)
+	if !opts.Serial {
+		enabled = interleaveHealthTestGroupIndexes(list, enabled)
+	}
 	result.Total = len(enabled)
 	for pos, idx := range enabled {
 		item := healthResultItemFromGroup(&list[idx], "queued")
@@ -2044,6 +2071,9 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 					Index:   done,
 					Total:   result.Total,
 				})
+				if opts.Serial && opts.InterGroupDelay > 0 && job.pos+1 < len(enabled) {
+					time.Sleep(opts.InterGroupDelay)
+				}
 			}
 		}()
 	}
@@ -2374,6 +2404,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		return &GatewayError{Status: http.StatusBadRequest, Body: jsonError(err.Error())}
 	}
 	normalized.ClientIP = requestIP
+	normalized = ensureCodexResponsesLiteReasoningContext(normalized)
 	normalized = s.rectifyBeforeSend(normalized)
 
 	failGatewayRequest := func(status int, code, message string) error {
@@ -2654,14 +2685,67 @@ func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamG
 		return request.alt()
 	}
 	if shouldPreferChatBridgeForResponsesStream(request, candidate) {
-		return request.altWithFallbackToSelf()
+		return stripCodexResponsesLiteHeader(request.altWithFallbackToSelf())
 	}
 	switch normalizeUpstreamRequestMode(candidate.RequestMode) {
 	case "chat":
-		return request.alt()
+		return stripCodexResponsesLiteHeader(request.alt())
 	default:
 		return request
 	}
+}
+
+const codexResponsesLiteHeader = "X-OpenAI-Internal-Codex-Responses-Lite"
+
+// ensureCodexResponsesLiteReasoningContext honors the contract advertised by
+// Codex Responses-Lite. Some OpenAI-compatible upstreams reject the complete
+// request unless reasoning.context is exactly all_turns; keeping the caller's
+// other reasoning settings intact avoids a needless multi-key failover storm.
+func ensureCodexResponsesLiteReasoningContext(request normalizedRequest) normalizedRequest {
+	if request.ResponseMode != "responses" || strings.TrimSpace(headerValueCaseInsensitive(request.Header, codexResponsesLiteHeader)) == "" {
+		return request
+	}
+	var raw map[string]any
+	if json.Unmarshal(request.Body, &raw) != nil || raw == nil {
+		return request
+	}
+	reasoning, _ := raw["reasoning"].(map[string]any)
+	if reasoning == nil {
+		reasoning = map[string]any{}
+	}
+	if strings.EqualFold(strings.TrimSpace(stringValue(reasoning["context"])), "all_turns") {
+		return request
+	}
+	reasoning["context"] = "all_turns"
+	raw["reasoning"] = reasoning
+	if body, err := json.Marshal(raw); err == nil {
+		request.Body = body
+	}
+	return request
+}
+
+// The Lite header belongs to native Responses traffic. A fallback Chat request
+// cannot honor it and forwarding it can make a compatible chat-only upstream
+// reject an otherwise valid conversion.
+func stripCodexResponsesLiteHeader(request normalizedRequest) normalizedRequest {
+	for key := range request.Header {
+		if strings.EqualFold(key, codexResponsesLiteHeader) {
+			request.Header.Del(key)
+		}
+	}
+	return request
+}
+
+func headerValueCaseInsensitive(header http.Header, name string) string {
+	if value := header.Get(name); value != "" {
+		return value
+	}
+	for key, values := range header {
+		if strings.EqualFold(key, name) && len(values) > 0 {
+			return values[0]
+		}
+	}
+	return ""
 }
 
 func shouldPreferChatBridgeForResponsesStream(request normalizedRequest, candidate *storage.UpstreamGroupKey) bool {
@@ -4607,6 +4691,15 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 func (s *Service) markProxyFailure(id uint, msg string) {
 	status := proxyFailureStatus(msg)
 	policy := s.proxyFailurePolicy(id, status, msg)
+	persistedStatus := status
+	// A one-off connect reset, timeout or 5xx says nothing reliable about a
+	// route's health. Preserve a per-key failure count, but keep it selectable
+	// until the same key reaches the short-circuit threshold. Previously this
+	// wrote network_error immediately, so a temporary local/upstream blip made
+	// an entire page appear unavailable even though single probes still worked.
+	if isTransientProxyFailureStatus(status) && policy.cooldown <= 0 {
+		persistedStatus = "alive"
+	}
 	var disabledUntil *time.Time
 	if policy.cooldown > 0 {
 		until := time.Now().Add(policy.cooldown)
@@ -4615,13 +4708,22 @@ func (s *Service) markProxyFailure(id uint, msg string) {
 	} else {
 		s.clearRuntimeDisable(id)
 	}
-	if err := s.groupKeys.MarkProxyFailureStatus(id, status, msg, disabledUntil); err != nil && s.log != nil {
+	if err := s.groupKeys.MarkProxyFailureStatus(id, persistedStatus, msg, disabledUntil); err != nil && s.log != nil {
 		s.log.Warn("mark upstream group failed", "id", id, "err", err)
 	}
 	if policy.disableKey {
 		if err := s.groupKeys.UpdateEnabled(id, false); err != nil && s.log != nil {
 			s.log.Warn("disable upstream group key failed", "id", id, "err", err)
 		}
+	}
+}
+
+func isTransientProxyFailureStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "network_error", "timeout", "server_error", "upstream_error", "dead":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -4989,9 +5091,12 @@ func responsesToChatRequestBody(body []byte) ([]byte, bool, error) {
 	out["messages"] = messages
 	if tools := responsesToolsToChatTools(raw["tools"]); len(tools) > 0 {
 		out["tools"] = tools
-		if choice := responsesToolChoiceToChat(raw["tool_choice"]); choice != nil {
-			out["tool_choice"] = choice
-		}
+	}
+	if choice := responsesToolChoiceToChat(raw["tool_choice"]); choice != nil {
+		out["tool_choice"] = choice
+	}
+	if parallel, ok := raw["parallel_tool_calls"]; ok {
+		out["parallel_tool_calls"] = parallel
 	}
 	if mt, ok := raw["max_output_tokens"]; ok {
 		out["max_tokens"] = mt
@@ -5139,6 +5244,46 @@ func responsesInputToChatMessages(input any) []map[string]any {
 			if msg == nil {
 				continue
 			}
+			typ := strings.ToLower(strings.TrimSpace(stringValue(msg["type"])))
+			// A Responses follow-up commonly contains function_call_output (and
+			// Codex can use other *_call_output item types) instead of repeating
+			// the entire conversation. A Chat-compatible upstream needs a native
+			// role=tool message; flattening this item into text loses the tool
+			// result and makes the model answer conversationally rather than carry
+			// on with the requested edit/tool workflow.
+			if typ == "function_call_output" || strings.HasSuffix(typ, "_call_output") {
+				callID := strings.TrimSpace(stringValue(firstNonNil(msg["call_id"], msg["id"])))
+				if callID != "" {
+					out = append(out, map[string]any{
+						"role":         "tool",
+						"tool_call_id": callID,
+						"content":      responsesToolOutputToChatContent(firstNonNil(msg["output"], msg["content"])),
+					})
+					continue
+				}
+			}
+			// Preserve explicit prior function calls when a client sends the
+			// complete Responses input. Chat APIs require the assistant tool-call
+			// message immediately before its role=tool result.
+			if typ == "function_call" {
+				name := strings.TrimSpace(stringValue(msg["name"]))
+				callID := strings.TrimSpace(stringValue(firstNonNil(msg["call_id"], msg["id"])))
+				if name != "" && callID != "" {
+					out = append(out, map[string]any{
+						"role":    "assistant",
+						"content": nil,
+						"tool_calls": []map[string]any{{
+							"id":   callID,
+							"type": "function",
+							"function": map[string]any{
+								"name":      name,
+								"arguments": stringValue(msg["arguments"]),
+							},
+						}},
+					})
+					continue
+				}
+			}
 			role, _ := msg["role"].(string)
 			if role == "" {
 				role = "user"
@@ -5151,6 +5296,27 @@ func responsesInputToChatMessages(input any) []map[string]any {
 		return out
 	default:
 		return nil
+	}
+}
+
+// responsesToolOutputToChatContent keeps structured tool output intact for a
+// Chat-compatible upstream. Tool output is often JSON; converting it with
+// fmt.Sprint loses valid JSON structure and can make a coding agent ignore an
+// edit result or an error returned by its tool.
+func responsesToolOutputToChatContent(output any) string {
+	switch value := output.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	case []byte:
+		return string(value)
+	default:
+		encoded, err := json.Marshal(value)
+		if err == nil {
+			return string(encoded)
+		}
+		return fmt.Sprint(value)
 	}
 }
 

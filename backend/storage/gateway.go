@@ -413,6 +413,7 @@ func (r *UpstreamGroupKeys) reactivateExpiredCooldowns(now time.Time) error {
 		Where("disabled_until IS NOT NULL AND disabled_until <= ?", now).
 		Updates(map[string]any{
 			"status":         "alive",
+			"failure_count":  0,
 			"disabled_until": nil,
 		}).Error
 }

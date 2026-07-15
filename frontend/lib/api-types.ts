@@ -681,6 +681,7 @@ export interface UsageLog {
   id: number
   gateway_key_id?: number
   gateway_key_name?: string
+  gateway_key_is_public?: boolean
   request_ip?: string
   channel_id?: number
   channel_name?: string

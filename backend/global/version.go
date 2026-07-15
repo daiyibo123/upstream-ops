@@ -1,3 +1,3 @@
 package global
 
-var VERSION = "0.24.7"
+var VERSION = "0.24.8"

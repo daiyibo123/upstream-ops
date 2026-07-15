@@ -61,7 +61,7 @@ func TestVersionEndpointReportsNoUpdate(t *testing.T) {
 	}
 }
 
-func TestVersionEndpointKeepsResponseOnGitHubError(t *testing.T) {
+func TestVersionEndpointFallsBackToRunningVersionOnGitHubError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	withGitHubReleaseServer(t, http.StatusInternalServerError, `{"message":"error"}`)
@@ -70,11 +70,23 @@ func TestVersionEndpointKeepsResponseOnGitHubError(t *testing.T) {
 	if resp.UpdateAvailable {
 		t.Fatalf("update_available = true, want false")
 	}
-	if strings.TrimSpace(resp.UpdateError) == "" {
-		t.Fatalf("update_error is empty")
+	if resp.LatestVersion != global.VERSION || resp.UpdateAvailable {
+		t.Fatalf("github failure should show current version as latest, got %#v", resp)
+	}
+	if strings.TrimSpace(resp.UpdateError) != "" {
+		t.Fatalf("update_error = %q, want hidden fallback", resp.UpdateError)
 	}
 	if resp.Version != global.VERSION {
 		t.Fatalf("version = %q, want %s", resp.Version, global.VERSION)
+	}
+}
+
+func TestVersionEndpointHidesGitHub403AsCurrentVersion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withGitHubReleaseServer(t, http.StatusForbidden, `{"message":"API rate limit exceeded"}`)
+	resp := requestVersion(t)
+	if resp.LatestVersion != global.VERSION || resp.UpdateAvailable || resp.UpdateError != "" {
+		t.Fatalf("403 fallback = %#v", resp)
 	}
 }
 

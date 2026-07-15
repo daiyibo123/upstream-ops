@@ -123,7 +123,7 @@ export function testLoginStream(channelID: number, options: SyncOptions) {
 
 /** 触发 /api/gateway/group-keys/test（按批次测活指定分组）。 */
 export function testGatewayHealthStream(options: SyncOptions, groupIds: number[] = []) {
-  const params = new URLSearchParams({ stream: "1", batch_size: "30" })
+  const params = new URLSearchParams({ stream: "1", batch_size: "1" })
   const ids = Array.from(new Set(groupIds.filter((id) => Number.isFinite(id) && id > 0)))
   if (ids.length > 0) {
     params.set("ids", ids.join(","))

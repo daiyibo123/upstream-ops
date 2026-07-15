@@ -254,7 +254,13 @@ func buildVersionResponse(ctx context.Context, d *Deps, force bool) versionRespo
 
 	latest, releaseURL, err := fetchLatestGitHubRelease(ctx, versionCheckClient(proxyCfg, force))
 	if err != nil {
-		resp.UpdateError = err.Error()
+		// GitHub's public API can return 403 for unauthenticated rate limiting or
+		// regional/network policy. This must not make the dashboard look broken:
+		// without a verified newer tag the only honest state is the running
+		// version, which is already up to date from this deployment's viewpoint.
+		resp.LatestVersion = global.VERSION
+		resp.ReleaseURL = githubRepoURL
+		resp.UpdateAvailable = false
 		return resp
 	}
 	resp.LatestVersion = latest

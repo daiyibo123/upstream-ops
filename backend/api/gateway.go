@@ -308,9 +308,11 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		c.JSON(http.StatusOK, gin.H{"data": item})
 	})
 	gp.POST("/group-keys/test", func(c *gin.Context) {
-		batchSize := atoiDefault(c.Query("batch_size"), 0)
 		groupIDs := parseUintCSV(c.Query("ids"))
-		opts := gatewaySvc.HealthTestOptions{BatchSize: batchSize, GroupIDs: groupIDs}
+		// A dashboard one-click check must never burst a shared upstream.  The
+		// service also enforces the OpenAI/effective-ratio policy server-side, so
+		// callers cannot accidentally test costly or non-OpenAI groups.
+		opts := gatewaySvc.OneClickHealthTestOptions(groupIDs)
 		if wantsSSE(c) {
 			obs := setupSSE(c)
 			ctx := progress.WithObserver(context.Background(), obs)
