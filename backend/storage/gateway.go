@@ -284,7 +284,7 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 			existing.KeyCipher = key.KeyCipher
 		}
 		if existing.Status == "" {
-			existing.Status = "unknown"
+			existing.Status = "alive"
 		}
 		return r.db.Save(&existing).Error
 	case errors.Is(err, gorm.ErrRecordNotFound):
@@ -302,7 +302,7 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 		}
 		key.RequestModeSource = normalizeRequestModeSource(key.RequestModeSource)
 		if key.Status == "" {
-			key.Status = "unknown"
+			key.Status = "alive"
 		}
 		return r.db.Create(key).Error
 	default:
@@ -412,7 +412,7 @@ func (r *UpstreamGroupKeys) reactivateExpiredCooldowns(now time.Time) error {
 		Where("status IN ?", []string{"rate_limited", "dead", "server_error", "timeout", "network_error", "upstream_error"}).
 		Where("disabled_until IS NOT NULL AND disabled_until <= ?", now).
 		Updates(map[string]any{
-			"status":         "unknown",
+			"status":         "alive",
 			"disabled_until": nil,
 		}).Error
 }
@@ -546,8 +546,8 @@ func normalizeRequestModeSource(source string) string {
 // the group back into scheduling without touching any automatic group record.
 // Protocol detection is advisory only: some otherwise usable upstreams block
 // probe endpoints or expose a model list different from the requested model.
-// A failed probe must never leave a newly replaced manual key stuck in an
-// "unknown" state and excluded from normal routing.
+// A failed probe must never leave a newly replaced manual key outside normal
+// routing.
 func (r *UpstreamGroupKeys) UpdateManualKey(id uint, keyCipher string) error {
 	if strings.TrimSpace(keyCipher) == "" {
 		return errors.New("manual key cipher cannot be empty")
@@ -651,7 +651,7 @@ func (r *UpstreamGroupKeys) MarkHealthInconclusive(id uint, errMsg string, laten
 		latencyMS = 0
 	}
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
-		"status":          "unknown",
+		"status":          "alive",
 		"last_checked_at": &now,
 		"last_latency_ms": latencyMS,
 		"disabled_until":  nil,

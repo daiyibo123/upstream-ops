@@ -1312,7 +1312,7 @@ func TestHealthTransientFailuresDoNotCooldownBeforeThreshold(t *testing.T) {
 	}
 }
 
-func TestGenericHealthFailureNeedsThreeCompletedRunsBeforeDead(t *testing.T) {
+func TestGenericHealthFailureKeepsKeyAliveUntilThreeCompletedRuns(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("d", 32))
 	channel := &storage.Channel{Name: "generic-health", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.invalid", MonitorEnabled: true}
 	if err := env.channels.Create(channel); err != nil {
@@ -1335,8 +1335,8 @@ func TestGenericHealthFailureNeedsThreeCompletedRunsBeforeDead(t *testing.T) {
 
 	for run := 1; run <= proxyTransientFailureThreshold-1; run++ {
 		status := env.svc.confirmedHealthFailureStatus(group.ID, "dead")
-		if status != "unknown" {
-			t.Fatalf("run %d status = %q, want unknown", run, status)
+		if status != "alive" {
+			t.Fatalf("run %d status = %q, want alive", run, status)
 		}
 		env.svc.markHealthFailureWithStatus(group.ID, status, "generic probe failure", 1)
 	}
@@ -1344,7 +1344,7 @@ func TestGenericHealthFailureNeedsThreeCompletedRunsBeforeDead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload group after unconfirmed failures: %v", err)
 	}
-	if stored.Status != "unknown" || stored.FailureCount != proxyTransientFailureThreshold-1 || stored.DisabledUntil != nil {
+	if stored.Status != "alive" || stored.FailureCount != proxyTransientFailureThreshold-1 || stored.DisabledUntil != nil {
 		t.Fatalf("unconfirmed generic failures should remain schedulable: %#v", stored)
 	}
 	if status := env.svc.confirmedHealthFailureStatus(group.ID, "dead"); status != "dead" {
@@ -1357,7 +1357,7 @@ func TestGenericHealthFailureNeedsThreeCompletedRunsBeforeDead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload group after inconclusive probe: %v", err)
 	}
-	if stored.Status != "unknown" || stored.FailureCount != beforeFailures || stored.DisabledUntil != nil {
+	if stored.Status != "alive" || stored.FailureCount != beforeFailures || stored.DisabledUntil != nil {
 		t.Fatalf("inconclusive probe must not add a failure or cooldown: %#v", stored)
 	}
 }
@@ -1844,7 +1844,7 @@ func TestHealthProbeUsesStreamingClaudeRequest(t *testing.T) {
 	}
 }
 
-func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
+func TestTestAllGroupKeysRunsOnlyLowRatioGroupsInBatches(t *testing.T) {
 	var inFlight int64
 	var maxInFlight int64
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1882,9 +1882,13 @@ func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
 	// batches, and each batch should run with controlled parallelism.
 	for i := 0; i < 35; i++ {
 		ref := "group-" + strconv.Itoa(i)
+		ratio := 0.05
+		if i >= 30 {
+			ratio = 0.2
+		}
 		if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
 			ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
-			GroupRef: ref, GroupName: ref, Ratio: 1, KeyCipher: keyCipher, Status: "unknown",
+			GroupRef: ref, GroupName: ref, Ratio: ratio, KeyCipher: keyCipher, Status: "unknown",
 		}); err != nil {
 			t.Fatalf("insert group %d: %v", i, err)
 		}
@@ -1894,11 +1898,11 @@ func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
 	if err != nil {
 		t.Fatalf("test all groups: %v", err)
 	}
-	if result.Alive != 35 {
-		t.Fatalf("alive = %d, want 35; result=%#v", result.Alive, result)
+	if result.Alive != 30 || result.Total != 30 {
+		t.Fatalf("alive/total = %d/%d, want 30/30; result=%#v", result.Alive, result.Total, result)
 	}
-	if result.BatchSize != 10 || result.Batches != 4 {
-		t.Fatalf("batch metadata = size %d batches %d, want 10/4", result.BatchSize, result.Batches)
+	if result.BatchSize != 10 || result.Batches != 3 {
+		t.Fatalf("batch metadata = size %d batches %d, want 10/3", result.BatchSize, result.Batches)
 	}
 	if got := atomic.LoadInt64(&maxInFlight); got > healthPerChannelParallel {
 		t.Fatalf("maximum concurrent requests to one upstream = %d, want at most %d", got, healthPerChannelParallel)
@@ -1910,9 +1914,21 @@ func TestTestAllGroupKeysRunsAllEnabledGroupsInBatches(t *testing.T) {
 		if item.Status != "alive" {
 			t.Fatalf("group %d status = %s: %s", item.ID, item.Status, item.Error)
 		}
-		if item.Batch < 1 || item.Batch > 4 {
-			t.Fatalf("group %d batch = %d, want 1..4", item.ID, item.Batch)
+		if item.Batch < 1 || item.Batch > 3 {
+			t.Fatalf("group %d batch = %d, want 1..3", item.ID, item.Batch)
 		}
+	}
+}
+
+func TestAutomaticHealthRatioFilterUsesEffectiveRatio(t *testing.T) {
+	groups := []storage.UpstreamGroupKey{
+		{ID: 1, Ratio: 0.05, RatioScalePercent: 100}, // 0.05: included
+		{ID: 2, Ratio: 0.2, RatioScalePercent: 50},   // 0.10: included
+		{ID: 3, Ratio: 0.05, RatioScalePercent: 300}, // 0.15: skipped
+	}
+	filtered := filterHealthGroupsByMaxRatio(groups, automaticHealthProbeMaxRatio)
+	if len(filtered) != 2 || filtered[0].ID != 1 || filtered[1].ID != 2 {
+		t.Fatalf("automatic health ratio filter = %#v, want groups 1 and 2", filtered)
 	}
 }
 
@@ -2178,8 +2194,12 @@ func TestTestGroupKeysClassifiesCommonProbeFailures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("test classified group: %v", err)
 			}
-			if len(result.Items) != 1 || result.Items[0].Status != tc.wantStatus || result.Items[0].ErrorType != tc.wantStatus {
-				t.Fatalf("result item = %#v, want status/error_type %s", result.Items, tc.wantStatus)
+			wantItemStatus := tc.wantStatus
+			if tc.wantStatus == "rate_limited" {
+				wantItemStatus = "alive"
+			}
+			if len(result.Items) != 1 || result.Items[0].Status != wantItemStatus || result.Items[0].ErrorType != tc.wantStatus {
+				t.Fatalf("result item = %#v, want status %s / error_type %s", result.Items, wantItemStatus, tc.wantStatus)
 			}
 			if result.Dead != 0 {
 				t.Fatalf("dead = %d, want classified failure not counted as dead; result=%#v", result.Dead, result)
@@ -3605,6 +3625,58 @@ func TestResponseInterceptionHandlesPublicTokenRestAcrossDeltas(t *testing.T) {
 	}
 	if got := svc.interceptedResponseContent(key, "公益token休息了"); got == "" {
 		t.Fatal("joined delta content must be intercepted")
+	}
+	if got := svc.interceptedResponseContent(key, "请求暂时无法完成: 公益token休息了"); got == "" {
+		t.Fatal("generic upstream failure prefix must be intercepted before a stream starts")
+	}
+}
+
+func TestProxyFailsOverWhenPublicRouteStreamsRestMessage(t *testing.T) {
+	var charityHits int
+	charity := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		charityHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"请求暂时无法完成:\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"公益token休息了\"}\n\n"))
+	}))
+	defer charity.Close()
+
+	var paidHits int
+	paid := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paidHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_paid\",\"object\":\"response\",\"model\":\"gpt-test\",\"status\":\"completed\",\"output\":[]}}\n\n"))
+	}))
+	defer paid.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("p", 32))
+	charityChannel := &storage.Channel{Name: "charity-rest", Type: storage.ChannelTypeSub2API, SiteURL: charity.URL}
+	paidChannel := &storage.Channel{Name: "paid-live", Type: storage.ChannelTypeSub2API, SiteURL: paid.URL}
+	if err := env.channels.Create(charityChannel); err != nil {
+		t.Fatalf("create charity channel: %v", err)
+	}
+	if err := env.channels.Create(paidChannel); err != nil {
+		t.Fatalf("create paid channel: %v", err)
+	}
+	charityKey, _ := env.cipher.Encrypt("sk-charity")
+	paidKey, _ := env.cipher.Encrypt("sk-paid")
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{ChannelID: charityChannel.ID, ChannelName: charityChannel.Name, ChannelType: charityChannel.Type, GroupRef: "charity", GroupName: "charity", Ratio: 1, Charity: true, KeyCipher: charityKey, Status: "alive"}); err != nil {
+		t.Fatalf("insert charity key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{ChannelID: paidChannel.ID, ChannelName: paidChannel.Name, ChannelType: paidChannel.Type, GroupRef: "paid", GroupName: "paid", Ratio: 0.01, KeyCipher: paidKey, Status: "alive"}); err != nil {
+		t.Fatalf("insert paid key: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	out := rec.Body.String()
+	if paidHits != 1 || charityHits == 0 || !strings.Contains(out, "\"delta\":\"ok\"") || strings.Contains(out, "公益token休息了") {
+		t.Fatalf("intercepted public route was not replaced: charity=%d paid=%d body=%s", charityHits, paidHits, out)
 	}
 }
 func TestBatchDisableGatewayKeysStoresCustomMessage(t *testing.T) {

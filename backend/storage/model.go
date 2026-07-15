@@ -427,7 +427,7 @@ type UpstreamGroupKey struct {
 	UpstreamKeyID    int64      `gorm:"not null;default:0" json:"upstream_key_id"`
 	KeyCipher        string     `gorm:"type:text;not null" json:"-"`
 	Enabled          bool       `gorm:"not null;default:true;index" json:"enabled"`
-	Status           string     `gorm:"size:16;not null;default:'unknown';index" json:"status"`
+	Status           string     `gorm:"size:16;not null;default:'alive';index" json:"status"`
 	ConcurrencyLimit int        `gorm:"not null;default:0" json:"concurrency_limit"`
 	FailureCount     int        `gorm:"not null;default:0" json:"failure_count"`
 	PromptTokens     int64      `gorm:"not null;default:0" json:"prompt_tokens"`

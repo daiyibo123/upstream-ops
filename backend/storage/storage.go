@@ -145,6 +145,22 @@ func AutoMigrate(db *gorm.DB) error {
 	if err := db.Model(&UsageLog{}).Where("status = ?", "estimated").Update("status", "success").Error; err != nil {
 		return fmt.Errorf("normalize estimated usage statuses: %w", err)
 	}
+	// Probe uncertainty must not be presented as a third scheduling state.
+	// Older versions stored such rows as "unknown"; they remain enabled and
+	// will be refreshed by normal health checks, but are immediately eligible
+	// for model-aware routing after upgrade.
+	if err := db.Model(&UpstreamGroupKey{}).Where("status = ?", "unknown").Update("status", "alive").Error; err != nil {
+		return fmt.Errorf("normalize unknown upstream statuses: %w", err)
+	}
+	// Network/TLS/timeout errors describe the probing machine's ability to
+	// reach an upstream at one instant. They are not a stable channel health
+	// state. New health logic retries them and only records a confirmed death;
+	// normalize legacy rows so the UI never presents them as a separate status.
+	if err := db.Model(&UpstreamGroupKey{}).
+		Where("status IN ?", []string{"network_error", "timeout", "upstream_error"}).
+		Updates(map[string]any{"status": "alive", "disabled_until": nil}).Error; err != nil {
+		return fmt.Errorf("normalize transient upstream statuses: %w", err)
+	}
 	return backfillGatewayKeyGroupScopes(db)
 }
 

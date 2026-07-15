@@ -40,9 +40,14 @@ const (
 
 	proxyAttemptTimeout       = 60 * time.Second
 	healthProbeTimeout        = 15 * time.Second
+	healthProbeRunTimeout     = 45 * time.Second
 	healthProbeRetryJitterMax = 3 * time.Second
 	healthTransientAttempts   = 3
 	healthPerChannelParallel  = 1
+	// Some upstream routers rate-limit short probe bursts even when ordinary
+	// user traffic is healthy. Keys at the same API base are already serialized;
+	// leave a small gap before the next key is probed as well.
+	healthProbeUpstreamMinInterval = 500 * time.Millisecond
 	// streamFirstEventTimeout 是"等上游吐出第一个有效 SSE 事件"的最长等待。
 	// Codex / o1 / o3 这类带 reasoning 的请求可能长时间没有可见文本；部分
 	// 中转站还会缓冲 response.created。这里给到 5 分钟，避免在上游仍在推理时
@@ -65,6 +70,7 @@ const (
 	modelSupportPositiveTTL        = 2 * time.Hour
 	modelSupportNegativeTTL        = 15 * time.Minute
 	defaultHealthProbeBatchSize    = 10
+	automaticHealthProbeMaxRatio   = 0.1
 
 	openAIHealthProbePrimaryModel  = "gpt-5.4"
 	openAIHealthProbeFallbackModel = "gpt-5.5"
@@ -314,6 +320,9 @@ type HealthResultItem struct {
 type HealthTestOptions struct {
 	BatchSize int
 	GroupIDs  []uint
+	// MaxRatio applies only to scheduled/background checks. A zero value keeps
+	// explicit one-click and per-channel tests unrestricted.
+	MaxRatio float64
 }
 
 type UpdateGroupKeyInput struct {
@@ -1912,7 +1921,7 @@ func (s *Service) TestAllGroupKeys(ctx context.Context, batchSizes ...int) (*Hea
 	if len(batchSizes) > 0 {
 		batchSize = batchSizes[0]
 	}
-	return s.TestGroupKeys(ctx, HealthTestOptions{BatchSize: batchSize})
+	return s.TestGroupKeys(ctx, HealthTestOptions{BatchSize: batchSize, MaxRatio: automaticHealthProbeMaxRatio})
 }
 
 func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*HealthResult, error) {
@@ -1925,6 +1934,9 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 	// use their own request contracts and remain available through per-group
 	// testing, so they cannot be accidentally probed as an OpenAI model.
 	list = filterOpenAIHealthGroups(list)
+	if opts.MaxRatio > 0 {
+		list = filterHealthGroupsByMaxRatio(list, opts.MaxRatio)
+	}
 	// The probe itself performs the protocol fallback and persists the winning
 	// Responses/Chat mode. Keeping that work inside the one real health request
 	// avoids sending duplicate probes before every batch while still correcting
@@ -2012,7 +2024,10 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 				// slot.  Otherwise a busy same-site queue would make a healthy group
 				// expire before its first HTTP request.
 				releaseChannelSlot := s.acquireHealthProbeUpstreamSlot(list[idx])
-				itemCtx, cancel := context.WithTimeout(probeCtx, 70*time.Second)
+				// Use the same independent deadline as the single-group action.
+				// The timeout begins after this job owns the upstream slot, so batch
+				// scheduling cannot change the meaning of a health result.
+				itemCtx, cancel := context.WithTimeout(probeCtx, healthProbeRunTimeout)
 				item := s.testGroupKeyWithUpstreamSlot(itemCtx, &list[idx])
 				releaseChannelSlot()
 				cancel()
@@ -2040,7 +2055,7 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 
 	for i := range result.Items {
 		if result.Items[i].ID == 0 && i < len(list) {
-			result.Items[i] = healthResultItemFromGroup(&list[i], "unknown")
+			result.Items[i] = healthResultItemFromGroup(&list[i], "alive")
 		}
 		switch result.Items[i].Status {
 		case "alive":
@@ -2185,7 +2200,12 @@ func (s *Service) acquireHealthProbeUpstreamSlot(key storage.UpstreamGroupKey) f
 	actual, _ := s.healthProbeSlots.LoadOrStore(upstream, created)
 	slot := actual.(chan struct{})
 	slot <- struct{}{}
-	return func() { <-slot }
+	return func() {
+		if healthProbeUpstreamMinInterval > 0 {
+			time.Sleep(healthProbeUpstreamMinInterval)
+		}
+		<-slot
+	}
 }
 
 func normalizeHealthProbeBatchSize(size int) int {
@@ -2308,7 +2328,7 @@ func (s *Service) TestGroupKey(id uint) (*HealthResultItem, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), healthProbeRunTimeout)
 	defer cancel()
 	result := s.testGroupKey(ctx, key)
 	return &result, nil
@@ -2318,6 +2338,19 @@ func filterOpenAIHealthGroups(groups []storage.UpstreamGroupKey) []storage.Upstr
 	result := make([]storage.UpstreamGroupKey, 0, len(groups))
 	for _, group := range groups {
 		if normalizeClientFormat(group.ClientFormat) == "openai" {
+			result = append(result, group)
+		}
+	}
+	return result
+}
+
+func filterHealthGroupsByMaxRatio(groups []storage.UpstreamGroupKey, maxRatio float64) []storage.UpstreamGroupKey {
+	if maxRatio <= 0 {
+		return groups
+	}
+	result := make([]storage.UpstreamGroupKey, 0, len(groups))
+	for _, group := range groups {
+		if effectiveGroupRatio(group) <= maxRatio+1e-9 {
 			result = append(result, group)
 		}
 	}
@@ -3116,7 +3149,13 @@ func (s *Service) responseInterceptionNeedles(key *storage.UpstreamGroupKey) []s
 	// not that the user's request is invalid. Handle their common spellings even
 	// without an administrator rule so another healthy route can be tried before
 	// any stream bytes are sent to Codex.
-	needles := []string{"公益token休息了", "公益 token 休息了"}
+	needles := []string{
+		"请求暂时无法完成",
+		"公益token",
+		"公益 token",
+		"公益token休息了",
+		"公益 token 休息了",
+	}
 	for _, rule := range s.appConfig().ResponseInterceptionRules {
 		needle := strings.TrimSpace(rule.Content)
 		if !rule.Enabled || needle == "" {
@@ -3264,7 +3303,7 @@ func upstreamGroupKeyFrom(ch storage.Channel, group connector.APIKeyGroup, group
 		Enabled:               true,
 		ConcurrencyLimit:      0,
 		KeyCipher:             keyCipher,
-		Status:                "unknown",
+		Status:                "alive",
 		FailureCount:          0,
 	}
 }
@@ -3355,15 +3394,19 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 	item.Error = healthProbeAttemptsError(attempts, retriesCompleted, lastErr)
 
 	if healthProbeFailureIsInconclusive(last.status, last.body, last.err, failureStatus) {
-		item.Status = "unknown"
+		// A model/protocol probe mismatch is not evidence that this concrete
+		// key cannot serve real traffic. Keep it eligible; model-aware routing
+		// will avoid it only for models later proven unsupported.
+		item.Status = "alive"
 		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
 		return item
 	}
-	if isManualGroupKey(key) && (failureStatus == "auth_failed" || failureStatus == "forbidden") {
-		// Do not make a manual key unavailable merely because the fixed probe
-		// contract was refused. The first real request still has the one-shot
-		// Bearer/x-api-key fallback and will disable only a genuinely invalid key.
-		item.Status = "unknown"
+	if failureStatus == "rate_limited" {
+		// A one-click probe must not consume the last slot in an upstream rate
+		// window and then label a generally usable channel as limited. Preserve
+		// the diagnostic in last_error, but leave routing to real traffic, where
+		// an actual 429 still applies its normal per-key cooldown.
+		item.Status = "alive"
 		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
 		return item
 	}
@@ -3472,7 +3515,7 @@ func shouldSkipHealthRetry(status string) bool {
 
 // healthProbeFailureIsInconclusive identifies failures caused by a probe's
 // fixed model or wire format. They do not prove that the upstream cannot serve
-// a real user request, so keep the group schedulable as unknown rather than
+// a real user request, so the caller keeps the group alive rather than
 // painting it dead and excluding it from normal routing.
 func healthProbeFailureIsInconclusive(status int, body []byte, err error, classification string) bool {
 	switch classification {
@@ -3502,7 +3545,10 @@ func (s *Service) confirmedHealthFailureStatus(id uint, status string) string {
 	}
 	current, err := s.groupKeys.FindByID(id)
 	if err != nil || current == nil || current.FailureCount+1 < proxyTransientFailureThreshold {
-		return "unknown"
+		// Keep a temporarily failing key schedulable until the configured
+		// repeated-failure threshold is reached; never expose a third state that
+		// makes a healthy sibling key appear untested.
+		return "alive"
 	}
 	return "dead"
 }

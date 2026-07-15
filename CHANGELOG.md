@@ -8,6 +8,16 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.7 - 2026-07-15
+
+### Fixed
+
+- 自动同步/定时测活仅覆盖实际倍率不高于 `0.1` 的 OpenAI 渠道，高倍率渠道不再消耗测活额度。
+- 单独测活与一键测活统一超时、请求协议和认证逻辑；同一上游串行测活并在完整请求之间留出缓冲。
+- 临时网络、超时、测活限流和探针模型不匹配不再显示为渠道状态，连续完整失败后才标记死亡。
+- 手动 Key 的认证失败仅影响当前 Key；历史“未检测”等临时状态升级后自动恢复为可调度状态。
+- 强化流式上游内容拦截：支持“请求暂时无法完成 / 公益 token 休息”等分片错误，并在首字前切换健康线路。
+
 ## v0.24.6 - 2026-07-15
 
 ### Fixed

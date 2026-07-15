@@ -210,7 +210,7 @@ function statusText(status: string) {
     case "disabled":
       return "停用"
     case "unknown":
-      return "未检测"
+      return "存活"
     default:
       return "未知"
   }
