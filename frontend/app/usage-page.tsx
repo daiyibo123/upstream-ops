@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { ChevronLeft, ChevronRight, KeyRound, Loader2, ScrollText, Trash2 } from "lucide-react"
+import { ChevronLeft, ChevronRight, HeartHandshake, KeyRound, Loader2, ScrollText, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -104,6 +104,7 @@ export default function UsagePage() {
         .sort((a, b) => b.total_tokens - a.total_tokens || b.today_tokens - a.today_tokens || a.name.localeCompare(b.name)),
     [keys],
   )
+  const publicKeyIDs = useMemo(() => new Set(keys.filter((key) => key.is_public).map((key) => key.id)), [keys])
 
   async function clearUsageLogs() {
     if (total <= 0 || clearing) return
@@ -256,7 +257,7 @@ export default function UsagePage() {
                   <TableHead className="w-24 text-right">总耗时</TableHead>
                   <TableHead className="w-36 text-right">Token</TableHead>
                   <TableHead className="w-20 text-center">状态</TableHead>
-                  <TableHead className="w-20 text-right">倍率</TableHead>
+                  <TableHead className="w-36">上游 / 倍率</TableHead>
                   <TableHead className="w-32">IP</TableHead>
                 </TableRow>
               </TableHeader>
@@ -313,8 +314,20 @@ export default function UsagePage() {
                           {usageStatusLabel(log.status)}
                         </Badge>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-xs text-foreground">
-                        {log.ratio != null ? formatRatio(log.ratio) : "—"}
+                      <TableCell className="min-w-0 text-xs">
+                        <div className="min-w-0">
+                          <div className="flex min-w-0 items-center gap-1">
+                            <span className="truncate font-medium text-foreground" title={log.channel_name || log.group_name || ""}>
+                              {log.channel_name || log.group_name || "未知上游"}
+                            </span>
+                            {log.gateway_key_id && publicKeyIDs.has(log.gateway_key_id) ? (
+                              <HeartHandshake className="size-3 shrink-0 text-amber-500" aria-label="公益 Key" />
+                            ) : null}
+                          </div>
+                          <span className="mt-0.5 block font-mono text-[10px] text-muted-foreground">
+                            倍率 {log.ratio != null ? formatRatio(log.ratio) : "—"}
+                          </span>
+                        </div>
                       </TableCell>
                       <TableCell className="truncate font-mono text-[11px] text-muted-foreground" title={log.request_ip || ""}>
                         {log.request_ip || "—"}

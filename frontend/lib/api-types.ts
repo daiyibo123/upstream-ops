@@ -619,6 +619,7 @@ export interface UpstreamGroupKey {
   group_name: string
   group_description?: string
   ratio: number
+  ratio_scale_percent?: number
   input_price_per_million?: number
   output_price_per_million?: number
   priority: number

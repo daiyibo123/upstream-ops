@@ -354,6 +354,23 @@ function isOpenAIResponsesGroup(group: UpstreamGroupKey) {
   return isOpenAIHealthGroup(group) && normalizeRequestMode(group.request_mode) === "responses"
 }
 
+function ratioScalePercent(group: UpstreamGroupKey) {
+  const percent = Number(group.ratio_scale_percent ?? 100)
+  return Number.isFinite(percent) && percent > 0 ? percent : 100
+}
+
+function effectiveRatio(group: UpstreamGroupKey) {
+  const ratio = Number(group.ratio ?? 0)
+  const upstreamRatio = Number.isFinite(ratio) && ratio > 0 ? ratio : 1
+  return upstreamRatio * ratioScalePercent(group) / 100
+}
+
+function ratioDetailLabel(group: UpstreamGroupKey) {
+  const percent = ratioScalePercent(group)
+  if (Math.abs(percent - 100) < 0.0001) return ""
+  return `上游 ${formatRatio(group.ratio)} × ${percent}%`
+}
+
 function rateFilterLabel(value: RateFilter) {
   switch (value) {
     case "0-0.05":
@@ -382,7 +399,7 @@ function charityFilterLabel(value: CharityFilter) {
 
 function groupMatchesRateBand(group: UpstreamGroupKey, band: RateFilter) {
   if (band === "all") return true
-  const ratio = Number(group.ratio ?? 0)
+  const ratio = effectiveRatio(group)
   if (!Number.isFinite(ratio)) return false
   switch (band) {
     case "0-0.05":
@@ -416,7 +433,7 @@ function maxGroupRatioLabel(value: MaxGroupRatioLimit | number | string | undefi
 function groupWithinMaxRatio(group: UpstreamGroupKey, limit: MaxGroupRatioLimit) {
   const max = Number(limit)
   if (!Number.isFinite(max) || max <= 0) return true
-  const ratio = Number(group.ratio ?? 0)
+  const ratio = effectiveRatio(group)
   return Number.isFinite(ratio) && ratio <= max + 1e-9
 }
 
@@ -461,7 +478,10 @@ function groupSearchText(group: UpstreamGroupKey) {
     group.group_description,
     group.group_ref,
     group.ratio,
-    formatRatio(group.ratio),
+    group.ratio_scale_percent,
+    effectiveRatio(group),
+    formatRatio(effectiveRatio(group)),
+    ratioDetailLabel(group),
     clientFormatLabel(format),
     format,
     requestModeLabel(group.request_mode),
@@ -545,7 +565,7 @@ function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
   return groups.slice().sort((a, b) => {
     return (
       groupDisplayFormatRank(a) - groupDisplayFormatRank(b) ||
-      a.ratio - b.ratio ||
+      effectiveRatio(a) - effectiveRatio(b) ||
       groupStatusRank(effectiveStatus(a)) - groupStatusRank(effectiveStatus(b)) ||
       (b.priority || 0) - (a.priority || 0) ||
       a.failure_count - b.failure_count ||
@@ -1083,7 +1103,7 @@ function KeyDraftFields({
                           </Badge>
                         </span>
                         <span className="mt-1 block text-muted-foreground">
-                          渠道 {group.channel_name || `#${group.channel_id}`} · 倍率 {formatRatio(group.ratio)} · {upstreamKeyLabel(group)}
+                          渠道 {group.channel_name || `#${group.channel_id}`} · 真实倍率 {formatRatio(effectiveRatio(group))} · {upstreamKeyLabel(group)}
                         </span>
                         <span className="mt-0.5 block text-muted-foreground">
                           优先级 {group.priority || 0} · {channelTypeLabel(group.channel_type)}
@@ -1117,6 +1137,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [visible, setVisible] = useState<Record<number, boolean>>({})
   const [concurrencyDrafts, setConcurrencyDrafts] = useState<Record<number, string>>({})
   const [priorityDrafts, setPriorityDrafts] = useState<Record<number, string>>({})
+  const [ratioScaleDrafts, setRatioScaleDrafts] = useState<Record<number, string>>({})
   const [ipPolicies, setIPPolicies] = useState<IPPolicy[]>([])
   const [ipPolicyDraft, setIPPolicyDraft] = useState<IPPolicyDraft>(() => createDefaultIPPolicyDraft())
   const [healthResults, setHealthResults] = useState<Record<number, GatewayHealthResult["items"][number]>>({})
@@ -1212,6 +1233,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       )
       setPriorityDrafts(
         Object.fromEntries(nextGroups.map((group) => [group.id, String(group.priority || 0)])),
+      )
+      setRatioScaleDrafts(
+        Object.fromEntries(nextGroups.map((group) => [group.id, String(ratioScalePercent(group))])),
       )
     } catch (e) {
       const err = e as Error
@@ -1451,7 +1475,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           channel_name: group.channel_name || "",
           group_ref: group.group_ref,
           group_name: group.group_name,
-          ratio: group.ratio,
+          ratio: effectiveRatio(group),
           status: "queued",
           latency_ms: 0,
         }
@@ -1524,7 +1548,15 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
 
   async function updateGroup(
     group: UpstreamGroupKey,
-    patch: { concurrency_limit?: number; enabled?: boolean; priority?: number; client_format?: string; request_mode?: string; charity?: boolean },
+    patch: {
+      concurrency_limit?: number
+      enabled?: boolean
+      priority?: number
+      client_format?: string
+      request_mode?: string
+      charity?: boolean
+      ratio_scale_percent?: number
+    },
   ) {
     setBusy(`group-${group.id}`)
     try {
@@ -1537,11 +1569,13 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           ...(patch.client_format == null ? {} : { client_format: patch.client_format }),
           ...(patch.request_mode == null ? {} : { request_mode: patch.request_mode }),
           ...(patch.charity == null ? {} : { charity: patch.charity }),
+          ...(patch.ratio_scale_percent == null ? {} : { ratio_scale_percent: patch.ratio_scale_percent }),
         }),
       })
       setGroups((prev) => sortGroupsForDisplay(prev.map((item) => (item.id === updated.id ? updated : item))))
       setConcurrencyDrafts((prev) => ({ ...prev, [group.id]: String(updated.concurrency_limit || 0) }))
       setPriorityDrafts((prev) => ({ ...prev, [group.id]: String(updated.priority || 0) }))
+      setRatioScaleDrafts((prev) => ({ ...prev, [group.id]: String(ratioScalePercent(updated)) }))
       return updated
     } catch (e) {
       const err = e as Error
@@ -1589,6 +1623,15 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     const updated = await updateGroup(group, { concurrency_limit: limit })
     if (updated) {
       toast.success("并发上限已保存")
+    }
+  }
+
+  async function saveRatioScalePercent(group: UpstreamGroupKey) {
+    const raw = ratioScaleDrafts[group.id] ?? String(ratioScalePercent(group))
+    const percent = Math.max(0, Number(raw) || 0)
+    const updated = await updateGroup(group, { ratio_scale_percent: percent })
+    if (updated) {
+      toast.success("倍率折算已保存")
     }
   }
 
@@ -1666,7 +1709,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             {group.group_description || group.group_ref}
           </p>
           <div className="mt-1.5 flex flex-wrap gap-1.5">
-            <Badge variant="outline" className="bg-background">倍率 {formatRatio(group.ratio)}</Badge>
+            <Badge variant="outline" className="bg-background">真实倍率 {formatRatio(effectiveRatio(group))}</Badge>
             <Badge variant="outline" className="bg-background">{requestModeLabel(group.request_mode)}</Badge>
             <Badge variant="outline" className="bg-background">{authModeLabel(group.auth_mode)}</Badge>
             <Badge variant="outline" className="bg-background">{upstreamKeyLabel(group)}</Badge>
@@ -1756,6 +1799,29 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               if (Number(draft) !== (group.concurrency_limit || 0)) void saveConcurrencyLimit(group)
             }}
             placeholder="并发"
+          />
+          <Input
+            value={ratioScaleDrafts[group.id] ?? String(ratioScalePercent(group))}
+            inputMode="decimal"
+            className="h-8 px-2 text-xs"
+            disabled={!!busy}
+            title="倍率折算百分比，真实倍率 = 上游倍率 × 百分比"
+            onChange={(event) =>
+              setRatioScaleDrafts((prev) => ({
+                ...prev,
+                [group.id]: event.target.value.replace(/[^\d.]/g, "").replace(/(\..*)\./g, "$1"),
+              }))
+            }
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur()
+            }}
+            onBlur={() => {
+              const draft = Number(ratioScaleDrafts[group.id] ?? ratioScalePercent(group))
+              if (Number.isFinite(draft) && Math.abs(draft - ratioScalePercent(group)) > 0.0001) {
+                void saveRatioScalePercent(group)
+              }
+            }}
+            placeholder="折算%"
           />
         </div>
 

@@ -8,6 +8,19 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.0 - 2026-07-15
+
+### Fixed
+
+- Fixed the Responses-to-Chat compatibility bridge dropping tool calls. Chat-compatible upstreams now preserve function-call IDs, names and arguments in both streaming events and the final `response.completed` object, so Codex can execute edit, shell and other tools instead of receiving a text-only turn.
+- Tool-only responses no longer receive a fabricated empty message before the function call. Tool and text outputs now retain their actual order and output indexes.
+- Kept the same conversion for non-streaming responses and added regression coverage for streamed and non-streamed tool calls.
+
+### Changed
+
+- Usage details now show the upstream name above the effective ratio. Public gateway Key calls carry a compact公益标识, avoiding a separate crowded ratio-only column.
+- Local usage and effective-ratio scheduling improvements from this release are included in the v0.24.0 release line; gateway and frontend production builds are verified before tagging.
+
 ## v0.23.1 - 2026-07-15
 
 ### Fixed

@@ -297,11 +297,11 @@ func TestProxyConvertsChatCompletionToResponses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load gateway key: %v", err)
 	}
-	if updated.TotalTokens != 5 || updated.TodayTokens != 5 {
-		t.Fatalf("usage not recorded: %#v", updated)
+	if updated.TotalTokens <= 0 || updated.TodayTokens <= 0 {
+		t.Fatalf("locally calculated usage was not recorded: %#v", updated)
 	}
-	if math.Abs(updated.TotalCost-0.000075) > 0.000000001 || math.Abs(updated.TodayCost-0.000075) > 0.000000001 {
-		t.Fatalf("cost = today %.8f total %.8f, want 0.000075", updated.TodayCost, updated.TotalCost)
+	if updated.TotalCost <= 0 || updated.TodayCost <= 0 {
+		t.Fatalf("locally calculated cost was not recorded: today %.8f total %.8f", updated.TodayCost, updated.TotalCost)
 	}
 }
 
@@ -372,6 +372,56 @@ func TestGatewayUsageCostUsesGroupPricesAndRatio(t *testing.T) {
 	})
 	if math.Abs(got-0.00015) > 0.000000001 {
 		t.Fatalf("cost = %.8f, want 0.00015", got)
+	}
+}
+
+func TestGatewayUsageCostUsesBuiltinGPT56PriceAndCacheDiscount(t *testing.T) {
+	got := gatewayUsageCost(usageTokens{
+		Prompt:     1_000_000,
+		Cached:     500_000,
+		Completion: 1_000_000,
+		Total:      2_000_000,
+		Model:      "gpt-5.6-codex",
+	}, &storage.UpstreamGroupKey{
+		Ratio:                 1,
+		InputPricePerMillion:  500,
+		OutputPricePerMillion: 500,
+	})
+	if math.Abs(got-32.75) > 0.000000001 {
+		t.Fatalf("cost = %.8f, want 32.75", got)
+	}
+}
+
+func TestEffectiveGroupRatioAppliesScalePercent(t *testing.T) {
+	got := effectiveGroupRatio(storage.UpstreamGroupKey{Ratio: 0.2, RatioScalePercent: 10})
+	if math.Abs(got-0.02) > 0.000000001 {
+		t.Fatalf("effective ratio = %.8f, want 0.02", got)
+	}
+	if got := effectiveGroupRatio(storage.UpstreamGroupKey{Ratio: 0.2}); math.Abs(got-0.2) > 0.000000001 {
+		t.Fatalf("zero scale should mean 100%% for old rows, got %.8f", got)
+	}
+}
+
+func TestOrderCandidatesUsesEffectiveRatioScale(t *testing.T) {
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Status: "alive", Ratio: 0.05, RatioScalePercent: 100},
+		{ID: 2, Status: "alive", Ratio: 0.2, RatioScalePercent: 10},
+	}
+	ordered := orderCandidates(candidates)
+	if ordered[0].ID != 2 {
+		t.Fatalf("scaled lower effective ratio should win: %#v", ordered)
+	}
+}
+
+func TestGatewayKeyMaxGroupRatioUsesEffectiveRatioScale(t *testing.T) {
+	key := &storage.GatewayKey{MaxGroupRatio: 0.05}
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Status: "alive", Ratio: 0.2, RatioScalePercent: 10},
+		{ID: 2, Status: "alive", Ratio: 0.2, RatioScalePercent: 100},
+	}
+	filtered := filterCandidatesForGatewayKeyRatio(key, candidates)
+	if len(filtered) != 1 || filtered[0].ID != 1 {
+		t.Fatalf("ratio filter should use effective ratio, got %#v", filtered)
 	}
 }
 
@@ -1007,15 +1057,26 @@ func TestOrderCandidatesUsesRuntimeFirstTokenWithinSamePrice(t *testing.T) {
 	}
 }
 
-func TestOrderCandidatesRespectsManualPriorityBeforeRatio(t *testing.T) {
+func TestOrderCandidatesPrefersLowerPaidRatioBeforeManualPriority(t *testing.T) {
 	candidates := []storage.UpstreamGroupKey{
 		{ID: 1, Status: "alive", Ratio: 0.01, Priority: 0},
 		{ID: 2, Status: "alive", Ratio: 1, Priority: 20},
 		{ID: 3, Status: "alive", Ratio: 0.05, Priority: 10},
 	}
 	ordered := orderCandidates(candidates)
-	if ordered[0].ID != 2 || ordered[1].ID != 3 || ordered[2].ID != 1 {
-		t.Fatalf("manual priority should win before ratio: %#v", ordered)
+	if ordered[0].ID != 1 || ordered[1].ID != 3 || ordered[2].ID != 2 {
+		t.Fatalf("lower paid ratio should win before manual priority: %#v", ordered)
+	}
+}
+
+func TestOrderCandidatesUsesActualPaidPriceBeforeRatio(t *testing.T) {
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Status: "alive", Ratio: 0.05, InputPricePerMillion: 40, OutputPricePerMillion: 120},
+		{ID: 2, Status: "alive", Ratio: 0.1, InputPricePerMillion: 2, OutputPricePerMillion: 8},
+	}
+	ordered := orderCandidates(candidates)
+	if ordered[0].ID != 2 {
+		t.Fatalf("lower effective paid price must win even with a higher ratio: %#v", ordered)
 	}
 }
 
@@ -1056,7 +1117,20 @@ func TestOrderCandidatesFallsBackToPaidWhenCharityUnusable(t *testing.T) {
 	}
 }
 
-func TestSoftAffinityKeepsSchedulableStickyCandidate(t *testing.T) {
+func TestGatewayRatioLimitDoesNotFilterCharityCandidate(t *testing.T) {
+	key := &storage.GatewayKey{MaxGroupRatio: 0.05}
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Ratio: 0.5, Charity: true},
+		{ID: 2, Ratio: 0.01, Charity: false},
+		{ID: 3, Ratio: 0.2, Charity: false},
+	}
+	filtered := filterCandidatesForGatewayKeyRatio(key, candidates)
+	if len(filtered) != 2 || filtered[0].ID != 1 || filtered[1].ID != 2 {
+		t.Fatalf("ratio filter must retain charity and low-ratio paid candidates: %#v", filtered)
+	}
+}
+
+func TestSoftAffinityDoesNotBypassSchedulableCharityCandidate(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("s", 32))
 	cheapCharity := storage.UpstreamGroupKey{ID: 1, Status: "alive", Ratio: 0.01, Charity: true}
 	stickyPaid := storage.UpstreamGroupKey{ID: 2, Status: "alive", Ratio: 0.9, Charity: false}
@@ -1064,8 +1138,8 @@ func TestSoftAffinityKeepsSchedulableStickyCandidate(t *testing.T) {
 		t.Fatalf("upsert soft affinity: %v", err)
 	}
 	ordered := env.svc.orderCandidatesForRequest([]storage.UpstreamGroupKey{cheapCharity, stickyPaid}, normalizedRequest{AffinityKey: "chat:stable-context"})
-	if len(ordered) == 0 || ordered[0].ID != stickyPaid.ID {
-		t.Fatalf("soft affinity should keep schedulable sticky candidate to preserve cache, got %#v", ordered)
+	if len(ordered) == 0 || ordered[0].ID != cheapCharity.ID {
+		t.Fatalf("soft affinity must not bypass a healthy charity candidate, got %#v", ordered)
 	}
 }
 
@@ -3364,6 +3438,45 @@ func TestStreamChatAsResponsesEventsConvertsToolCalls(t *testing.T) {
 			t.Fatalf("missing %q in stream:\n%s", want, out)
 		}
 	}
+	completedMarker := "event: response.completed\ndata: "
+	start := strings.Index(out, completedMarker)
+	if start < 0 {
+		t.Fatalf("response.completed event missing: %s", out)
+	}
+	data := out[start+len(completedMarker):]
+	data = data[:strings.Index(data, "\n\n")]
+	var completed map[string]any
+	if err := json.Unmarshal([]byte(data), &completed); err != nil {
+		t.Fatalf("decode completed event: %v\n%s", err, data)
+	}
+	response, _ := completed["response"].(map[string]any)
+	output, _ := response["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("completed output len=%d, want one function call: %#v", len(output), response)
+	}
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "function_call" || item["name"] != "exec" || item["arguments"] != `{"cmd":"ls"}` {
+		t.Fatalf("completed event lost tool call: %#v", item)
+	}
+}
+
+func TestChatToResponsesResponseKeepsToolCalls(t *testing.T) {
+	converted, err := chatToResponsesResponse([]byte(`{"id":"chatcmpl_tool","model":"gpt-test","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_exec","type":"function","function":{"name":"exec","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`))
+	if err != nil {
+		t.Fatalf("convert chat response: %v", err)
+	}
+	var response map[string]any
+	if err := json.Unmarshal(converted, &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	output, _ := response["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output len=%d body=%s", len(output), converted)
+	}
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "function_call" || item["name"] != "exec" || item["arguments"] != `{"cmd":"pwd"}` {
+		t.Fatalf("non-stream conversion lost tool call: %#v", item)
+	}
 }
 
 func TestStreamChatAsResponsesEventsReturnsOnFinishReasonWithoutDone(t *testing.T) {
@@ -4327,6 +4440,42 @@ func TestUsageFromMapExtractsCachedTokens(t *testing.T) {
 	}
 }
 
+func TestUsageFromMapAcceptsCamelCaseCompatibleUsage(t *testing.T) {
+	usage := usageFromMap(map[string]any{
+		"inputTokens":  12,
+		"outputTokens": 8,
+		"totalTokens":  20,
+	})
+	if usage.Prompt != 12 || usage.Completion != 8 || usage.Total != 20 {
+		t.Fatalf("camel-case usage = %#v", usage)
+	}
+}
+
+func TestCalculateLocalUsageDoesNotTrustUpstreamUsage(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("l", 32))
+	usage := usageTokens{Prompt: 5, Completion: 3, Total: 8, Cached: 4, GeneratedText: "generated answer"}
+	env.svc.calculateLocalUsage(&usage, normalizedRequest{Body: []byte(`{"model":"gpt-5.6","input":"hello"}`)}, &storage.UpstreamGroupKey{ID: 1})
+	if usage.Prompt <= 0 || usage.Completion <= 0 || usage.Total != usage.Prompt+usage.Completion || !usage.Estimated || usage.Cached != 0 {
+		t.Fatalf("local usage = %#v", usage)
+	}
+	if usage.Prompt == 5 && usage.Completion == 3 {
+		t.Fatalf("local accounting must replace upstream figures: %#v", usage)
+	}
+}
+
+func TestCalculateLocalUsageCountsGatewayAffinityAsLocalCacheEligible(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("m", 32))
+	cacheKey := "prompt-cache:local-cache-session"
+	if err := env.affinities.Upsert(HashKey(cacheKey), 7, time.Now().Add(time.Hour), time.Now()); err != nil {
+		t.Fatalf("upsert affinity: %v", err)
+	}
+	usage := usageTokens{GeneratedText: "ok"}
+	env.svc.calculateLocalUsage(&usage, normalizedRequest{AffinityKey: cacheKey, Body: []byte(`{"input":"repeatable prompt"}`)}, &storage.UpstreamGroupKey{ID: 7})
+	if usage.Prompt <= 0 || usage.Cached != usage.Prompt {
+		t.Fatalf("local cache eligibility = %#v", usage)
+	}
+}
+
 func TestStreamRawSSEPreservesChatDone(t *testing.T) {
 	body := strings.NewReader("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"pong\"}}]}\n\n" +
 		"data: [DONE]\n\n")
@@ -4573,6 +4722,34 @@ func TestStreamNonSSEAsResponsesEventsWrapsChatJSON(t *testing.T) {
 	}
 	if usage.Prompt != 3 || usage.Completion != 2 || usage.Total != 5 {
 		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestStreamNonSSEAsResponsesEventsKeepsChatToolCall(t *testing.T) {
+	body := []byte(`{"id":"chatcmpl_tool","object":"chat.completion","model":"gpt-test","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_exec","type":"function","function":{"name":"exec","arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}`)
+	rec := httptest.NewRecorder()
+	if _, err := streamNonSSEAsResponsesEvents(rec, http.StatusOK, http.Header{}, body, &storage.UpstreamGroupKey{}, "responses_from_chat"); err != nil {
+		t.Fatalf("wrap non-sse tool response: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "event: response.function_call_arguments.done") || !strings.Contains(out, "event: response.completed") {
+		t.Fatalf("tool events missing from wrapped stream: %s", out)
+	}
+	completedMarker := "event: response.completed\ndata: "
+	data := out[strings.Index(out, completedMarker)+len(completedMarker):]
+	data = data[:strings.Index(data, "\n\n")]
+	var completed map[string]any
+	if err := json.Unmarshal([]byte(data), &completed); err != nil {
+		t.Fatalf("decode completed response: %v", err)
+	}
+	response, _ := completed["response"].(map[string]any)
+	output, _ := response["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output = %#v", response)
+	}
+	item, _ := output[0].(map[string]any)
+	if item["type"] != "function_call" || item["name"] != "exec" || item["arguments"] != `{"cmd":"pwd"}` {
+		t.Fatalf("final output lost tool call: %#v", item)
 	}
 }
 

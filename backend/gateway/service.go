@@ -73,6 +73,15 @@ const (
 
 var errResponsesStreamTerminal = errors.New("responses stream terminal event emitted")
 
+var builtinModelPriceRules = []modelPriceRule{
+	// Keep these values explicit and local so accounting never depends on
+	// upstream-reported usage/cost fields.
+	{Prefix: "gpt-5.4-mini", Price: modelPrice{InputPerMillion: 5, CachedInputPerMillion: 0.5, OutputPerMillion: 30}},
+	{Prefix: "gpt-5.4", Price: modelPrice{InputPerMillion: 5, CachedInputPerMillion: 0.5, OutputPerMillion: 30}},
+	{Prefix: "gpt-5.5", Price: modelPrice{InputPerMillion: 5, CachedInputPerMillion: 0.5, OutputPerMillion: 30}},
+	{Prefix: "gpt-5.6", Price: modelPrice{InputPerMillion: 5, CachedInputPerMillion: 0.5, OutputPerMillion: 30}},
+}
+
 type Service struct {
 	channels         *storage.Channels
 	gateway          *storage.GatewayKeys
@@ -299,13 +308,14 @@ type HealthTestOptions struct {
 }
 
 type UpdateGroupKeyInput struct {
-	ConcurrencyLimit *int    `json:"concurrency_limit"`
-	Enabled          *bool   `json:"enabled"`
-	RequestMode      *string `json:"request_mode"`
-	Priority         *int    `json:"priority"`
-	ClientFormat     *string `json:"client_format"`
-	Charity          *bool   `json:"charity"`
-	Key              *string `json:"key"`
+	ConcurrencyLimit  *int     `json:"concurrency_limit"`
+	Enabled           *bool    `json:"enabled"`
+	RequestMode       *string  `json:"request_mode"`
+	Priority          *int     `json:"priority"`
+	RatioScalePercent *float64 `json:"ratio_scale_percent"`
+	ClientFormat      *string  `json:"client_format"`
+	Charity           *bool    `json:"charity"`
+	Key               *string  `json:"key"`
 }
 
 type normalizedRequest struct {
@@ -325,16 +335,29 @@ type normalizedRequest struct {
 }
 
 type usageTokens struct {
-	Prompt       int64
-	Completion   int64
-	Total        int64
-	Cached       int64
-	Model        string
-	ResponseID   string
-	SoftFailure  string
-	Status       string
-	FirstTokenMS int64
-	DurationMS   int64
+	Prompt        int64
+	Completion    int64
+	Total         int64
+	Cached        int64
+	Model         string
+	ResponseID    string
+	SoftFailure   string
+	Status        string
+	FirstTokenMS  int64
+	DurationMS    int64
+	Estimated     bool
+	GeneratedText string
+}
+
+type modelPrice struct {
+	InputPerMillion       float64
+	CachedInputPerMillion float64
+	OutputPerMillion      float64
+}
+
+type modelPriceRule struct {
+	Prefix string
+	Price  modelPrice
 }
 
 type groupRuntimeState struct {
@@ -644,7 +667,7 @@ func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *stor
 		CompletionTokens: usage.Completion,
 		TotalTokens:      usage.Total,
 		CachedTokens:     usage.Cached,
-		Ratio:            candidate.Ratio,
+		Ratio:            effectiveGroupRatio(*candidate),
 		Status:           usageStatus(usage),
 		FirstTokenMS:     maxInt64(0, usage.FirstTokenMS),
 		DurationMS:       maxInt64(0, usage.DurationMS),
@@ -678,16 +701,62 @@ func gatewayUsageCost(usage usageTokens, candidate *storage.UpstreamGroupKey) fl
 	if promptTokens+completionTokens <= 0 && totalTokens > 0 {
 		promptTokens = totalTokens
 	}
-	inputPrice := candidate.InputPricePerMillion
-	if inputPrice <= 0 {
-		inputPrice = storage.DefaultInputPricePerMillion
+	price := priceForModelOrCandidate(usage.Model, *candidate)
+	inputPrice := price.InputPerMillion
+	cachedInputPrice := price.CachedInputPerMillion
+	outputPrice := price.OutputPerMillion
+	cachedTokens := usage.Cached
+	if cachedTokens < 0 {
+		cachedTokens = 0
 	}
-	outputPrice := candidate.OutputPricePerMillion
-	if outputPrice <= 0 {
-		outputPrice = storage.DefaultOutputPricePerMillion
+	if cachedTokens > promptTokens {
+		cachedTokens = promptTokens
 	}
-	ratio := normalizedRatio(candidate.Ratio)
-	return (float64(promptTokens)*inputPrice + float64(completionTokens)*outputPrice) * ratio / 1_000_000
+	uncachedPromptTokens := promptTokens - cachedTokens
+	ratio := effectiveGroupRatio(*candidate)
+	return (float64(uncachedPromptTokens)*inputPrice + float64(cachedTokens)*cachedInputPrice + float64(completionTokens)*outputPrice) * ratio / 1_000_000
+}
+
+func priceForModelOrCandidate(model string, candidate storage.UpstreamGroupKey) modelPrice {
+	if price, ok := builtinModelPrice(model); ok {
+		return price
+	}
+	input := candidate.InputPricePerMillion
+	if input <= 0 {
+		input = storage.DefaultInputPricePerMillion
+	}
+	output := candidate.OutputPricePerMillion
+	if output <= 0 {
+		output = storage.DefaultOutputPricePerMillion
+	}
+	return modelPrice{InputPerMillion: input, CachedInputPerMillion: input, OutputPerMillion: output}
+}
+
+func builtinModelPrice(model string) (modelPrice, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	if normalized == "" {
+		return modelPrice{}, false
+	}
+	for _, rule := range builtinModelPriceRules {
+		prefix := strings.ToLower(strings.TrimSpace(rule.Prefix))
+		if prefix == "" {
+			continue
+		}
+		if normalized == prefix || strings.HasPrefix(normalized, prefix+"-") || strings.HasPrefix(normalized, prefix+".") {
+			price := rule.Price
+			if price.InputPerMillion <= 0 {
+				price.InputPerMillion = storage.DefaultInputPricePerMillion
+			}
+			if price.OutputPerMillion <= 0 {
+				price.OutputPerMillion = storage.DefaultOutputPricePerMillion
+			}
+			if price.CachedInputPerMillion <= 0 {
+				price.CachedInputPerMillion = price.InputPerMillion
+			}
+			return price, true
+		}
+	}
+	return modelPrice{}, false
 }
 
 func usageStatus(usage usageTokens) string {
@@ -696,6 +765,9 @@ func usageStatus(usage usageTokens) string {
 	}
 	if strings.TrimSpace(usage.SoftFailure) != "" {
 		return "interrupted"
+	}
+	if usage.Estimated {
+		return "estimated"
 	}
 	return "success"
 }
@@ -1159,6 +1231,11 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 			return nil, err
 		}
 	}
+	if input.RatioScalePercent != nil {
+		if err := s.groupKeys.UpdateRatioScalePercent(id, *input.RatioScalePercent); err != nil {
+			return nil, err
+		}
+	}
 	if shouldDetect || keyChanged {
 		ctx, cancel := context.WithTimeout(context.Background(), manualRequestModeDetectTimeout)
 		defer cancel()
@@ -1528,6 +1605,7 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 		GroupName:             groupName,
 		GroupDesc:             strings.TrimSpace(input.GroupDesc),
 		Ratio:                 ratio,
+		RatioScalePercent:     100,
 		InputPricePerMillion:  storage.DefaultInputPricePerMillion,
 		OutputPricePerMillion: storage.DefaultOutputPricePerMillion,
 		Priority:              input.Priority,
@@ -2037,7 +2115,7 @@ func healthResultItemFromGroup(key *storage.UpstreamGroupKey, status string) Hea
 		ChannelName: key.ChannelName,
 		GroupRef:    key.GroupRef,
 		GroupName:   key.GroupName,
-		Ratio:       key.Ratio,
+		Ratio:       effectiveGroupRatio(*key),
 		Status:      status,
 	}
 }
@@ -2609,6 +2687,7 @@ func (s *Service) attemptStream(
 		}
 	}
 	if err == nil {
+		s.calculateLocalUsage(&usage, normalized, candidate)
 		duration := time.Since(start)
 		s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
 		usage.FirstTokenMS = timedWriter.FirstTokenMS()
@@ -2648,6 +2727,7 @@ func (s *Service) attemptStream(
 		timedWriter = &timingResponseWriter{ResponseWriter: w, start: start}
 		retry, usage, err = s.streamProxyCandidate(ctx, fallback, candidate, timedWriter)
 		if err == nil {
+			s.calculateLocalUsage(&usage, normalized, candidate)
 			s.rememberSuccessfulProtocolFallback(candidate, normalized, fallback)
 			duration := time.Since(start)
 			s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
@@ -2673,6 +2753,7 @@ func (s *Service) attemptStream(
 		timedWriter = &timingResponseWriter{ResponseWriter: w, start: start}
 		retry, usage, err = s.streamProxyCandidate(ctx, rectified, candidate, timedWriter)
 		if err == nil {
+			s.calculateLocalUsage(&usage, normalized, candidate)
 			duration := time.Since(start)
 			s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
 			usage.FirstTokenMS = timedWriter.FirstTokenMS()
@@ -2719,6 +2800,8 @@ func (s *Service) attemptNonStream(
 		s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
 		s.recordRuntimeSuccess(candidate.ID, duration, duration)
 		usage := extractUsage(respBody)
+		usage.GeneratedText = generatedTextFromResponse(respBody)
+		s.calculateLocalUsage(&usage, normalized, candidate)
 		usage.FirstTokenMS = duration.Milliseconds()
 		usage.DurationMS = duration.Milliseconds()
 		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
@@ -2738,6 +2821,8 @@ func (s *Service) attemptNonStream(
 			s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
 			s.recordRuntimeSuccess(candidate.ID, duration, duration)
 			usage := extractUsage(respBody)
+			usage.GeneratedText = generatedTextFromResponse(respBody)
+			s.calculateLocalUsage(&usage, normalized, candidate)
 			usage.FirstTokenMS = duration.Milliseconds()
 			usage.DurationMS = duration.Milliseconds()
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
@@ -2760,6 +2845,8 @@ func (s *Service) attemptNonStream(
 			s.rememberCandidateModelCapability(candidate.ID, routingRequestModel(normalized), true)
 			s.recordRuntimeSuccess(candidate.ID, duration, duration)
 			usage := extractUsage(respBody)
+			usage.GeneratedText = generatedTextFromResponse(respBody)
+			s.calculateLocalUsage(&usage, normalized, candidate)
 			usage.FirstTokenMS = duration.Milliseconds()
 			usage.DurationMS = duration.Milliseconds()
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
@@ -2961,6 +3048,7 @@ func upstreamGroupKeyFrom(ch storage.Channel, group connector.APIKeyGroup, group
 		GroupName:             strings.TrimSpace(group.Name),
 		GroupDesc:             strings.TrimSpace(group.Description),
 		Ratio:                 normalizedRatio(group.Ratio),
+		RatioScalePercent:     100,
 		InputPricePerMillion:  storage.DefaultInputPricePerMillion,
 		OutputPricePerMillion: storage.DefaultOutputPricePerMillion,
 		Enabled:               true,
@@ -3006,7 +3094,7 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 		ChannelName: key.ChannelName,
 		GroupRef:    key.GroupRef,
 		GroupName:   key.GroupName,
-		Ratio:       key.Ratio,
+		Ratio:       effectiveGroupRatio(*key),
 	}
 	if !key.Enabled {
 		item.Status = "disabled"
@@ -5107,9 +5195,10 @@ func (s *Service) orderCandidatesForRequest(candidates []storage.UpstreamGroupKe
 			continue
 		}
 		if !hard {
-			// 软亲和：只有目标已经不是健康/未知态时才放弃粘性，回归成本排序。
-			// 价格、倍率、优先级变化不应让一个可用的会话频繁换上游。
-			if statusRank(item.Status) > statusRank("unknown") {
+			// Soft affinity only keeps a paid route warm among paid routes. A
+			// healthy charity route is an explicit first-tier scheduler rule and
+			// must never be bypassed merely because a previous paid request exists.
+			if statusRank(item.Status) > statusRank("unknown") || (!item.Charity && hasSchedulableCharityCandidate(ordered)) {
 				return ordered
 			}
 		}
@@ -5184,11 +5273,14 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
+		if costI, costJ := candidateDispatchCostScore(out[i], requestModel), candidateDispatchCostScore(out[j], requestModel); costI != costJ {
+			return costI < costJ
+		}
+		if ratioI, ratioJ := effectiveGroupRatio(out[i]), effectiveGroupRatio(out[j]); ratioI != ratioJ {
+			return ratioI < ratioJ
+		}
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
-		}
-		if out[i].Ratio != out[j].Ratio {
-			return out[i].Ratio < out[j].Ratio
 		}
 		if out[i].FailureCount != out[j].FailureCount {
 			return out[i].FailureCount < out[j].FailureCount
@@ -5599,11 +5691,14 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
+		if costI, costJ := candidateDispatchCostScore(out[i]), candidateDispatchCostScore(out[j]); costI != costJ {
+			return costI < costJ
+		}
+		if ratioI, ratioJ := effectiveGroupRatio(out[i]), effectiveGroupRatio(out[j]); ratioI != ratioJ {
+			return ratioI < ratioJ
+		}
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
-		}
-		if out[i].Ratio != out[j].Ratio {
-			return out[i].Ratio < out[j].Ratio
 		}
 		if out[i].FailureCount != out[j].FailureCount {
 			return out[i].FailureCount < out[j].FailureCount
@@ -5615,6 +5710,25 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 
 func candidateSchedulable(item storage.UpstreamGroupKey) bool {
 	return statusRank(item.Status) <= statusRank("unknown")
+}
+
+func hasSchedulableCharityCandidate(candidates []storage.UpstreamGroupKey) bool {
+	for _, candidate := range candidates {
+		if candidate.Charity && candidateSchedulable(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+// candidateDispatchCostScore is the local ordering price for paid routes. It
+// uses the configured per-million input/output prices and ratio, independent
+// of whatever a relay reports in a response.  We use equal input/output
+// weights for ordering because the exact output size is unknown before a
+// request; billing itself still uses the exact locally-counted split.
+func candidateDispatchCostScore(candidate storage.UpstreamGroupKey, model ...string) float64 {
+	price := priceForModelOrCandidate(firstNonEmpty(model...), candidate)
+	return (price.InputPerMillion + price.OutputPerMillion) * effectiveGroupRatio(candidate)
 }
 
 func (s *Service) rememberAffinity(request normalizedRequest, responseID string, groupKeyID uint) {
@@ -5758,21 +5872,44 @@ func chatToResponsesResponse(body []byte) ([]byte, error) {
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(id)), "resp") {
 		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
+	output := make([]map[string]any, 0, 2)
+	if text != "" {
+		output = append(output, responsesMessageOutputItem(id, 0, text))
+	}
+	// Chat compatible upstreams put tool calls in message.tool_calls.  Keeping
+	// them only in the transient Chat envelope made Codex treat the converted
+	// response as plain text and skip the tool execution turn.
+	if choices, _ := raw["choices"].([]any); len(choices) > 0 {
+		choice, _ := choices[0].(map[string]any)
+		message, _ := choice["message"].(map[string]any)
+		calls, _ := message["tool_calls"].([]any)
+		for index, value := range calls {
+			call, _ := value.(map[string]any)
+			fn, _ := call["function"].(map[string]any)
+			name := stringValue(fn["name"])
+			if name == "" {
+				continue
+			}
+			callID := stringValue(call["id"])
+			if callID == "" {
+				callID = fmt.Sprintf("call_%s_%d", strings.TrimPrefix(id, "resp_"), index)
+			}
+			output = append(output, responsesFunctionCallOutputItem(id, len(output), callID, name, stringValue(fn["arguments"])))
+		}
+		if legacy, _ := message["function_call"].(map[string]any); legacy != nil && stringValue(legacy["name"]) != "" {
+			output = append(output, responsesFunctionCallOutputItem(id, len(output), "call_"+strings.TrimPrefix(id, "resp_"), stringValue(legacy["name"]), stringValue(legacy["arguments"])))
+		}
+	}
+	if len(output) == 0 {
+		output = append(output, responsesMessageOutputItem(id, 0, ""))
+	}
 	resp := map[string]any{
-		"id":         id,
-		"object":     "response",
-		"created_at": time.Now().Unix(),
-		"model":      model,
-		"status":     "completed",
-		"output": []map[string]any{{
-			"type":   "message",
-			"role":   "assistant",
-			"status": "completed",
-			"content": []map[string]any{{
-				"type": "output_text",
-				"text": text,
-			}},
-		}},
+		"id":          id,
+		"object":      "response",
+		"created_at":  time.Now().Unix(),
+		"model":       model,
+		"status":      "completed",
+		"output":      output,
 		"output_text": text,
 	}
 	if usage, ok := raw["usage"]; ok {
@@ -5798,21 +5935,98 @@ func streamNonSSEAsResponsesEvents(w http.ResponseWriter, status int, header htt
 		}
 	}
 	id, model, text, usage := responsesCompletionPartsFromBody(outBody)
+	output := responsesOutputItemsFromBody(outBody)
 	copyResponseHeaders(w, header, key)
 	setStreamResponseHeaders(w)
 	w.WriteHeader(status)
-	if err := writeResponsesStreamStart(w, id, model); err != nil {
+	if err := writeResponsesCreated(w, id, model); err != nil {
 		return usage, err
 	}
-	if text != "" {
-		if err := writeResponsesTextDelta(w, id, text); err != nil {
-			return usage, err
+	textStarted := false
+	textOutputIndex := 0
+	for outputIndex, item := range output {
+		switch strings.TrimSpace(stringValue(item["type"])) {
+		case "function_call":
+			callID := stringValue(item["call_id"])
+			name := stringValue(item["name"])
+			arguments := stringValue(item["arguments"])
+			if err := writeResponsesFunctionCallAdded(w, id, outputIndex, callID, name); err != nil {
+				return usage, err
+			}
+			if arguments != "" {
+				if err := writeResponsesFunctionCallArgumentsDelta(w, id, outputIndex, callID, arguments); err != nil {
+					return usage, err
+				}
+			}
+			if err := writeResponsesFunctionCallDone(w, id, outputIndex, callID, name, arguments); err != nil {
+				return usage, err
+			}
+		case "message":
+			messageText := responseOutputItemText(item)
+			if err := writeResponsesOutputStartAtIndex(w, id, outputIndex); err != nil {
+				return usage, err
+			}
+			if messageText != "" {
+				if err := writeResponsesTextDeltaAtIndex(w, id, outputIndex, messageText); err != nil {
+					return usage, err
+				}
+			}
+			// Chat-compatible non-SSE replies contain at most one assistant text
+			// item. Preserve its index for the terminal content-part events.
+			if !textStarted {
+				textStarted = true
+				textOutputIndex = outputIndex
+				text = messageText
+			}
 		}
 	}
-	if err := writeResponsesStreamEnd(w, id, model, text, usage); err != nil {
+	if len(output) == 0 {
+		output = []map[string]any{responsesMessageOutputItem(id, 0, text)}
+		textStarted = true
+		textOutputIndex = 0
+		if err := writeResponsesOutputStartAtIndex(w, id, textOutputIndex); err != nil {
+			return usage, err
+		}
+		if text != "" {
+			if err := writeResponsesTextDeltaAtIndex(w, id, textOutputIndex, text); err != nil {
+				return usage, err
+			}
+		}
+	}
+	if err := writeResponsesStreamEndWithOutput(w, id, model, text, usage, textOutputIndex, textStarted, output); err != nil {
 		return usage, err
 	}
 	return usage, nil
+}
+
+func responsesOutputItemsFromBody(body []byte) []map[string]any {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil || raw == nil {
+		return nil
+	}
+	if nested, ok := raw["response"].(map[string]any); ok && nested != nil {
+		raw = nested
+	}
+	values, _ := raw["output"].([]any)
+	items := make([]map[string]any, 0, len(values))
+	for _, value := range values {
+		if item, ok := value.(map[string]any); ok && item != nil {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func responseOutputItemText(item map[string]any) string {
+	content, _ := item["content"].([]any)
+	var text strings.Builder
+	for _, value := range content {
+		part, _ := value.(map[string]any)
+		if part != nil && stringValue(part["type"]) == "output_text" {
+			text.WriteString(stringValue(part["text"]))
+		}
+	}
+	return text.String()
 }
 
 func responsesCompletionPartsFromBody(body []byte) (string, string, string, usageTokens) {
@@ -5829,9 +6043,6 @@ func responsesCompletionPartsFromBody(body []byte) (string, string, string, usag
 	}
 	model := strings.TrimSpace(stringValue(raw["model"]))
 	text := responseText(raw)
-	if text == "" {
-		text = strings.TrimSpace(string(body))
-	}
 	usage := usageTokens{ResponseID: id}
 	if usageRaw, ok := raw["usage"].(map[string]any); ok {
 		usage = usageFromMap(usageRaw)
@@ -5842,18 +6053,18 @@ func responsesCompletionPartsFromBody(body []byte) (string, string, string, usag
 }
 
 func buildResponsesCompletedResponse(id, model, itemID, text string, usage usageTokens) map[string]any {
+	if itemID == "" {
+		itemID = responseItemID(id)
+	}
+	return buildResponsesCompletedResponseWithOutput(id, model, []map[string]any{responsesMessageOutputItemWithID(itemID, text)}, text, usage)
+}
+
+func buildResponsesCompletedResponseWithOutput(id, model string, output []map[string]any, text string, usage usageTokens) map[string]any {
 	if id == "" {
 		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
-	if itemID == "" {
-		itemID = "item_" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	}
-	item := map[string]any{
-		"id":      itemID,
-		"type":    "message",
-		"role":    "assistant",
-		"status":  "completed",
-		"content": []map[string]any{{"type": "output_text", "text": text}},
+	if len(output) == 0 {
+		output = []map[string]any{responsesMessageOutputItem(id, 0, text)}
 	}
 	resp := map[string]any{
 		"id":          id,
@@ -5861,7 +6072,7 @@ func buildResponsesCompletedResponse(id, model, itemID, text string, usage usage
 		"created_at":  time.Now().Unix(),
 		"status":      "completed",
 		"model":       model,
-		"output":      []map[string]any{item},
+		"output":      output,
 		"output_text": text,
 	}
 	if usage.Total > 0 {
@@ -5872,6 +6083,24 @@ func buildResponsesCompletedResponse(id, model, itemID, text string, usage usage
 		}
 	}
 	return resp
+}
+
+func responsesMessageOutputItemWithID(itemID, text string) map[string]any {
+	return map[string]any{
+		"id": itemID, "type": "message", "role": "assistant", "status": "completed",
+		"content": []map[string]any{{"type": "output_text", "text": text}},
+	}
+}
+
+func responsesMessageOutputItem(responseID string, outputIndex int, text string) map[string]any {
+	return responsesMessageOutputItemWithID(responseItemIDForIndex(responseID, outputIndex), text)
+}
+
+func responsesFunctionCallOutputItem(responseID string, outputIndex int, callID, name, arguments string) map[string]any {
+	return map[string]any{
+		"id": responseFunctionItemID(responseID, outputIndex), "type": "function_call", "call_id": callID,
+		"name": name, "arguments": arguments, "status": "completed",
+	}
 }
 
 func writeResponsesStreamStart(w http.ResponseWriter, id, model string) error {
@@ -5900,14 +6129,18 @@ func writeResponsesCreated(w http.ResponseWriter, id, model string) error {
 }
 
 func writeResponsesOutputStart(w http.ResponseWriter, id string) error {
+	return writeResponsesOutputStartAtIndex(w, id, 0)
+}
+
+func writeResponsesOutputStartAtIndex(w http.ResponseWriter, id string, outputIndex int) error {
 	if id == "" {
 		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
-	itemID := responseItemID(id)
+	itemID := responseItemIDForIndex(id, outputIndex)
 	added := map[string]any{
 		"type":         "response.output_item.added",
 		"response_id":  id,
-		"output_index": 0,
+		"output_index": outputIndex,
 		"item": map[string]any{
 			"id":      itemID,
 			"type":    "message",
@@ -5923,7 +6156,7 @@ func writeResponsesOutputStart(w http.ResponseWriter, id string) error {
 		"type":          "response.content_part.added",
 		"response_id":   id,
 		"item_id":       itemID,
-		"output_index":  0,
+		"output_index":  outputIndex,
 		"content_index": 0,
 		"part":          map[string]any{"type": "output_text", "text": ""},
 	}
@@ -5931,11 +6164,15 @@ func writeResponsesOutputStart(w http.ResponseWriter, id string) error {
 }
 
 func writeResponsesTextDelta(w http.ResponseWriter, id, delta string) error {
+	return writeResponsesTextDeltaAtIndex(w, id, 0, delta)
+}
+
+func writeResponsesTextDeltaAtIndex(w http.ResponseWriter, id string, outputIndex int, delta string) error {
 	payload := map[string]any{
 		"type":          "response.output_text.delta",
 		"response_id":   id,
-		"item_id":       responseItemID(id),
-		"output_index":  0,
+		"item_id":       responseItemIDForIndex(id, outputIndex),
+		"output_index":  outputIndex,
 		"content_index": 0,
 		"delta":         delta,
 	}
@@ -6002,48 +6239,33 @@ func writeResponsesFunctionCallDone(w http.ResponseWriter, responseID string, ou
 }
 
 func writeResponsesStreamEnd(w http.ResponseWriter, id, model, text string, usage usageTokens) error {
+	return writeResponsesStreamEndWithOutput(w, id, model, text, usage, 0, true, nil)
+}
+
+// writeResponsesStreamEndWithOutput closes a Responses stream with the exact
+// output items that were emitted.  This matters for tool-only turns: the final
+// response.completed must contain function_call items, not a fabricated empty
+// assistant message.
+func writeResponsesStreamEndWithOutput(w http.ResponseWriter, id, model, text string, usage usageTokens, textOutputIndex int, textStarted bool, output []map[string]any) error {
 	if id == "" {
 		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
-	itemID := responseItemID(id)
-	textDone := map[string]any{
-		"type":          "response.output_text.done",
-		"response_id":   id,
-		"item_id":       itemID,
-		"output_index":  0,
-		"content_index": 0,
-		"text":          text,
+	if textStarted {
+		itemID := responseItemIDForIndex(id, textOutputIndex)
+		textDone := map[string]any{"type": "response.output_text.done", "response_id": id, "item_id": itemID, "output_index": textOutputIndex, "content_index": 0, "text": text}
+		if err := writeSSEEvent(w, sseEvent{Event: "response.output_text.done", Data: mustJSON(textDone)}); err != nil {
+			return err
+		}
+		partDone := map[string]any{"type": "response.content_part.done", "response_id": id, "item_id": itemID, "output_index": textOutputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": text}}
+		if err := writeSSEEvent(w, sseEvent{Event: "response.content_part.done", Data: mustJSON(partDone)}); err != nil {
+			return err
+		}
+		itemDone := map[string]any{"type": "response.output_item.done", "response_id": id, "output_index": textOutputIndex, "item": responsesMessageOutputItemWithID(itemID, text)}
+		if err := writeSSEEvent(w, sseEvent{Event: "response.output_item.done", Data: mustJSON(itemDone)}); err != nil {
+			return err
+		}
 	}
-	if err := writeSSEEvent(w, sseEvent{Event: "response.output_text.done", Data: mustJSON(textDone)}); err != nil {
-		return err
-	}
-	partDone := map[string]any{
-		"type":          "response.content_part.done",
-		"response_id":   id,
-		"item_id":       itemID,
-		"output_index":  0,
-		"content_index": 0,
-		"part":          map[string]any{"type": "output_text", "text": text},
-	}
-	if err := writeSSEEvent(w, sseEvent{Event: "response.content_part.done", Data: mustJSON(partDone)}); err != nil {
-		return err
-	}
-	itemDone := map[string]any{
-		"type":         "response.output_item.done",
-		"response_id":  id,
-		"output_index": 0,
-		"item": map[string]any{
-			"id":      itemID,
-			"type":    "message",
-			"role":    "assistant",
-			"status":  "completed",
-			"content": []map[string]any{{"type": "output_text", "text": text}},
-		},
-	}
-	if err := writeSSEEvent(w, sseEvent{Event: "response.output_item.done", Data: mustJSON(itemDone)}); err != nil {
-		return err
-	}
-	completed := buildResponsesCompletedResponse(id, model, itemID, text, usage)
+	completed := buildResponsesCompletedResponseWithOutput(id, model, output, text, usage)
 	if err := writeSSEEvent(w, sseEvent{Event: "response.completed", Data: mustJSON(map[string]any{"type": "response.completed", "response": completed})}); err != nil {
 		return err
 	}
@@ -6228,10 +6450,18 @@ func streamFailureMessageFromError(err error, fallback string) string {
 }
 
 func responseItemID(responseID string) string {
+	return responseItemIDForIndex(responseID, 0)
+}
+
+func responseItemIDForIndex(responseID string, outputIndex int) string {
 	if responseID == "" {
 		responseID = strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
-	return "item_" + strings.TrimPrefix(responseID, "resp_")
+	base := "item_" + strings.TrimPrefix(responseID, "resp_")
+	if outputIndex <= 0 {
+		return base
+	}
+	return fmt.Sprintf("%s_%d", base, outputIndex)
 }
 
 func responseFunctionItemID(responseID string, outputIndex int) string {
@@ -6362,6 +6592,113 @@ func extractUsage(body []byte) usageTokens {
 	usage.ResponseID = responseID
 	usage.Model = model
 	return usage
+}
+
+// generatedTextFromResponse is used exclusively by local accounting.  It
+// understands both OpenAI Responses and Chat Completions envelopes without
+// trusting either envelope's usage fields.
+func generatedTextFromResponse(body []byte) string {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil {
+		return ""
+	}
+	if text := strings.TrimSpace(stringValue(raw["output_text"])); text != "" {
+		return text
+	}
+	if text := strings.TrimSpace(responseText(raw)); text != "" {
+		return text
+	}
+	return strings.TrimSpace(chatCompletionText(raw))
+}
+
+// calculateLocalUsage deliberately owns the accounting boundary.  Compatible
+// upstreams often omit usage, return incompatible fields, or report a token
+// count for a transformed request.  Charging one caller from those values made
+// the same request cost differently depending on the relay.  Keep only the
+// response metadata collected from upstream; all token and cache figures are
+// calculated from the request and response that passed through this gateway.
+func (s *Service) calculateLocalUsage(usage *usageTokens, request normalizedRequest, candidate *storage.UpstreamGroupKey) {
+	if usage == nil {
+		return
+	}
+	prompt := approximateRequestTokens(request.Body)
+	completion := approximateTokenCount(usage.GeneratedText)
+	usage.Prompt = prompt
+	usage.Completion = completion
+	usage.Total = prompt + completion
+	usage.Cached = 0
+	usage.Estimated = true
+	if model := routingRequestModel(request); model != "" {
+		usage.Model = model
+	}
+
+	// This is a gateway-side cache-eligibility measurement, not a provider
+	// billing claim.  Once a stable conversation/cache key has already been
+	// routed to this same upstream, its prompt is eligible for that provider's
+	// cache.  The calculation remains fully local and works for every relay.
+	if prompt > 0 && candidate != nil && s != nil && s.affinities != nil && request.AffinityKey != "" {
+		if affinity, err := s.affinities.Find(HashKey(request.AffinityKey), time.Now()); err == nil && affinity != nil && affinity.GroupKeyID == candidate.ID {
+			usage.Cached = prompt
+		}
+	}
+}
+
+// approximateRequestTokens counts semantic request values rather than the
+// JSON wire envelope, so model names, transport flags and field names do not
+// inflate a caller's local usage.  It intentionally includes instructions,
+// messages, input and tool schemas because those all form the model context.
+func approximateRequestTokens(body []byte) int64 {
+	var raw any
+	if json.Unmarshal(body, &raw) != nil {
+		return approximateTokenCount(string(body))
+	}
+	var text strings.Builder
+	var walk func(any, string)
+	walk = func(value any, field string) {
+		switch v := value.(type) {
+		case map[string]any:
+			for key, item := range v {
+				switch strings.ToLower(key) {
+				case "model", "stream", "stream_options", "temperature", "top_p", "max_output_tokens", "max_tokens", "n", "seed", "user", "metadata", "store":
+					continue
+				}
+				walk(item, key)
+			}
+		case []any:
+			for _, item := range v {
+				walk(item, field)
+			}
+		case string:
+			if strings.TrimSpace(v) != "" {
+				text.WriteString(v)
+				text.WriteByte('\n')
+			}
+		case json.Number, float64, float32, int, int64, bool:
+			// Tool argument defaults and structured input are also context.
+			text.WriteString(fmt.Sprint(v))
+			text.WriteByte('\n')
+		}
+	}
+	walk(raw, "")
+	return approximateTokenCount(text.String())
+}
+
+func approximateTokenCount(text string) int64 {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	var ascii, nonASCII int64
+	for _, r := range text {
+		if r <= 0x7f {
+			ascii++
+		} else {
+			nonASCII++
+		}
+	}
+	// English-like JSON/text averages about four ASCII characters per token;
+	// non-ASCII characters are counted conservatively as one token each.
+	return maxInt64(1, (ascii+3)/4+nonASCII)
 }
 
 func usageFromSSEData(data string) usageTokens {
@@ -6530,15 +6867,9 @@ func numericValue(value any) (int64, bool) {
 }
 
 func usageFromMap(usageRaw map[string]any) usageTokens {
-	prompt := intField(usageRaw, "prompt_tokens")
-	if prompt == 0 {
-		prompt = intField(usageRaw, "input_tokens")
-	}
-	completion := intField(usageRaw, "completion_tokens")
-	if completion == 0 {
-		completion = intField(usageRaw, "output_tokens")
-	}
-	total := intField(usageRaw, "total_tokens")
+	prompt := firstUsageInt(usageRaw, "prompt_tokens", "input_tokens", "promptTokens", "inputTokens", "input_token_count")
+	completion := firstUsageInt(usageRaw, "completion_tokens", "output_tokens", "completionTokens", "outputTokens", "output_token_count")
+	total := firstUsageInt(usageRaw, "total_tokens", "totalTokens", "total_token_count")
 	if total == 0 {
 		total = prompt + completion
 	}
@@ -6559,6 +6890,15 @@ func usageFromMap(usageRaw map[string]any) usageTokens {
 		cached = prompt
 	}
 	return usageTokens{Prompt: prompt, Completion: completion, Total: total, Cached: cached}
+}
+
+func firstUsageInt(values map[string]any, keys ...string) int64 {
+	for _, key := range keys {
+		if value := intField(values, key); value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func cachedTokensFromUsage(usageRaw map[string]any) int64 {
@@ -6659,7 +6999,10 @@ func streamResponsesAsChat(w http.ResponseWriter, r io.Reader) (usageTokens, err
 func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader) (usageTokens, error) {
 	id := "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	model := ""
-	startSent := false
+	createdSent := false
+	textStarted := false
+	textOutputIndex := -1
+	nextOutputIndex := 0
 	var best usageTokens
 	var textBuf strings.Builder
 	type chatToolCallState struct {
@@ -6673,12 +7016,24 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	toolOrder := make([]int, 0)
 	sawDone := false
 
-	emitStart := func() error {
-		if startSent {
+	emitCreated := func() error {
+		if createdSent {
 			return nil
 		}
-		startSent = true
-		return writeResponsesStreamStart(w, id, model)
+		createdSent = true
+		return writeResponsesCreated(w, id, model)
+	}
+	emitTextStart := func() error {
+		if textStarted {
+			return nil
+		}
+		if err := emitCreated(); err != nil {
+			return err
+		}
+		textOutputIndex = nextOutputIndex
+		nextOutputIndex++
+		textStarted = true
+		return writeResponsesOutputStartAtIndex(w, id, textOutputIndex)
 	}
 	emitToolCalls := func(raw map[string]any) error {
 		choices, _ := raw["choices"].([]any)
@@ -6700,7 +7055,8 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 				idx := int(intField(call, "index"))
 				state, ok := toolCalls[idx]
 				if !ok {
-					state = &chatToolCallState{OutputIndex: idx + 1}
+					state = &chatToolCallState{OutputIndex: nextOutputIndex}
+					nextOutputIndex++
 					toolCalls[idx] = state
 					toolOrder = append(toolOrder, idx)
 				}
@@ -6719,7 +7075,7 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 					continue
 				}
 				if !state.Added {
-					if err := emitStart(); err != nil {
+					if err := emitCreated(); err != nil {
 						return err
 					}
 					if err := writeResponsesFunctionCallAdded(w, id, state.OutputIndex, state.CallID, state.Name); err != nil {
@@ -6762,19 +7118,19 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			if usage := usageFromMap(usageRaw); usage.Total > 0 {
 				usage.ResponseID = firstNonEmpty(usage.ResponseID, best.ResponseID, id)
 				usage.Model = firstNonEmpty(usage.Model, best.Model, model)
+				usage.GeneratedText = best.GeneratedText
 				best = usage
-			}
-		}
-		if _, ok := raw["choices"].([]any); ok {
-			if err := emitStart(); err != nil {
-				return err
 			}
 		}
 		// 从 chat chunk 里取出增量文本。
 		delta := chatChunkDeltaText(raw)
 		if delta != "" {
+			if err := emitTextStart(); err != nil {
+				return err
+			}
 			textBuf.WriteString(delta)
-			if err := writeResponsesTextDelta(w, id, delta); err != nil {
+			best.GeneratedText = textBuf.String()
+			if err := writeResponsesTextDeltaAtIndex(w, id, textOutputIndex, delta); err != nil {
 				return err
 			}
 		}
@@ -6791,7 +7147,7 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	if errors.Is(streamErr, errResponsesStreamTerminal) {
 		streamErr = nil
 	}
-	if err := emitStart(); err != nil {
+	if err := emitCreated(); err != nil {
 		return best, err
 	}
 	if streamErr != nil || !sawDone {
@@ -6815,8 +7171,35 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			return best, err
 		}
 	}
+	outputByIndex := make(map[int]map[string]any, len(toolOrder)+1)
+	if textStarted {
+		outputByIndex[textOutputIndex] = responsesMessageOutputItem(id, textOutputIndex, textBuf.String())
+	}
+	for _, idx := range toolOrder {
+		state := toolCalls[idx]
+		if state != nil && state.Added {
+			outputByIndex[state.OutputIndex] = responsesFunctionCallOutputItem(id, state.OutputIndex, state.CallID, state.Name, state.Args.String())
+		}
+	}
+	if len(outputByIndex) == 0 {
+		// An empty Chat completion is still a valid Responses terminal.  Start a
+		// message only here so a tool-only completion never gets a fake item 0.
+		textOutputIndex = 0
+		textStarted = true
+		nextOutputIndex = 1
+		outputByIndex[textOutputIndex] = responsesMessageOutputItem(id, textOutputIndex, "")
+		if err := writeResponsesOutputStartAtIndex(w, id, textOutputIndex); err != nil {
+			return best, err
+		}
+	}
+	output := make([]map[string]any, 0, len(outputByIndex))
+	for outputIndex := 0; outputIndex < nextOutputIndex; outputIndex++ {
+		if item, ok := outputByIndex[outputIndex]; ok {
+			output = append(output, item)
+		}
+	}
 	// 收尾：补齐 Responses 生命周期终态，保证 Codex 一定能看到 response.completed。
-	if err := writeResponsesStreamEnd(w, id, model, textBuf.String(), best); err != nil {
+	if err := writeResponsesStreamEndWithOutput(w, id, model, textBuf.String(), best, textOutputIndex, textStarted, output); err != nil {
 		return best, err
 	}
 	return best, nil
@@ -6898,6 +7281,7 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 				if usage := usageFromMap(usageRaw); usage.Total > 0 {
 					usage.ResponseID = firstNonEmpty(usage.ResponseID, best.ResponseID, id)
 					usage.Model = firstNonEmpty(usage.Model, best.Model, model)
+					usage.GeneratedText = best.GeneratedText
 					best = usage
 				}
 			}
@@ -6914,6 +7298,7 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			if usage := usageFromMap(usageRaw); usage.Total > 0 {
 				usage.ResponseID = firstNonEmpty(usage.ResponseID, best.ResponseID, id)
 				usage.Model = firstNonEmpty(usage.Model, best.Model, model)
+				usage.GeneratedText = best.GeneratedText
 				best = usage
 			}
 		}
@@ -6930,6 +7315,7 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			}
 			delta, _ := raw["delta"].(string)
 			if delta != "" {
+				best.GeneratedText += delta
 				return writeChatStreamChunk(w, id, model, created, map[string]any{"content": delta}, nil)
 			}
 		}
@@ -7007,6 +7393,7 @@ func streamResponsesAsClaudeEvents(w http.ResponseWriter, buffered []sseEvent, r
 				if usage := usageFromMap(usageRaw); usage.Total > 0 {
 					usage.ResponseID = firstNonEmpty(usage.ResponseID, best.ResponseID, id)
 					usage.Model = firstNonEmpty(usage.Model, best.Model, model)
+					usage.GeneratedText = best.GeneratedText
 					best = usage
 				}
 			}
@@ -7028,6 +7415,7 @@ func streamResponsesAsClaudeEvents(w http.ResponseWriter, buffered []sseEvent, r
 			}
 			delta, _ := raw["delta"].(string)
 			if delta != "" {
+				best.GeneratedText += delta
 				return writeClaudeEvent(w, "content_block_delta", map[string]any{
 					"type":  "content_block_delta",
 					"index": 0,
@@ -7502,6 +7890,7 @@ func sseEventType(ev sseEvent) string {
 func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader, responseMode string) (usageTokens, error) {
 	var best usageTokens
 	if responseMode != "responses" {
+		var textBuf strings.Builder
 		err := readSSEEvents(buffered, reader, func(event, data string) error {
 			usage := usageFromSSEData(data)
 			if usage.ResponseID != "" {
@@ -7513,7 +7902,15 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 			if usage.Total > 0 {
 				usage.ResponseID = firstNonEmpty(usage.ResponseID, best.ResponseID)
 				usage.Model = firstNonEmpty(usage.Model, best.Model)
+				usage.GeneratedText = best.GeneratedText
 				best = usage
+			}
+			var raw map[string]any
+			if json.Unmarshal([]byte(data), &raw) == nil {
+				if delta := chatChunkDeltaText(raw); delta != "" {
+					textBuf.WriteString(delta)
+					best.GeneratedText = textBuf.String()
+				}
 			}
 			return writeSSEEvent(w, sseEvent{Event: event, Data: data})
 		})
@@ -7588,6 +7985,7 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 		if usage := usageFromSSEData(data); usage.Total > 0 {
 			usage.ResponseID = firstNonEmpty(usage.ResponseID, best.ResponseID, respID)
 			usage.Model = firstNonEmpty(usage.Model, best.Model, model)
+			usage.GeneratedText = best.GeneratedText
 			best = usage
 		}
 		if id, m := sseResponseIDAndModel(data); id != "" || m != "" {
@@ -7650,6 +8048,7 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 			}
 			if delta := responseDeltaText(data); delta != "" {
 				textBuf.WriteString(delta)
+				best.GeneratedText = textBuf.String()
 			}
 		case "response.completed", "response.done":
 			if !createdSeen {
@@ -7944,6 +8343,7 @@ func extractStreamUsage(body []byte) usageTokens {
 			if usage := usageFromMap(usageRaw); usage.Total > 0 {
 				usage.ResponseID = firstNonEmpty(usage.ResponseID, best.ResponseID)
 				usage.Model = firstNonEmpty(usage.Model, best.Model)
+				usage.GeneratedText = best.GeneratedText
 				best = usage
 			}
 		}
@@ -7952,6 +8352,7 @@ func extractStreamUsage(body []byte) usageTokens {
 				if usage := usageFromMap(usageRaw); usage.Total > 0 {
 					usage.ResponseID = firstNonEmpty(usage.ResponseID, best.ResponseID)
 					usage.Model = firstNonEmpty(usage.Model, best.Model)
+					usage.GeneratedText = best.GeneratedText
 					best = usage
 				}
 			}
@@ -8281,7 +8682,10 @@ func filterCandidatesForGatewayKeyRatio(key *storage.GatewayKey, candidates []st
 	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
 	maxRatio := key.MaxGroupRatio + 1e-9
 	for _, candidate := range candidates {
-		if candidate.Ratio <= maxRatio {
+		// Public/charity channels are a separate first-tier source.  A maximum
+		// paid-channel ratio must not accidentally filter them out, otherwise a
+		// gateway key configured as "all" silently spends on paid routes first.
+		if candidate.Charity || effectiveGroupRatio(candidate) <= maxRatio {
 			out = append(out, candidate)
 		}
 	}
@@ -9356,7 +9760,7 @@ func copyResponseHeaders(out io.Writer, header http.Header, key *storage.Upstrea
 	}
 	dst.Set("X-UpstreamOps-Channel", key.ChannelName)
 	dst.Set("X-UpstreamOps-Group", key.GroupName)
-	dst.Set("X-UpstreamOps-Ratio", strconv.FormatFloat(key.Ratio, 'f', -1, 64))
+	dst.Set("X-UpstreamOps-Ratio", strconv.FormatFloat(effectiveGroupRatio(*key), 'f', -1, 64))
 }
 
 func cloneHeader(h http.Header) http.Header {
@@ -9647,4 +10051,15 @@ func normalizedRatio(v float64) float64 {
 		return 1
 	}
 	return v
+}
+
+// effectiveGroupRatio is the single ratio source used by display, filtering,
+// scheduling and billing. Existing rows have zero for the newly-added scale
+// column, which intentionally means the backwards-compatible 100%.
+func effectiveGroupRatio(group storage.UpstreamGroupKey) float64 {
+	percent := group.RatioScalePercent
+	if percent <= 0 {
+		percent = 100
+	}
+	return normalizedRatio(group.Ratio) * percent / 100
 }

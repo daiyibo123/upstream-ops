@@ -409,11 +409,14 @@ type UpstreamGroupKey struct {
 	// AuthMode is stored per concrete upstream key. The same URL can accept
 	// different credentials through different headers, so it cannot be kept on
 	// the shared channel record.
-	AuthMode              string  `gorm:"size:16;not null;default:'bearer';index" json:"auth_mode"`
-	GroupRef              string  `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
-	GroupName             string  `gorm:"size:256;not null" json:"group_name"`
-	GroupDesc             string  `gorm:"size:512" json:"group_description,omitempty"`
-	Ratio                 float64 `gorm:"not null;default:1" json:"ratio"`
+	AuthMode  string  `gorm:"size:16;not null;default:'bearer';index" json:"auth_mode"`
+	GroupRef  string  `gorm:"size:128;not null;uniqueIndex:idx_upstream_group_key" json:"group_ref"`
+	GroupName string  `gorm:"size:256;not null" json:"group_name"`
+	GroupDesc string  `gorm:"size:512" json:"group_description,omitempty"`
+	Ratio     float64 `gorm:"not null;default:1" json:"ratio"`
+	// RatioScalePercent converts the upstream-advertised ratio into the real
+	// local consumption ratio.  100 keeps the upstream value unchanged.
+	RatioScalePercent     float64 `gorm:"not null;default:100" json:"ratio_scale_percent"`
 	InputPricePerMillion  float64 `gorm:"not null;default:5" json:"input_price_per_million"`
 	OutputPricePerMillion float64 `gorm:"not null;default:30" json:"output_price_per_million"`
 	Priority              int     `gorm:"not null;default:0;index" json:"priority"`

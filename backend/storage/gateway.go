@@ -262,6 +262,9 @@ func (r *UpstreamGroupKeys) Upsert(key *UpstreamGroupKey) error {
 		existing.GroupName = key.GroupName
 		existing.GroupDesc = key.GroupDesc
 		existing.Ratio = key.Ratio
+		if existing.RatioScalePercent <= 0 {
+			existing.RatioScalePercent = 100
+		}
 		existing.InputPricePerMillion = key.InputPricePerMillion
 		existing.OutputPricePerMillion = key.OutputPricePerMillion
 		if existing.ClientFormat == "" {
@@ -316,6 +319,9 @@ func normalizeGroupKeyPrices(key *UpstreamGroupKey) {
 	}
 	if key.OutputPricePerMillion <= 0 {
 		key.OutputPricePerMillion = DefaultOutputPricePerMillion
+	}
+	if key.RatioScalePercent <= 0 {
+		key.RatioScalePercent = 100
 	}
 }
 
@@ -557,6 +563,16 @@ func (r *UpstreamGroupKeys) UpdatePriority(id uint, priority int) error {
 		priority = 0
 	}
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("priority", priority).Error
+}
+
+func (r *UpstreamGroupKeys) UpdateRatioScalePercent(id uint, percent float64) error {
+	if percent <= 0 {
+		percent = 100
+	}
+	if percent > 10000 {
+		percent = 10000
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("ratio_scale_percent", percent).Error
 }
 
 // UpdateClientFormat 手动纠正某个分组的请求格式（openai / claude）。
