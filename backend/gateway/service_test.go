@@ -2166,8 +2166,15 @@ func TestTestGroupKeysClassifiesCommonProbeFailures(t *testing.T) {
 			if result.Dead != 0 {
 				t.Fatalf("dead = %d, want classified failure not counted as dead; result=%#v", result.Dead, result)
 			}
-			if responseHits != 1 {
-				t.Fatalf("response hits = %d, want no retry for classified failure", responseHits)
+			wantHits := 1
+			// Non-generation responses are retried once with the fallback
+			// health model (gpt-5.5); permanent credential/limit failures are
+			// not retried because another model cannot repair the key.
+			if tc.wantStatus == "non_generation" {
+				wantHits = 2
+			}
+			if responseHits != wantHits {
+				t.Fatalf("response hits = %d, want %d", responseHits, wantHits)
 			}
 		})
 	}

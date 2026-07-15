@@ -66,7 +66,7 @@ const (
 	defaultHealthProbeBatchSize    = 10
 
 	openAIHealthProbePrimaryModel  = "gpt-5.4"
-	openAIHealthProbeFallbackModel = "gpt-4o-mini"
+	openAIHealthProbeFallbackModel = "gpt-5.5"
 	healthProbePrompt              = "1+1="
 	healthProbeMaxOutputTokens     = 16
 )
@@ -3401,7 +3401,7 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 	// instead of /v1/models discovery: model lists are often filtered or stale,
 	// which used to make a healthy channel look dead before the real probe ran.
 	status, body, err := s.healthProbeOpenAIModel(ctx, key, openAIHealthProbePrimaryModel, true)
-	if shouldRetryHealthWithCompatibleModel(body, err) {
+	if shouldTryHealthFallbackModel(status, body, err) {
 		status, body, err = s.healthProbeOpenAIModel(ctx, key, openAIHealthProbeFallbackModel, false)
 	}
 	if shouldFallbackHealthModelDiscovery(status, body, err) {
@@ -3421,6 +3421,21 @@ func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.Upstrea
 		return status, body, latencyMS, fmt.Errorf("upstream returned non-generation payload: %s", truncateBody(body, 240))
 	}
 	return status, body, latencyMS, nil
+}
+
+func shouldTryHealthFallbackModel(status int, body []byte, err error) bool {
+	if healthProbeSucceeded(status, body, err) {
+		return false
+	}
+	classification := healthFailureStatus(status, body, err)
+	switch classification {
+	case "zero_balance", "rate_limited", "forbidden", "auth_failed":
+		// The credential/billing failure applies to the Key, not the model;
+		// trying another model only burns another request and obscures the cause.
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.UpstreamGroupKey, model string, allowCompatibleModelRetry bool) (int, []byte, error) {

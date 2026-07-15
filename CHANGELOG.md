@@ -8,6 +8,15 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.5 - 2026-07-15
+
+### Fixed
+
+- OpenAI health checks now probe `gpt-5.4` first and try `gpt-5.5` only when the first probe fails.
+- Probes use the native Responses input-list shape with low reasoning effort, avoiding false deaths caused by rejected shorthand input.
+- A successful 5.4 probe stops immediately; authentication, 403, rate-limit, and balance failures do not waste a second model probe.
+- Compatibility model discovery remains available only after both primary probes fail, preserving support for relays that advertise other models.
+
 ## v0.24.4 - 2026-07-15
 
 ### Fixed
