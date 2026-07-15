@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/bejix/upstream-ops/backend/channel"
 	"github.com/bejix/upstream-ops/backend/config"
@@ -1383,10 +1384,13 @@ func (s *Service) DetectGroupAuthMode(ctx context.Context, id uint) (*storage.Up
 		candidate := *key
 		candidate.AuthMode = authMode
 		status, body, _, probeErr := s.healthProbeCandidate(probeCtx, &candidate)
-		if !healthProbeSucceeded(status, body, probeErr) {
+		if !healthProbeSucceeded(status, body, probeErr) && !healthProbeProvesProtocolReachable(status, body, probeErr) {
 			continue
 		}
 		if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
+			return nil, err
+		}
+		if err := s.groupKeys.MarkHealthSuccess(key.ID, 0); err != nil {
 			return nil, err
 		}
 		return s.groupKeys.FindByID(key.ID)
@@ -1412,7 +1416,7 @@ func (s *Service) detectOpenAIGroupRequestMode(ctx context.Context, key *storage
 	probeCtx, cancel := context.WithTimeout(ctx, manualRequestModeDetectTimeout)
 	defer cancel()
 	models := []string{openAIHealthProbePrimaryModel, openAIHealthProbeFallbackModel}
-	if detected, ok, err := s.detectOpenAIGroupRequestModeForModels(probeCtx, key, models); err != nil {
+	if detected, ok, err := s.detectOpenAIGroupRequestModeForModels(probeCtx, key, models, false); err != nil {
 		return nil, err
 	} else if ok {
 		return detected, nil
@@ -1429,17 +1433,28 @@ func (s *Service) detectOpenAIGroupRequestMode(ctx context.Context, key *storage
 		if model, _, _, err := s.discoverHealthProbeModel(probeCtx, &candidate); err == nil {
 			before := len(models)
 			models = appendDistinctHealthProbeModel(models, model)
-			if detected, ok, detectErr := s.detectOpenAIGroupRequestModeForModels(probeCtx, &candidate, models[before:]); detectErr != nil {
+			if detected, ok, detectErr := s.detectOpenAIGroupRequestModeForModels(probeCtx, &candidate, models[before:], false); detectErr != nil {
 				return nil, detectErr
 			} else if ok {
 				return detected, nil
 			}
 		}
 	}
+	if detected, ok, detectErr := s.detectOpenAIGroupRequestModeForModels(probeCtx, key, models, true); detectErr != nil {
+		return nil, detectErr
+	} else if ok {
+		return detected, nil
+	}
 	return key, errors.New("could not detect a working responses or chat endpoint for this upstream key")
 }
 
-func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key *storage.UpstreamGroupKey, models []string) (*storage.UpstreamGroupKey, bool, error) {
+func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key *storage.UpstreamGroupKey, models []string, acceptTentative bool) (*storage.UpstreamGroupKey, bool, error) {
+	// A relay can expose a valid authenticated endpoint while rejecting only
+	// the small probe model. Remember that as protocol evidence and use it only
+	// if none of the configured probe models can complete a generation. This
+	// keeps a model-limited but otherwise usable Codex channel schedulable.
+	tentativeMode := ""
+	tentativeAuthMode := ""
 	for _, model := range models {
 		if strings.TrimSpace(model) == "" {
 			continue
@@ -1454,6 +1469,10 @@ func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key
 				candidate.AuthMode = authMode
 				status, _, body, probeErr := s.requestHealthProbeCandidate(ctx, request, &candidate, requestModeDetectionProbeTimeout)
 				if !healthProbeSucceeded(status, body, probeErr) {
+					if tentativeMode == "" && healthProbeProvesProtocolReachable(status, body, probeErr) {
+						tentativeMode = mode
+						tentativeAuthMode = authMode
+					}
 					continue
 				}
 				if err := s.groupKeys.UpdateRequestMode(key.ID, mode); err != nil {
@@ -1462,12 +1481,36 @@ func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key
 				if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
 					return nil, false, err
 				}
+				if err := s.groupKeys.MarkHealthSuccess(key.ID, 0); err != nil {
+					return nil, false, err
+				}
 				detected, err := s.groupKeys.FindByID(key.ID)
 				return detected, true, err
 			}
 		}
 	}
+	if tentativeMode != "" && acceptTentative {
+		if err := s.groupKeys.UpdateRequestMode(key.ID, tentativeMode); err != nil {
+			return nil, false, err
+		}
+		if err := s.groupKeys.UpdateAuthMode(key.ID, tentativeAuthMode); err != nil {
+			return nil, false, err
+		}
+		if err := s.groupKeys.MarkHealthSuccess(key.ID, 0); err != nil {
+			return nil, false, err
+		}
+		detected, err := s.groupKeys.FindByID(key.ID)
+		return detected, true, err
+	}
 	return key, false, nil
+}
+
+func healthProbeProvesProtocolReachable(status int, body []byte, err error) bool {
+	if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+		return false
+	}
+	classification := healthFailureStatus(status, body, err)
+	return classification == "model_error" || classification == "invalid_request"
 }
 
 func appendDistinctHealthProbeModel(models []string, model string) []string {
@@ -1509,6 +1552,9 @@ func (s *Service) detectFixedGroupRequestMode(ctx context.Context, key *storage.
 			return nil, err
 		}
 		if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
+			return nil, err
+		}
+		if err := s.groupKeys.MarkHealthSuccess(key.ID, 0); err != nil {
 			return nil, err
 		}
 		return s.groupKeys.FindByID(key.ID)
@@ -1666,7 +1712,10 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 		Charity:               input.Charity,
 		Enabled:               true,
 		KeyCipher:             cipher,
-		Status:                "unknown",
+		// A protocol probe is a best-effort convenience, not an eligibility
+		// gate. Keep a manually supplied key schedulable even if its provider
+		// blocks probing or only permits the model used by real traffic.
+		Status: "alive",
 	}
 	if err := s.groupKeys.Upsert(rec); err != nil {
 		return nil, fmt.Errorf("保存分组失败: %w", err)
@@ -2386,13 +2435,17 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	if len(candidates) == 0 {
 		return failGatewayRequest(http.StatusServiceUnavailable, "upstream_unavailable", gatewayKeyScopeEmptyMessage(gatewayKey))
 	}
+	requestedModel := routingRequestModel(normalized)
+	candidates = s.filterKnownUnsupportedModelCandidates(candidates, requestedModel)
+	if len(candidates) == 0 {
+		return failGatewayRequest(http.StatusBadRequest, "model_not_supported", fmt.Sprintf("no configured upstream supports requested model %q", requestedModel))
+	}
 	candidates = s.orderCandidatesForRequest(candidates, normalized)
 
 	var errorsSeen []string
 	var saturatedSeen []string
 	var disabledSeen []string
 	modelUnsupportedFailures := 0
-	requestedModel := routingRequestModel(normalized)
 	rememberUnsupportedModel := func(candidate storage.UpstreamGroupKey, errMsg string) {
 		// Provider routers may return “model temporarily unavailable” with an
 		// HTTP 503. That is a transient routing fault, not proof this upstream
@@ -2989,7 +3042,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		// heartbeat before proving this upstream can produce a valid event, the
 		// request is pinned to this candidate and we can no longer fail over to a
 		// healthier charity/low-ratio key without corrupting the Codex stream.
-		buffered, err := preflightSSEStream(reader, resp.Body, streamPreflightTimeout)
+		buffered, err := preflightSSEStream(reader, resp.Body, streamPreflightTimeout, func(events []sseEvent) bool { return s.shouldHoldInterceptionPreflight(key, events) })
 		if err != nil {
 			return true, usageTokens{}, err
 		}
@@ -3048,11 +3101,22 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	return false, usageTokens{}, &GatewayError{Status: resp.StatusCode, Header: header, Body: respBody}
 }
 
-func (s *Service) interceptedResponseContent(key *storage.UpstreamGroupKey, content string) string {
-	content = strings.ToLower(content)
-	if content == "" {
-		return ""
-	}
+func normalizeResponseInterceptionText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, value)
+}
+
+func (s *Service) responseInterceptionNeedles(key *storage.UpstreamGroupKey) []string {
+	// These provider-side messages mean the free/public allocation is resting,
+	// not that the user's request is invalid. Handle their common spellings even
+	// without an administrator rule so another healthy route can be tried before
+	// any stream bytes are sent to Codex.
+	needles := []string{"公益token休息了", "公益 token 休息了"}
 	for _, rule := range s.appConfig().ResponseInterceptionRules {
 		needle := strings.TrimSpace(rule.Content)
 		if !rule.Enabled || needle == "" {
@@ -3061,13 +3125,69 @@ func (s *Service) interceptedResponseContent(key *storage.UpstreamGroupKey, cont
 		if rule.ChannelID != 0 && (key == nil || rule.ChannelID != key.ChannelID) {
 			continue
 		}
-		if strings.Contains(content, strings.ToLower(needle)) {
+		needles = append(needles, needle)
+	}
+	return needles
+}
+
+func (s *Service) interceptedResponseContent(key *storage.UpstreamGroupKey, content string) string {
+	if strings.TrimSpace(content) == "" {
+		return ""
+	}
+	lower := strings.ToLower(content)
+	compact := normalizeResponseInterceptionText(content)
+	for _, needle := range s.responseInterceptionNeedles(key) {
+		needle = strings.TrimSpace(needle)
+		if needle == "" {
+			continue
+		}
+		if strings.Contains(lower, strings.ToLower(needle)) || strings.Contains(compact, normalizeResponseInterceptionText(needle)) {
 			return needle
 		}
 	}
 	return ""
 }
 
+// shouldHoldInterceptionPreflight keeps a stream uncommitted while a visible
+// output prefix could still become an interception rule. This catches errors
+// split across several SSE deltas (for example "公益" + "token" + "休息了")
+// before the first byte is written, so the scheduler may safely choose another
+// compatible upstream instead of leaving Codex with a disconnected stream.
+func (s *Service) shouldHoldInterceptionPreflight(key *storage.UpstreamGroupKey, events []sseEvent) bool {
+	var text strings.Builder
+	for _, event := range events {
+		if message := errorMessageFromJSON([]byte(event.Data)); message != "" {
+			text.WriteString(message)
+		}
+		if delta := responseDeltaText(event.Data); delta != "" {
+			text.WriteString(delta)
+			continue
+		}
+		var raw map[string]any
+		if json.Unmarshal([]byte(event.Data), &raw) == nil {
+			text.WriteString(chatChunkDeltaText(raw))
+		}
+	}
+	value := normalizeResponseInterceptionText(text.String())
+	if value == "" || s.interceptedResponseContent(key, text.String()) != "" {
+		return false
+	}
+	for _, needle := range s.responseInterceptionNeedles(key) {
+		needle = normalizeResponseInterceptionText(needle)
+		if needle == "" {
+			continue
+		}
+		if strings.HasPrefix(needle, value) {
+			return true
+		}
+		for offset := 1; offset < len(value); offset++ {
+			if strings.HasPrefix(needle, value[offset:]) {
+				return true
+			}
+		}
+	}
+	return false
+}
 func (s *Service) createUpstreamKey(ctx context.Context, ch storage.Channel, group connector.APIKeyGroup, groupID *int64) (*storage.UpstreamGroupKey, error) {
 	customKey, err := randomOpenAIKey()
 	if err != nil {
@@ -5384,9 +5504,6 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		if schedI != schedJ {
 			return schedI
 		}
-		if schedI && out[i].Charity != out[j].Charity {
-			return out[i].Charity
-		}
 		if supportI, supportJ := s.candidateModelCapabilityRank(out[i].ID, requestModel), s.candidateModelCapabilityRank(out[j].ID, requestModel); supportI != supportJ {
 			return supportI < supportJ
 		}
@@ -5447,6 +5564,24 @@ func normalizeModelCapabilityKey(model string) string {
 // unsupported (2). Unsupported candidates are retained as a last resort: a
 // model list can be stale, but they no longer add a failed first request after
 // the gateway has already observed their real response for this model.
+// filterKnownUnsupportedModelCandidates removes only channels for which this
+// gateway has already observed a definitive "model unsupported" response.
+// Unknown channels remain eligible so a newly added model can still be used;
+// they are ranked after proven-compatible routes by orderCandidatesWithRuntime.
+func (s *Service) filterKnownUnsupportedModelCandidates(candidates []storage.UpstreamGroupKey, model string) []storage.UpstreamGroupKey {
+	model = normalizeModelCapabilityKey(model)
+	if model == "" {
+		return candidates
+	}
+	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
+	for _, candidate := range candidates {
+		if s.candidateModelCapabilityRank(candidate.ID, model) == 2 {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
+}
 func (s *Service) candidateModelCapabilityRank(candidateID uint, model string) int {
 	model = normalizeModelCapabilityKey(model)
 	if candidateID == 0 || model == "" {
@@ -7758,7 +7893,7 @@ func healthStreamEventReady(ev sseEvent) bool {
 	return false
 }
 
-func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.Duration) ([]sseEvent, error) {
+func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.Duration, hold func([]sseEvent) bool) ([]sseEvent, error) {
 	buffered := make([]sseEvent, 0, 4)
 	totalBytes := 0
 	if timeout <= 0 {
@@ -7791,6 +7926,9 @@ func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.
 		buffered = append(buffered, ev)
 		totalBytes += len(ev.Event) + len(ev.Data)
 		if streamEventReady(ev) {
+			if hold != nil && hold(buffered) {
+				continue
+			}
 			return buffered, nil
 		}
 	}

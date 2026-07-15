@@ -8,6 +8,14 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.6 - 2026-07-15
+
+### Fixed
+
+- 手动渠道新建或更换上游 Key 后保持可调度；自动协议/认证探测失败不再将渠道置为“待复测”。
+- 自动识别会保留模型受限上游已确认的协议和认证头，避免探针模型不匹配误报接口不可用。
+- 调度按请求模型过滤已知不支持的渠道；在兼容候选内按存活、公益优先和实际价格/倍率排序。
+- 流式返回内容拦截支持忽略空白字符，并在首字前处理分片关键词；“公益 token 休息了”会自动切换其他兼容上游。
 ## v0.24.5 - 2026-07-15
 
 ### Fixed

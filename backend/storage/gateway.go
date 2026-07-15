@@ -544,6 +544,10 @@ func normalizeRequestModeSource(source string) string {
 // UpdateManualKey replaces a manually maintained upstream secret. Updating a
 // key is an intentional recovery action, so clear stale failure state and put
 // the group back into scheduling without touching any automatic group record.
+// Protocol detection is advisory only: some otherwise usable upstreams block
+// probe endpoints or expose a model list different from the requested model.
+// A failed probe must never leave a newly replaced manual key stuck in an
+// "unknown" state and excluded from normal routing.
 func (r *UpstreamGroupKeys) UpdateManualKey(id uint, keyCipher string) error {
 	if strings.TrimSpace(keyCipher) == "" {
 		return errors.New("manual key cipher cannot be empty")
@@ -551,7 +555,7 @@ func (r *UpstreamGroupKeys) UpdateManualKey(id uint, keyCipher string) error {
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
 		"key_cipher":     keyCipher,
 		"enabled":        true,
-		"status":         "unknown",
+		"status":         "alive",
 		"failure_count":  0,
 		"disabled_until": nil,
 		"last_error":     "",

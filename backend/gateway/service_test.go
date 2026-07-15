@@ -1038,6 +1038,24 @@ func TestProxyConcurrentRequestsFailOverAndRecordUsage(t *testing.T) {
 	}
 }
 
+func TestOrderCandidatesSkipsKnownUnsupportedCharityModel(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("q", 32))
+	const model = "gpt-5.6"
+	env.svc.rememberCandidateModelCapability(1, model, false)
+	env.svc.rememberCandidateModelCapability(2, model, true)
+	candidates := []storage.UpstreamGroupKey{
+		{ID: 1, Status: "alive", Charity: true, Ratio: 0.01},
+		{ID: 2, Status: "alive", Charity: false, Ratio: 0.2},
+	}
+	eligible := env.svc.filterKnownUnsupportedModelCandidates(candidates, model)
+	if len(eligible) != 1 || eligible[0].ID != 2 {
+		t.Fatalf("eligible candidates = %#v, want supported paid candidate only", eligible)
+	}
+	ordered := env.svc.orderCandidatesWithRuntime(candidates, model)
+	if ordered[0].ID != 2 {
+		t.Fatalf("proven-supported candidate must outrank unsupported charity route: %#v", ordered)
+	}
+}
 func TestOrderCandidatesUsesRuntimeFirstTokenWithinSamePrice(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("i", 32))
 	// Candidate 1 has a longer full response, but it starts producing tokens far
@@ -3568,6 +3586,27 @@ func TestInterceptedResponseContentSupportsGlobalAndChannelRules(t *testing.T) {
 	}
 }
 
+func TestResponseInterceptionHandlesPublicTokenRestAcrossDeltas(t *testing.T) {
+	svc := &Service{}
+	key := &storage.UpstreamGroupKey{ChannelID: 9}
+	if got := svc.interceptedResponseContent(key, "请求暂时无法完成: 公益 token 休息了"); got == "" {
+		t.Fatal("public token rest message must be intercepted despite whitespace")
+	}
+	first := []sseEvent{{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"公益"}`}}
+	if !svc.shouldHoldInterceptionPreflight(key, first) {
+		t.Fatal("interception prefix should keep preflight buffered")
+	}
+	complete := append(first,
+		sseEvent{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"token"}`},
+		sseEvent{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"休息了"}`},
+	)
+	if svc.shouldHoldInterceptionPreflight(key, complete) {
+		t.Fatal("matched interception text should return to caller for retry")
+	}
+	if got := svc.interceptedResponseContent(key, "公益token休息了"); got == "" {
+		t.Fatal("joined delta content must be intercepted")
+	}
+}
 func TestBatchDisableGatewayKeysStoresCustomMessage(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("d", 32))
 	created, err := env.svc.CreateGatewayKey(CreateGatewayKeyInput{Name: "disable-me"})
@@ -3890,6 +3929,53 @@ func TestDetectGroupRequestModeDiscoversAdvertisedModelAfterDefaultProbeMiss(t *
 	}
 }
 
+func TestDetectGroupRequestModeKeepsAuthenticatedModelLimitedEndpointSchedulable(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer sk-model-limited" {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+			return
+		}
+		switch r.URL.Path {
+		case "/v1/responses":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"type":"invalid_request_error","code":"model_not_found","message":"the requested probe model is not supported"}}`))
+		case "/v1/chat/completions":
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("m", 32))
+	channel := &storage.Channel{Name: "model-limited", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-model-limited")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	group := &storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type,
+		ClientFormat: "openai", RequestMode: "responses", RequestModeSource: "auto", AuthMode: "bearer",
+		GroupRef: "manual:model-limited", GroupName: "model-limited", Ratio: 1, KeyCipher: cipher, Status: "unknown",
+	}
+	if err := env.groupKeys.Upsert(group); err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+
+	detected, err := env.svc.DetectGroupRequestMode(context.Background(), group.ID)
+	if err != nil {
+		t.Fatalf("detect request mode: %v", err)
+	}
+	if detected.RequestMode != "responses" || detected.AuthMode != "bearer" || detected.Status != "alive" {
+		t.Fatalf("detected model-limited endpoint = %#v", detected)
+	}
+}
+
 func TestDetectGroupRequestModeUsesNativeClaudeMessages(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/messages" {
@@ -4009,7 +4095,7 @@ func TestUpdateGroupKeyReplacesManualKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replace manual key: %v", err)
 	}
-	if !updated.Enabled || updated.Status != "unknown" || updated.FailureCount != 0 {
+	if !updated.Enabled || updated.Status != "alive" || updated.FailureCount != 0 {
 		t.Fatalf("manual key replacement did not reset scheduler state: %#v", updated)
 	}
 	revealed, err := env.svc.RevealManualGroupKey(group.ID)
@@ -4065,6 +4151,9 @@ func TestReplacingManualKeyRedetectsAuthenticationHeader(t *testing.T) {
 	}
 	if updated.AuthMode != "x_api_key" {
 		t.Fatalf("auth mode after replacement = %q, want x_api_key", updated.AuthMode)
+	}
+	if updated.Status != "alive" {
+		t.Fatalf("status after successful replacement detection = %q, want alive", updated.Status)
 	}
 }
 
@@ -4914,7 +5003,7 @@ func TestPreflightSSEStreamRejectsLifecycleOnlyEOFForSafeFailover(t *testing.T) 
 		"event: response.in_progress\n" +
 		"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_lifecycle\",\"status\":\"in_progress\"}}\n\n"))
 	defer body.Close()
-	if _, err := preflightSSEStream(newSSEStreamReader(body), body, time.Second); err == nil || !strings.Contains(err.Error(), "usable generation") {
+	if _, err := preflightSSEStream(newSSEStreamReader(body), body, time.Second, nil); err == nil || !strings.Contains(err.Error(), "usable generation") {
 		t.Fatalf("lifecycle-only EOF must remain eligible for failover, err=%v", err)
 	}
 }

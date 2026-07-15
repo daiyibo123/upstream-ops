@@ -59,7 +59,7 @@ type UpstreamRequestMode = "responses" | "chat" | "messages"
 type GroupFormatFilter = "all" | ColumnClientFormat
 type RateFilter = "all" | "0-0.05" | "0.06-0.1" | "0.1-0.2" | "0.2+"
 type CharityFilter = "all" | "charity" | "normal"
-type GroupStatusFilter = "all" | "alive" | "dead" | "unknown" | "zero_balance" | "rate_limited" | "forbidden"
+type GroupStatusFilter = "all" | "alive" | "dead" | "zero_balance" | "rate_limited" | "forbidden"
 type MaxGroupRatioLimit = "0" | "0.05" | "0.1"
 
 interface GroupFilters {
@@ -210,7 +210,7 @@ function statusText(status: string) {
     case "disabled":
       return "停用"
     case "unknown":
-      return "待复测"
+      return "未检测"
     default:
       return "未知"
   }
@@ -2412,7 +2412,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <SelectItem value="all">全部状态</SelectItem>
                     <SelectItem value="alive">存活</SelectItem>
                     <SelectItem value="dead">死亡</SelectItem>
-                    <SelectItem value="unknown">待复测</SelectItem>
                     <SelectItem value="zero_balance">零余额</SelectItem>
                     <SelectItem value="rate_limited">限流</SelectItem>
                     <SelectItem value="forbidden">403</SelectItem>
