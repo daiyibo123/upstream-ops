@@ -145,10 +145,10 @@ func handleSystemUpdate(c *gin.Context) {
 	runner, err := resolveSystemUpdateRunner()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"status":  "unsupported",
+			"status": "unsupported",
 			// apiFetch renders `error` for failed HTTP requests. Returning it
 			// keeps the setup problem actionable instead of showing only HTTP 400.
-			"error":    err.Error(),
+			"error":   err.Error(),
 			"message": err.Error(),
 			"command": "docker compose pull && docker compose up -d app",
 		})
@@ -236,7 +236,7 @@ func runShellCommand(ctx context.Context, command string) error {
 }
 
 func buildVersionResponse(ctx context.Context, d *Deps, force bool) versionResponse {
-	app := config.AppConfig{Title: "UpstreamOps"}
+	app := config.AppConfig{Title: "AI Gateway"}
 	proxyCfg := config.ProxyConfig{}
 	if d != nil && d.Runtime != nil {
 		if cfg, err := config.LoadFile(d.Runtime.ConfigPath()); err == nil {

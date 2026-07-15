@@ -234,7 +234,7 @@ func orderUpstreamGroupKeys(q *gorm.DB, table string) *gorm.DB {
 // panel even for groups created before ChannelURL was added to the model.
 func groupKeysWithChannelSource(q *gorm.DB) *gorm.DB {
 	return q.Model(&UpstreamGroupKey{}).
-		Select("upstream_group_keys.*, channels.site_url AS channel_url").
+		Select("upstream_group_keys.*, channels.name AS channel_name, channels.site_url AS channel_url").
 		Joins("LEFT JOIN channels ON channels.id = upstream_group_keys.channel_id")
 }
 
@@ -339,7 +339,7 @@ func (r *UpstreamGroupKeys) ListPage(limit, offset int, search string) ([]Upstre
 	q := groupKeysWithChannelSource(r.db)
 	if search = strings.TrimSpace(search); search != "" {
 		like := "%" + strings.ToLower(search) + "%"
-		q = q.Where(`LOWER(channel_name) LIKE ? OR LOWER(group_name) LIKE ? OR LOWER(group_desc) LIKE ? OR LOWER(group_ref) LIKE ?`, like, like, like, like)
+		q = q.Where(`LOWER(upstream_group_keys.channel_name) LIKE ? OR LOWER(channels.name) LIKE ? OR LOWER(channels.site_url) LIKE ? OR LOWER(upstream_group_keys.channel_url) LIKE ? OR LOWER(group_name) LIKE ? OR LOWER(group_desc) LIKE ? OR LOWER(group_ref) LIKE ?`, like, like, like, like, like, like, like)
 	}
 	var total int64
 	if err := q.Count(&total).Error; err != nil {

@@ -346,6 +346,7 @@ type GatewayKey struct {
 	KeyHash              string     `gorm:"size:64;not null;uniqueIndex" json:"-"`
 	KeyCipher            string     `gorm:"type:text;not null" json:"-"`
 	Enabled              bool       `gorm:"not null;default:true" json:"enabled"`
+	DisabledMessage      string     `gorm:"type:text" json:"disabled_message,omitempty"`
 	ClientFormat         string     `gorm:"size:16;not null;default:'openai'" json:"client_format"`
 	AllowedGroupScope    string     `gorm:"size:16;not null;default:'all';index" json:"allowed_group_scope"`
 	AllowedGroupIDs      string     `gorm:"type:text" json:"allowed_group_ids,omitempty"`

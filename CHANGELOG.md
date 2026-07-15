@@ -8,6 +8,23 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.1 - 2026-07-15
+
+### Added
+
+- Added global and per-channel upstream response-content interception. A matching pre-output response is retried twice on the same upstream, then safely fails over to another channel without replaying content already delivered to the client.
+- Added batch Gateway Key disabling with a custom Responses-compatible message that Codex can display directly on subsequent requests.
+
+### Fixed
+
+- Available-channel search now matches the current channel name, website/API URL, stored channel URL, group name, description and reference using fuzzy matching.
+- Application branding is now sourced from System Settings. Hard-coded product branding was removed from the UI, backend defaults, generated upstream Key names, diagnostic headers and notification email content.
+
+### Changed
+
+- Redesigned notification email HTML with a clearer responsive layout, stronger contrast and application-title branding.
+- Kept content interception inside the existing stream preflight window, so normal requests gain no extra buffering or first-token delay. Existing health-check batching, per-provider probing and sticky low-cost scheduling behavior remain covered by the full test suite.
+
 ## v0.24.0 - 2026-07-15
 
 ### Fixed

@@ -230,7 +230,7 @@ export default function HomePage() {
   const [publicPasswordVisible, setPublicPasswordVisible] = useState(false)
 	const [cheapestRotation, setCheapestRotation] = useState(0)
 	const [cheapestRotationTransition, setCheapestRotationTransition] = useState(true)
-  const appTitle = summary?.title?.trim() || "UpstreamOps"
+  const appTitle = summary?.title?.trim() || "AI Gateway"
 
   useEffect(() => {
     document.title = appTitle

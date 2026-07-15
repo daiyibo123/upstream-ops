@@ -1,5 +1,5 @@
 /**
- * API response shapes for UpstreamOps backend.
+ * API response shapes for the gateway backend.
  * Keep in sync with backend/storage/*.go and backend/api/*.go.
  */
 
@@ -304,7 +304,14 @@ export interface AppConfig {
   title: string
   notificationPrefix: string
 	homepageCheapestEnabled: boolean
+	responseInterceptionRules?: ResponseInterceptionRule[]
   publicKey: SystemPublicKeyConfig
+}
+
+export interface ResponseInterceptionRule {
+  enabled: boolean
+  channelId: number
+  content: string
 }
 
 export interface SystemSchedulerRetentionConfig {
@@ -532,6 +539,7 @@ export interface GatewayKey {
   key_prefix: string
   key?: string
   enabled: boolean
+  disabled_message?: string
   client_format: "openai" | "claude" | "grok" | "any" | string
   allowed_group_scope?: "all" | "selected" | "charity" | "normal" | string
   allowed_group_ids?: number[]

@@ -44,7 +44,7 @@ func main() {
 	resolvedConfigPath := config.ResolvePath(*configPath, usedConfigPath)
 
 	log := logger.New(cfg.Log.Level, cfg.Log.Format)
-	log.Info("starting UpstreamOps", "port", cfg.Server.Port, "mode", cfg.Server.Mode)
+	log.Info("starting application", "title", cfg.App.Title, "port", cfg.Server.Port, "mode", cfg.Server.Mode)
 
 	if _, err := os.Stat(resolvedConfigPath); errors.Is(err, os.ErrNotExist) {
 		if err := config.Save(resolvedConfigPath, cfg); err != nil {
@@ -108,6 +108,7 @@ func main() {
 	channelSvc.UpdateProxyConfig(cfg.Proxy)
 	channelSvc.UpdateUpstreamConfig(cfg.Upstream)
 	dispatcher := notify.NewDispatcher(notifies, cipher, log, notify.Policy{
+		AppTitle:                                 cfg.App.Title,
 		NotificationPrefix:                       cfg.App.NotificationPrefix,
 		BatchRateChanges:                         cfg.Notifications.BatchRateChanges,
 		MinChangePct:                             cfg.Notifications.MinChangePct,
@@ -123,6 +124,7 @@ func main() {
 	monitorSvc := monitor.NewService(channels, announcements, rates, monLogs, channelSvc, dispatcher, log)
 	gatewaySvc := gateway.NewService(channels, gatewayKeys, gatewayAffinities, upstreamGroupKeys, cipher, channelSvc, log)
 	gatewaySvc.UpdateUpstreamConfig(cfg.Upstream)
+	gatewaySvc.UpdateAppConfig(cfg.App)
 	usageLogs := storage.NewUsageLogs(db)
 	gatewaySvc.SetUsageLogs(usageLogs)
 	gatewaySvc.SetIPPolicies(storage.NewIPPolicies(db))

@@ -95,6 +95,19 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": key})
 	})
+	gp.POST("/keys/batch-disable", func(c *gin.Context) {
+		var in gatewaySvc.BatchDisableGatewayKeysInput
+		if err := c.ShouldBindJSON(&in); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		items, err := d.Gateway.BatchDisableGatewayKeys(in)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": items})
+	})
 	gp.PATCH("/keys/:id", func(c *gin.Context) {
 		id, err := uintParam(c, "id")
 		if err != nil {

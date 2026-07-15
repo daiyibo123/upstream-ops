@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -338,7 +339,9 @@ func (d *Dispatcher) applyProxy(ch *storage.NotificationChannel, n Notifier) err
 }
 
 func (d *Dispatcher) withNotificationPrefix(msg Message) Message {
-	prefix := d.Policy().NotificationPrefix
+	policy := d.Policy()
+	msg.AppTitle = strings.TrimSpace(policy.AppTitle)
+	prefix := policy.NotificationPrefix
 	if prefix == "" || msg.Subject == "" {
 		return msg
 	}

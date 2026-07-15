@@ -16,6 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import {
   Select,
@@ -45,6 +46,7 @@ import type {
   GatewayKeyReveal,
   IPPolicy,
   UpstreamGroupKey,
+  ResponseInterceptionRule,
 } from "@/lib/api-types"
 
 const TOKEN_M = 1_000_000
@@ -1148,6 +1150,12 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [groupPageSize, setGroupPageSize] = useState(10)
   const [keySearch, setKeySearch] = useState("")
   const [manualGroupDialogOpen, setManualGroupDialogOpen] = useState(false)
+  const [interceptionOpen, setInterceptionOpen] = useState(false)
+  const [interceptionRules, setInterceptionRules] = useState<ResponseInterceptionRule[]>([])
+  const [interceptionDraft, setInterceptionDraft] = useState<ResponseInterceptionRule>({ enabled: true, channelId: 0, content: "" })
+  const [selectedKeyIDs, setSelectedKeyIDs] = useState<number[]>([])
+  const [disableMessage, setDisableMessage] = useState("此调用 Key 已停用，请联系管理员。")
+  const [disableOpen, setDisableOpen] = useState(false)
 
   const displayKeys = useMemo(
     () => keys.filter(isOpenAIGatewayKey),
@@ -1242,6 +1250,38 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       toast.error(err.message || "加载调度网关失败")
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function loadInterceptionRules() {
+    try {
+      const rules = await apiFetch<ResponseInterceptionRule[]>("/settings/response-interception")
+      setInterceptionRules(Array.isArray(rules) ? rules : [])
+    } catch (error) {
+      toast.error((error as Error).message || "加载拦截规则失败")
+    }
+  }
+
+  async function saveInterceptionRules(next: ResponseInterceptionRule[]) {
+    try {
+      const saved = await apiFetch<ResponseInterceptionRule[]>("/settings/response-interception", { method: "PUT", body: JSON.stringify(next) })
+      setInterceptionRules(saved)
+      toast.success("上游内容拦截规则已保存")
+    } catch (error) {
+      toast.error((error as Error).message || "保存拦截规则失败")
+    }
+  }
+
+  async function batchDisableKeys() {
+    if (selectedKeyIDs.length === 0) return toast.error("请先选择要停用的 Key")
+    try {
+      await apiFetch<GatewayKey[]>("/gateway/keys/batch-disable", { method: "POST", body: JSON.stringify({ ids: selectedKeyIDs, message: disableMessage }) })
+      setSelectedKeyIDs([])
+      setDisableOpen(false)
+      await load()
+      toast.success("已批量停用调用 Key")
+    } catch (error) {
+      toast.error((error as Error).message || "批量停用失败")
     }
   }
 
@@ -1965,10 +2005,16 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 <p className="text-xs font-medium text-foreground">已有调用 Key</p>
                 <span className="text-[11px] text-muted-foreground">OpenAI Bearer Key · {filteredKeys.length}/{displayKeys.length} 个</span>
               </div>
-              <Button size="sm" className="h-8 gap-1.5 text-xs" disabled={!!busy} onClick={() => setCreateOpen(true)}>
-                <KeyRound className="size-3.5" />
-                创建调用 Key
-              </Button>
+              <div className="flex gap-2">
+                <Button size="sm" variant="outline" className="h-8 gap-1.5 text-xs" disabled={!!busy} onClick={() => setDisableOpen(true)}>
+                  <XCircle className="size-3.5" />
+                  批量停用
+                </Button>
+                <Button size="sm" className="h-8 gap-1.5 text-xs" disabled={!!busy} onClick={() => setCreateOpen(true)}>
+                  <KeyRound className="size-3.5" />
+                  创建调用 Key
+                </Button>
+              </div>
             </div>
             <div className="mb-3 max-w-sm">
               <Input
@@ -1987,6 +2033,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 <Table className="min-w-[880px]">
                   <TableHeader>
                     <TableRow>
+                      <TableHead className="w-10"></TableHead>
                       <TableHead className="w-44">名称</TableHead>
                       <TableHead>密钥</TableHead>
                       <TableHead className="hidden lg:table-cell">绑定分组</TableHead>
@@ -2000,6 +2047,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                   <TableBody>
                     {filteredKeys.map((key) => (
                       <TableRow key={key.id}>
+                        <TableCell>
+                          <Checkbox checked={selectedKeyIDs.includes(key.id)} onCheckedChange={(checked) => setSelectedKeyIDs((prev) => checked === true ? [...new Set([...prev, key.id])] : prev.filter((id) => id !== key.id))} />
+                        </TableCell>
                         <TableCell>
                           <div className="min-w-0">
                             <p className="truncate text-xs font-medium text-foreground">{key.name}</p>
@@ -2233,6 +2283,18 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </div>
         ) : null}
 
+        {showKeys ? (
+          <div className="rounded-md border border-border bg-muted/10 p-3">
+            <p className="text-xs font-medium text-foreground">调用 Key 批量停用与固定回复</p>
+            <p className="mt-1 text-[11px] text-muted-foreground">在上方勾选多个 Key 后停用；再次请求时会以 Codex 可直接展示的 Responses 内容返回自定义提示。</p>
+            <Textarea className="mt-3 min-h-20 text-xs" value={disableMessage} onChange={(event) => setDisableMessage(event.target.value)} placeholder="例如：该 Key 已停止服务，请联系管理员。" />
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <span className="text-[11px] text-muted-foreground">已选择 {selectedKeyIDs.length} 个 Key</span>
+              <Button size="sm" variant="destructive" disabled={selectedKeyIDs.length === 0} onClick={() => void batchDisableKeys()}>停用所选 Key</Button>
+            </div>
+          </div>
+        ) : null}
+
         {showGroups ? (
           <>
             <div className="rounded-md border border-border bg-muted/10 p-3">
@@ -2246,6 +2308,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 <Badge variant="outline" className="border-border bg-background text-muted-foreground">
                   命中 {filteredGroups.length}/{totalGroups}
                 </Badge>
+                <Button size="sm" variant="outline" className="h-8 text-xs" onClick={() => { void loadInterceptionRules(); setInterceptionOpen(true) }}>
+                  上游内容拦截
+                </Button>
               </div>
               <div className="grid gap-2 lg:grid-cols-[minmax(220px,1.4fr)_0.8fr_0.8fr_0.8fr_0.8fr_auto]">
                 <div className="relative">
@@ -2418,6 +2483,47 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </>
         ) : null}
       </CardContent>
+
+      <Dialog open={interceptionOpen} onOpenChange={setInterceptionOpen}>
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>上游返回内容拦截</DialogTitle>
+            <DialogDescription>命中内容时，同一渠道最多重新请求两次；仍命中后自动切换下一个可用渠道。仅在流内容写给客户端前执行，避免重复回答。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="grid gap-2 sm:grid-cols-[180px_1fr_auto]">
+              <Select value={String(interceptionDraft.channelId)} onValueChange={(value) => setInterceptionDraft((prev) => ({ ...prev, channelId: Number(value) }))}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="0">全局拦截</SelectItem>
+                  {[...new Map(groups.map((group) => [group.channel_id, group.channel_name || `渠道 #${group.channel_id}`])).entries()].map(([id, name]) => <SelectItem key={id} value={String(id)}>{name}</SelectItem>)}
+                </SelectContent>
+              </Select>
+              <Input value={interceptionDraft.content} onChange={(event) => setInterceptionDraft((prev) => ({ ...prev, content: event.target.value }))} placeholder="需要拦截的返回内容，支持模糊包含匹配" />
+              <Button onClick={() => { const content = interceptionDraft.content.trim(); if (!content) return; const next = [...interceptionRules, { ...interceptionDraft, content }]; void saveInterceptionRules(next); setInterceptionDraft({ enabled: true, channelId: 0, content: "" }) }}>添加</Button>
+            </div>
+            <div className="max-h-72 space-y-2 overflow-y-auto">
+              {interceptionRules.length === 0 ? <p className="rounded-md border border-dashed p-6 text-center text-xs text-muted-foreground">暂无拦截规则</p> : interceptionRules.map((rule, index) => (
+                <div key={`${rule.channelId}-${rule.content}-${index}`} className="flex items-center gap-2 rounded-md border bg-muted/20 p-2">
+                  <Switch checked={rule.enabled} onCheckedChange={(checked) => { const next = interceptionRules.map((item, i) => i === index ? { ...item, enabled: checked } : item); void saveInterceptionRules(next) }} />
+                  <Badge variant="outline">{rule.channelId === 0 ? "全局" : groups.find((group) => group.channel_id === rule.channelId)?.channel_name || `渠道 #${rule.channelId}`}</Badge>
+                  <span className="min-w-0 flex-1 truncate text-xs" title={rule.content}>{rule.content}</span>
+                  <Button size="icon-sm" variant="ghost" className="text-destructive" onClick={() => void saveInterceptionRules(interceptionRules.filter((_, i) => i !== index))}><Trash2 className="size-3.5" /></Button>
+                </div>
+              ))}
+            </div>
+          </div>
+          <DialogFooter><Button variant="outline" onClick={() => setInterceptionOpen(false)}>完成</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={disableOpen} onOpenChange={setDisableOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader><DialogTitle>批量停用调用 Key</DialogTitle><DialogDescription>已选择 {selectedKeyIDs.length} 个 Key。停用后，调用方会看到下面的固定回复。</DialogDescription></DialogHeader>
+          <Textarea value={disableMessage} onChange={(event) => setDisableMessage(event.target.value)} className="min-h-28" />
+          <DialogFooter><Button variant="outline" onClick={() => setDisableOpen(false)}>取消</Button><Button variant="destructive" disabled={selectedKeyIDs.length === 0} onClick={() => void batchDisableKeys()}>确认停用</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={createOpen}

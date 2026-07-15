@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/gin-gonic/gin"
@@ -31,6 +32,43 @@ func registerSettings(g *gin.RouterGroup, d *Deps) {
 	gs.PUT("/config", func(c *gin.Context) { saveSettingsConfig(c, d) })
 	gs.POST("/apply", func(c *gin.Context) { applySettingsConfig(c, d) })
 	gs.POST("/proxy/test", func(c *gin.Context) { testProxy(c) })
+	gs.GET("/response-interception", func(c *gin.Context) {
+		cfg, err := config.LoadFile(d.Runtime.ConfigPath())
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": cfg.App.ResponseInterceptionRules})
+	})
+	gs.PUT("/response-interception", func(c *gin.Context) {
+		var rules []config.ResponseInterceptionRule
+		if err := c.ShouldBindJSON(&rules); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		cfg, err := config.LoadFile(d.Runtime.ConfigPath())
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		clean := make([]config.ResponseInterceptionRule, 0, len(rules))
+		for _, rule := range rules {
+			rule.Content = strings.TrimSpace(rule.Content)
+			if rule.Content != "" {
+				clean = append(clean, rule)
+			}
+		}
+		cfg.App.ResponseInterceptionRules = clean
+		if err := config.Save(d.Runtime.ConfigPath(), cfg); err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		if _, err := d.Runtime.ApplyFromFile(); err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": clean})
+	})
 }
 
 func getSettingsConfig(c *gin.Context, d *Deps) {
@@ -73,6 +111,7 @@ func saveSettingsConfig(c *gin.Context, d *Deps) {
 	// The public dashboard reads this flag directly from config.yaml. Keep it
 	// here instead of silently restoring the previous value on every save.
 	cfg.App.HomepageCheapestEnabled = in.App.HomepageCheapestEnabled
+	cfg.App.ResponseInterceptionRules = in.App.ResponseInterceptionRules
 	cfg.Auth = in.Auth
 	cfg.Scheduler = in.Scheduler
 	cfg.Notifications = in.Notifications

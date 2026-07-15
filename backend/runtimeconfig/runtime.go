@@ -136,6 +136,7 @@ func (m *Manager) ApplyFromFile() (*ApplyResult, error) {
 
 	if dispatcher != nil {
 		dispatcher.UpdatePolicy(notify.Policy{
+			AppTitle:                                 cfg.App.Title,
 			NotificationPrefix:                       cfg.App.NotificationPrefix,
 			BatchRateChanges:                         cfg.Notifications.BatchRateChanges,
 			MinChangePct:                             cfg.Notifications.MinChangePct,
@@ -155,6 +156,7 @@ func (m *Manager) ApplyFromFile() (*ApplyResult, error) {
 	}
 	if gatewaySvc != nil {
 		gatewaySvc.UpdateUpstreamConfig(cfg.Upstream)
+		gatewaySvc.UpdateAppConfig(cfg.App)
 	}
 
 	newScheduler := factory(cfg.Scheduler, cfg.Proxy)

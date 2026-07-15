@@ -1,10 +1,10 @@
-# UpstreamOps
+# AI Gateway
 
 [English](README.md) | [简体中文](README.zh.md)
 
 > 本项目基于 [bejix/upstream-ops](https://github.com/bejix/upstream-ops) 二次开发，其上游最初来自 [worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub)。感谢 [@bejix](https://github.com/bejix)、[@worryzyy](https://github.com/worryzyy) 的开源工作，也感谢 [sub2api](https://github.com/Wei-Shaw/sub2api)、[new-api](https://github.com/QuantumNous/new-api) 等项目提供的实现参考。
 
-> UpstreamOps 是一个面向 NewAPI / Sub2API 上游站点的集中监控、运维与 AI API 聚合调度网关。它可以统一管理上游账号、查看余额与消费、同步模型倍率、追踪倍率变化、维护上游 API Key、发起充值/兑换，并通过多种通知渠道推送余额告警、倍率变更、登录异常、监控异常和上游公告。
+> AI Gateway 是一个面向 NewAPI / Sub2API 上游站点的集中监控、运维与 AI API 聚合调度网关。它可以统一管理上游账号、查看余额与消费、同步模型倍率、追踪倍率变化、维护上游 API Key、发起充值/兑换，并通过多种通知渠道推送余额告警、倍率变更、登录异常、监控异常和上游公告。
 它也可以创建本站密钥并转发 `/v1/*` 模型请求，在多个存活上游之间按公益优先、优先级和低倍率自动调度。
 
 
@@ -28,7 +28,7 @@
 
 当你同时维护多个 NewAPI / Sub2API 上游时，余额、消费、倍率、公告、API Key、订阅和充值入口通常分散在不同后台。人工逐个登录检查不仅重复，而且很容易漏掉余额不足、倍率调整、登录失效、订阅即将到期或上游公告。
 
-UpstreamOps 主要解决这些痛点：
+AI Gateway 主要解决这些痛点：
 
 - 集中看状态：把多个上游的余额、消费、倍率、公告、订阅和异常状态放到一个面板里。
 - 减少人工巡检：定时同步余额、消费、倍率和订阅用量，不需要反复打开不同后台。
@@ -41,19 +41,19 @@ UpstreamOps 主要解决这些痛点：
 
 ## 预览
 
-![UpstreamOps 预览 1](docs/images/demo1.png)
+![应用预览 1](docs/images/demo1.png)
 
-![UpstreamOps 预览 2](docs/images/demo2.png)
+![应用预览 2](docs/images/demo2.png)
 
-![UpstreamOps 预览 3](docs/images/demo3.png)
+![应用预览 3](docs/images/demo3.png)
 
-![UpstreamOps 预览 4](docs/images/demo4.png)
+![应用预览 4](docs/images/demo4.png)
 
-![UpstreamOps 预览 5](docs/images/demo5.png)
+![应用预览 5](docs/images/demo5.png)
 
-![UpstreamOps 预览 6](docs/images/demo6.png)
+![应用预览 6](docs/images/demo6.png)
 
-![UpstreamOps 预览 7](docs/images/demo7.png)
+![应用预览 7](docs/images/demo7.png)
 
 ## 功能概览
 
@@ -554,7 +554,7 @@ Webhook 请求体示例：
 ```json
 {
 	"event": "announcement",
-	"subject": "[UpstreamOps] xxx",
+	"subject": "[应用标题] xxx",
 	"body": "通知正文",
 	"extra": {}
 }

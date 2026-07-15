@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -1877,7 +1878,7 @@ func TestTestGroupKeysHonorsSelectedGroupIDs(t *testing.T) {
 			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-test"}]}`))
 		case "/v1/responses":
 			hitsMu.Lock()
-			hits[r.Header.Get("X-UpstreamOps-Group")]++
+			hits[r.Header.Get("X-Gateway-Group")]++
 			hitsMu.Unlock()
 			_, _ = w.Write([]byte(`{"id":"resp_probe","output_text":"ok"}`))
 		default:
@@ -3476,6 +3477,43 @@ func TestChatToResponsesResponseKeepsToolCalls(t *testing.T) {
 	item, _ := output[0].(map[string]any)
 	if item["type"] != "function_call" || item["name"] != "exec" || item["arguments"] != `{"cmd":"pwd"}` {
 		t.Fatalf("non-stream conversion lost tool call: %#v", item)
+	}
+}
+
+func TestInterceptedResponseContentSupportsGlobalAndChannelRules(t *testing.T) {
+	svc := &Service{}
+	svc.UpdateAppConfig(config.AppConfig{ResponseInterceptionRules: []config.ResponseInterceptionRule{
+		{Enabled: true, Content: "blocked globally"},
+		{Enabled: true, ChannelID: 7, Content: "channel-only"},
+	}})
+	if got := svc.interceptedResponseContent(&storage.UpstreamGroupKey{ChannelID: 3}, "BLOCKED GLOBALLY"); got != "blocked globally" {
+		t.Fatalf("global rule = %q", got)
+	}
+	if got := svc.interceptedResponseContent(&storage.UpstreamGroupKey{ChannelID: 3}, "channel-only"); got != "" {
+		t.Fatalf("channel rule leaked to another channel: %q", got)
+	}
+	if got := svc.interceptedResponseContent(&storage.UpstreamGroupKey{ChannelID: 7}, "prefix CHANNEL-ONLY suffix"); got != "channel-only" {
+		t.Fatalf("channel rule = %q", got)
+	}
+}
+
+func TestBatchDisableGatewayKeysStoresCustomMessage(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("d", 32))
+	created, err := env.svc.CreateGatewayKey(CreateGatewayKeyInput{Name: "disable-me"})
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	message := "该 Key 已暂停使用"
+	items, err := env.svc.BatchDisableGatewayKeys(BatchDisableGatewayKeysInput{IDs: []uint{created.ID}, Message: message})
+	if err != nil || len(items) != 1 {
+		t.Fatalf("batch disable: items=%#v err=%v", items, err)
+	}
+	stored, err := env.svc.gateway.FindByID(created.ID)
+	if err != nil || stored.Enabled || stored.DisabledMessage != message {
+		t.Fatalf("stored disabled key = %#v err=%v", stored, err)
+	}
+	if got, ok := env.svc.gatewayLimitOrExpiredMessage(created.Key, nil, errors.New("gateway key disabled")); !ok || got != message {
+		t.Fatalf("custom disabled response = %q ok=%v", got, ok)
 	}
 }
 

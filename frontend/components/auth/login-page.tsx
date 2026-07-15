@@ -26,7 +26,7 @@ export function LoginPage() {
   const [passwordVisible, setPasswordVisible] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const appTitle = appVersion.data?.title?.trim() || "UpstreamOps"
+  const appTitle = appVersion.data?.title?.trim() || "AI Gateway"
 
   useEffect(() => {
     document.title = `${appTitle} · 登录`

@@ -1,4 +1,4 @@
-# UpstreamOps · 聚合调度网关
+# AI Gateway · 聚合调度网关
 
 > 一个自用的 AI API 聚合调度网关：你创建自己的密钥（`sk-...`），请求打到本站，本站在多个上游中转站之间**按最便宜且存活的渠道自动调度转发**，一个渠道坏了自动切换，尽量降低丢包、提升稳定性。支持 OpenAI、Claude 与 Grok（xAI）三种格式隔离调度，支持 Codex（Responses API）直连。
 
@@ -41,7 +41,7 @@ docker compose pull && docker compose up -d
 
 ```bash
 cd /root/upstream-ops
-curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.24.0/docker-compose.yml
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.24.1/docker-compose.yml
 sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=latest/' .env
 docker compose pull && docker compose up -d
 ```

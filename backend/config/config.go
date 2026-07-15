@@ -25,10 +25,17 @@ type Config struct {
 }
 
 type AppConfig struct {
-	Title              string `mapstructure:"title" yaml:"title" json:"title"`
-	NotificationPrefix string `mapstructure:"notificationPrefix" yaml:"notificationPrefix" json:"notificationPrefix"`
-	HomepageCheapestEnabled bool `mapstructure:"homepageCheapestEnabled" yaml:"homepageCheapestEnabled" json:"homepageCheapestEnabled"`
-	PublicKey          PublicKeyConfig `mapstructure:"publicKey" yaml:"publicKey" json:"publicKey"`
+	Title                     string                     `mapstructure:"title" yaml:"title" json:"title"`
+	NotificationPrefix        string                     `mapstructure:"notificationPrefix" yaml:"notificationPrefix" json:"notificationPrefix"`
+	HomepageCheapestEnabled   bool                       `mapstructure:"homepageCheapestEnabled" yaml:"homepageCheapestEnabled" json:"homepageCheapestEnabled"`
+	PublicKey                 PublicKeyConfig            `mapstructure:"publicKey" yaml:"publicKey" json:"publicKey"`
+	ResponseInterceptionRules []ResponseInterceptionRule `mapstructure:"responseInterceptionRules" yaml:"responseInterceptionRules" json:"responseInterceptionRules"`
+}
+
+type ResponseInterceptionRule struct {
+	Enabled   bool   `mapstructure:"enabled" yaml:"enabled" json:"enabled"`
+	ChannelID uint   `mapstructure:"channelId" yaml:"channelId" json:"channelId"`
+	Content   string `mapstructure:"content" yaml:"content" json:"content"`
 }
 
 type PublicKeyConfig struct {
@@ -309,7 +316,7 @@ func configSearchPaths() []string {
 }
 
 func setDefaults(v *viper.Viper) {
-	v.SetDefault("app.title", "UpstreamOps")
+	v.SetDefault("app.title", "AI Gateway")
 	v.SetDefault("app.notificationPrefix", "[AI 聚合监控] ")
 	v.SetDefault("app.publicKey.enabled", false)
 	v.SetDefault("app.publicKey.name", "公益 Key")

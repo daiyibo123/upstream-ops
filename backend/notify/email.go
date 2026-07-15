@@ -91,7 +91,11 @@ func buildEmailBody(from string, to []string, msg Message) string {
 	if plainBody == "" {
 		plainBody = subject
 	}
-	boundary := fmt.Sprintf("upstreamops-%d", time.Now().UnixNano())
+	appTitle := strings.TrimSpace(msg.AppTitle)
+	if appTitle == "" {
+		appTitle = "AI Gateway"
+	}
+	boundary := fmt.Sprintf("gateway-%d", time.Now().UnixNano())
 	headers := []string{
 		"From: " + sanitizeMailHeader(from),
 		"To: " + sanitizeMailHeader(strings.Join(to, ", ")),
@@ -99,7 +103,7 @@ func buildEmailBody(from string, to []string, msg Message) string {
 		"Date: " + time.Now().Format(time.RFC1123Z),
 		"MIME-Version: 1.0",
 		fmt.Sprintf(`Content-Type: multipart/alternative; boundary="%s"`, boundary),
-		"X-Mailer: UpstreamOps",
+		"X-Mailer: " + sanitizeMailHeader(appTitle),
 	}
 	parts := []string{
 		strings.Join(headers, "\r\n"),
@@ -113,7 +117,7 @@ func buildEmailBody(from string, to []string, msg Message) string {
 		"Content-Type: text/html; charset=UTF-8",
 		"Content-Transfer-Encoding: 8bit",
 		"",
-		buildEmailHTML(subject, plainBody, msg),
+		buildEmailHTML(appTitle, subject, plainBody, msg),
 		"--" + boundary + "--",
 		"",
 	}
@@ -126,7 +130,7 @@ func sanitizeMailHeader(value string) string {
 	return strings.TrimSpace(value)
 }
 
-func buildEmailHTML(subject, body string, msg Message) string {
+func buildEmailHTML(appTitle, subject, body string, msg Message) string {
 	event := emailEventLabel(msg.Event)
 	when := time.Now().Format("2006-01-02 15:04:05")
 	content := emailContentHTML(body)
@@ -139,15 +143,15 @@ func buildEmailHTML(subject, body string, msg Message) string {
 	}
 	return fmt.Sprintf(`<!doctype html>
 <html>
-<body style="margin:0;padding:0;background:#e5e7eb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;color:#111827;">
+<body style="margin:0;padding:0;background:#eef2ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;color:#172033;">
   <div style="display:none;max-height:0;overflow:hidden;color:transparent;">%s</div>
-  <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background:#e5e7eb;padding:32px 12px;">
+  <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background:linear-gradient(145deg,#eef2ff,#f8fafc);padding:38px 12px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="max-width:680px;overflow:hidden;border-radius:18px;background:#ffffff;border:1px solid #d1d5db;box-shadow:0 14px 38px rgba(17,24,39,.14);">
+        <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="max-width:680px;overflow:hidden;border-radius:22px;background:#ffffff;border:1px solid #dbe4ff;box-shadow:0 18px 48px rgba(49,46,129,.14);">
           <tr>
-            <td style="padding:26px 30px;background:#111827;color:#ffffff;">
-              <div style="font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:#93c5fd;font-weight:800;">UpstreamOps</div>
+            <td style="padding:30px 34px;background:linear-gradient(135deg,#312e81,#2563eb);color:#ffffff;">
+              <div style="font-size:13px;letter-spacing:.08em;color:#bfdbfe;font-weight:800;">%s</div>
               <h1 style="margin:12px 0 0;font-size:24px;line-height:1.35;font-weight:800;color:#ffffff;">%s</h1>
             </td>
           </tr>
@@ -159,8 +163,8 @@ func buildEmailHTML(subject, body string, msg Message) string {
             </td>
           </tr>
           <tr>
-            <td style="padding:18px 30px 26px;color:#475569;font-size:13px;line-height:1.7;border-top:1px solid #e5e7eb;">
-              这封邮件由 UpstreamOps 自动发送。你可以在系统设置的通知渠道和通知策略里调整接收范围。
+            <td style="padding:18px 30px 26px;color:#64748b;font-size:13px;line-height:1.7;border-top:1px solid #e5e7eb;background:#f8fafc;">
+              这封邮件由 %s 自动发送。你可以在系统设置的通知渠道和通知策略里调整接收范围。
             </td>
           </tr>
         </table>
@@ -168,7 +172,7 @@ func buildEmailHTML(subject, body string, msg Message) string {
     </tr>
   </table>
 </body>
-</html>`, html.EscapeString(subject), html.EscapeString(subject), strings.Join(meta, ""), when, content)
+</html>`, html.EscapeString(subject), html.EscapeString(appTitle), html.EscapeString(subject), strings.Join(meta, ""), when, content, html.EscapeString(appTitle))
 }
 
 func emailContentHTML(body string) string {

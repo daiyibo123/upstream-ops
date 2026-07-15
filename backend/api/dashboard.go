@@ -156,16 +156,16 @@ func dashboardPublicPreviewSiteKey(group dashboardGatewayGroup) string {
 
 func publicDashboardTitle(d *Deps) string {
 	if d == nil || d.Runtime == nil {
-		return "UpstreamOps"
+		return "AI Gateway"
 	}
 	cfg, err := config.LoadFile(d.Runtime.ConfigPath())
 	if err != nil {
-		return "UpstreamOps"
+		return "AI Gateway"
 	}
 	if title := strings.TrimSpace(cfg.App.Title); title != "" {
 		return title
 	}
-	return "UpstreamOps"
+	return "AI Gateway"
 }
 
 type publicKeyStat struct {

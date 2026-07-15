@@ -25,6 +25,7 @@ type Message struct {
 	Subject   string
 	Body      string
 	Extra     map[string]any
+	AppTitle  string
 }
 
 // Notifier 通知渠道抽象。

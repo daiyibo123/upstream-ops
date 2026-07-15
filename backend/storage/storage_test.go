@@ -90,6 +90,27 @@ func TestUsageLogsClearPreservesGatewayKeyUsage(t *testing.T) {
 	}
 }
 
+func TestUpstreamGroupKeySearchMatchesChannelURLNameAndGroup(t *testing.T) {
+	db := openTestDB(t)
+	channel := &Channel{Name: "示例渠道", SiteURL: "https://relay.example.test/v1", Type: ChannelTypeNewAPI}
+	if err := db.Create(channel).Error; err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	repo := NewUpstreamGroupKeys(db)
+	if err := repo.Upsert(&UpstreamGroupKey{ChannelID: channel.ID, ChannelName: "旧名称", ChannelType: channel.Type, GroupRef: "group-a", GroupName: "高速分组", KeyCipher: "cipher", Enabled: true}); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	for _, query := range []string{"relay.example.test", "示例渠道", "高速分组", "group-a"} {
+		items, total, err := repo.ListPage(10, 0, query)
+		if err != nil || total != 1 || len(items) != 1 {
+			t.Fatalf("search %q: total=%d items=%#v err=%v", query, total, items, err)
+		}
+		if items[0].ChannelName != channel.Name || items[0].ChannelURL != channel.SiteURL {
+			t.Fatalf("search result source was not refreshed from channel: %#v", items[0])
+		}
+	}
+}
+
 func TestAggregateBalanceTrend(t *testing.T) {
 	db := openTestDB(t)
 	rates := NewRates(db)

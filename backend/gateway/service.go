@@ -99,6 +99,7 @@ type Service struct {
 	healthProbeSlots sync.Map
 	configMu         sync.RWMutex
 	upstream         config.UpstreamConfig
+	app              config.AppConfig
 }
 
 type CreateGatewayKeyInput struct {
@@ -129,6 +130,12 @@ type UpdateGatewayKeyInput struct {
 	MaxGroupRatio     *float64   `json:"max_group_ratio"`
 	ExpiresInDays     *int       `json:"expires_in_days"`
 	ExpiresAt         *time.Time `json:"expires_at"`
+	DisabledMessage   *string    `json:"disabled_message"`
+}
+
+type BatchDisableGatewayKeysInput struct {
+	IDs     []uint `json:"ids"`
+	Message string `json:"message"`
 }
 
 type IPPolicyInput struct {
@@ -173,6 +180,7 @@ type GatewayKeyOutput struct {
 	LastUsedIP         string     `json:"last_used_ip,omitempty"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
+	DisabledMessage    string     `json:"disabled_message,omitempty"`
 }
 
 type GatewayKeyUsageOutput struct {
@@ -778,6 +786,19 @@ func (s *Service) UpdateUpstreamConfig(cfg config.UpstreamConfig) {
 	s.upstream = cfg.WithDefaults()
 }
 
+func (s *Service) UpdateAppConfig(cfg config.AppConfig) {
+	s.configMu.Lock()
+	s.app = cfg
+	s.configMu.Unlock()
+}
+
+func (s *Service) appConfig() config.AppConfig {
+	s.configMu.RLock()
+	cfg := s.app
+	s.configMu.RUnlock()
+	return cfg
+}
+
 func (s *Service) upstreamConfig() config.UpstreamConfig {
 	s.configMu.RLock()
 	cfg := s.upstream
@@ -934,6 +955,9 @@ func (s *Service) UpdateGatewayKey(id uint, input UpdateGatewayKeyInput) (*Gatew
 	if input.Enabled != nil {
 		key.Enabled = *input.Enabled
 	}
+	if input.DisabledMessage != nil {
+		key.DisabledMessage = strings.TrimSpace(*input.DisabledMessage)
+	}
 	if input.ClientFormat != nil {
 		key.ClientFormat = normalizeClientFormat(*input.ClientFormat)
 	}
@@ -997,6 +1021,34 @@ func (s *Service) UpdateGatewayKey(id uint, input UpdateGatewayKeyInput) (*Gatew
 	}
 	out := gatewayKeyOutput(*key)
 	return &out, nil
+}
+
+func (s *Service) BatchDisableGatewayKeys(input BatchDisableGatewayKeysInput) ([]GatewayKeyOutput, error) {
+	message := strings.TrimSpace(input.Message)
+	if message == "" {
+		message = "此调用 Key 已停用，请联系管理员。"
+	}
+	seen := map[uint]struct{}{}
+	result := make([]GatewayKeyOutput, 0, len(input.IDs))
+	for _, id := range input.IDs {
+		if id == 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		enabled := false
+		out, err := s.UpdateGatewayKey(id, UpdateGatewayKeyInput{Enabled: &enabled, DisabledMessage: &message})
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *out)
+	}
+	if len(result) == 0 {
+		return nil, errors.New("select at least one gateway key")
+	}
+	return result, nil
 }
 
 func (s *Service) RevealGatewayKey(id uint) (string, error) {
@@ -2488,10 +2540,18 @@ func (s *Service) attemptCandidate(
 	defer release()
 
 	normalized = requestForCandidate(normalized, candidate)
-	if normalized.Stream {
-		return s.attemptStream(ctx, gatewayKey, normalized, candidate, w)
+	var outcome candOutcome
+	for attempt := 0; attempt < 3; attempt++ {
+		if normalized.Stream {
+			outcome = s.attemptStream(ctx, gatewayKey, normalized, candidate, w)
+		} else {
+			outcome = s.attemptNonStream(ctx, gatewayKey, normalized, candidate, w)
+		}
+		if outcome.kind != candRetryable || !strings.Contains(strings.ToLower(outcome.errMsg), "response content intercepted") {
+			return outcome
+		}
 	}
-	return s.attemptNonStream(ctx, gatewayKey, normalized, candidate, w)
+	return outcome
 }
 
 func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamGroupKey) normalizedRequest {
@@ -2542,7 +2602,7 @@ func (s *Service) applyUpstreamAuthHeaders(header http.Header, key *storage.Upst
 	}
 	header.Set("Content-Type", "application/json")
 	if key != nil {
-		header.Set("X-UpstreamOps-Group", key.GroupName)
+		header.Set("X-Gateway-Group", key.GroupName)
 	}
 	if key != nil && normalizeClientFormat(key.ClientFormat) == "claude" && header.Get("Anthropic-Version") == "" {
 		header.Set("Anthropic-Version", "2023-06-01")
@@ -2912,6 +2972,9 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			if isUpstreamErrorBody(respBody) {
 				return true, usageTokens{}, fmt.Errorf("upstream returned error payload: %s", truncateBody(respBody, 240))
 			}
+			if matched := s.interceptedResponseContent(key, string(respBody)); matched != "" {
+				return true, usageTokens{}, fmt.Errorf("response content intercepted: %s", matched)
+			}
 			if request.Stream && (request.ResponseMode == "responses" || request.ResponseMode == "responses_from_chat") {
 				usage, err := streamNonSSEAsResponsesEvents(w, resp.StatusCode, header, respBody, key, request.ResponseMode)
 				return false, usage, err
@@ -2927,6 +2990,11 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		buffered, err := preflightSSEStream(reader, resp.Body, streamPreflightTimeout)
 		if err != nil {
 			return true, usageTokens{}, err
+		}
+		for _, event := range buffered {
+			if matched := s.interceptedResponseContent(key, event.Data); matched != "" {
+				return true, usageTokens{}, fmt.Errorf("response content intercepted: %s", matched)
+			}
 		}
 		// 正式转发阶段的 idle 读超时：上游连续 streamIdleTimeout 没有任何新事件就判定卡死，
 		// 主动关连接返回错误，避免 reader.Next() 无限阻塞导致客户端 stream closed。
@@ -2978,6 +3046,26 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	return false, usageTokens{}, &GatewayError{Status: resp.StatusCode, Header: header, Body: respBody}
 }
 
+func (s *Service) interceptedResponseContent(key *storage.UpstreamGroupKey, content string) string {
+	content = strings.ToLower(content)
+	if content == "" {
+		return ""
+	}
+	for _, rule := range s.appConfig().ResponseInterceptionRules {
+		needle := strings.TrimSpace(rule.Content)
+		if !rule.Enabled || needle == "" {
+			continue
+		}
+		if rule.ChannelID != 0 && (key == nil || rule.ChannelID != key.ChannelID) {
+			continue
+		}
+		if strings.Contains(content, strings.ToLower(needle)) {
+			return needle
+		}
+	}
+	return ""
+}
+
 func (s *Service) createUpstreamKey(ctx context.Context, ch storage.Channel, group connector.APIKeyGroup, groupID *int64) (*storage.UpstreamGroupKey, error) {
 	customKey, err := randomOpenAIKey()
 	if err != nil {
@@ -2987,7 +3075,7 @@ func (s *Service) createUpstreamKey(ctx context.Context, ch storage.Channel, gro
 	expiredTime := int64(-1)
 	crossGroupRetry := false
 	req := connector.APIKeyCreateRequest{
-		Name:            fmt.Sprintf("UpstreamOps Gateway - %s - %s", ch.Name, group.Name),
+		Name:            fmt.Sprintf("%s - %s - %s", firstNonEmpty(strings.TrimSpace(s.appConfig().Title), "AI Gateway"), ch.Name, group.Name),
 		CustomKey:       customKey,
 		UnlimitedQuota:  &unlimited,
 		ExpiredTime:     &expiredTime,
@@ -8438,6 +8526,9 @@ func (s *Service) gatewayLimitOrExpiredMessage(rawKey string, key *storage.Gatew
 	if key == nil {
 		return "", false
 	}
+	if !key.Enabled && strings.TrimSpace(key.DisabledMessage) != "" {
+		return strings.TrimSpace(key.DisabledMessage), true
+	}
 	now := time.Now()
 	lower := ""
 	if cause != nil {
@@ -8559,6 +8650,7 @@ func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 		AllowedGroupIDs:    decodeUintList(key.AllowedGroupIDs),
 		CreatedAt:          key.CreatedAt,
 		UpdatedAt:          key.UpdatedAt,
+		DisabledMessage:    key.DisabledMessage,
 	}
 }
 
@@ -9758,9 +9850,9 @@ func copyResponseHeaders(out io.Writer, header http.Header, key *storage.Upstrea
 			dst.Add(k, v)
 		}
 	}
-	dst.Set("X-UpstreamOps-Channel", key.ChannelName)
-	dst.Set("X-UpstreamOps-Group", key.GroupName)
-	dst.Set("X-UpstreamOps-Ratio", strconv.FormatFloat(effectiveGroupRatio(*key), 'f', -1, 64))
+	dst.Set("X-Gateway-Channel", key.ChannelName)
+	dst.Set("X-Gateway-Group", key.GroupName)
+	dst.Set("X-Gateway-Ratio", strconv.FormatFloat(effectiveGroupRatio(*key), 'f', -1, 64))
 }
 
 func cloneHeader(h http.Header) http.Header {

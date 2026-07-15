@@ -15,6 +15,7 @@ import (
 //   - BalanceLowCooldown：同渠道 balance_low 在窗口内不重复发送
 //   - SendMaxAttempts：单条消息最多发送尝试次数（含首发），<=1 表示不重试
 type Policy struct {
+	AppTitle                                 string
 	NotificationPrefix                       string
 	BatchRateChanges                         bool
 	MinChangePct                             float64
