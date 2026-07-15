@@ -36,11 +36,11 @@ import {
 } from "@/components/ui/table"
 import { apiFetch } from "@/lib/api"
 import { channelTypeLabel, formatRatio, formatTokens, money, relativeTime } from "@/lib/format"
-import { testGatewayHealthStream, type ProgressEvent } from "@/lib/sync-stream"
 import { cn } from "@/lib/utils"
 import { ManualGroupKeyDialog } from "@/components/monitor/manual-group-key-dialog"
 import type {
   GatewayBootstrapResult,
+  GatewayHealthJob,
   GatewayHealthResult,
   GatewayKey,
   GatewayKeyReveal,
@@ -647,32 +647,6 @@ function formatExpiry(value?: string | null) {
 async function copyText(text: string) {
   await navigator.clipboard.writeText(text)
   toast.success("已复制")
-}
-
-type HealthItem = GatewayHealthResult["items"][number]
-
-function healthItemFromProgress(ev: ProgressEvent): HealthItem | null {
-  const data = ev.data as { item?: HealthItem } | undefined
-  return data?.item?.id ? data.item : null
-}
-
-function healthProgressFromEvent(ev: ProgressEvent, fallback: HealthProgress): HealthProgress {
-  const data = (ev.data ?? {}) as {
-    completed?: number
-    total?: number
-    batch?: number
-    batches?: number
-    batch_size?: number
-  }
-  return {
-    running: true,
-    completed: Number(data.completed ?? ev.index ?? fallback.completed ?? 0),
-    total: Number(data.total ?? ev.total ?? fallback.total ?? 0),
-    batch: Number(data.batch ?? fallback.batch ?? 0),
-    batches: Number(data.batches ?? fallback.batches ?? 0),
-    batchSize: Number(data.batch_size ?? fallback.batchSize ?? 10),
-    message: ev.message || fallback.message,
-  }
 }
 
 function draftFromKey(key: GatewayKey): KeyDraft {
@@ -1559,39 +1533,56 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       message: "测活排队中...",
     })
     try {
-      let finalResult: GatewayHealthResult | undefined
-      await testGatewayHealthStream({
-        onEvent: (ev) => {
-          const item = healthItemFromProgress(ev)
-          if (item) {
-            setHealthResults((prev) => ({ ...prev, [item.id]: item }))
-          }
-          setHealthProgress((prev) => healthProgressFromEvent(ev, prev ?? {
-              running: true,
-              completed: 0,
-              total: enabledTargets.length,
-              batch: 0,
-              batches: 0,
-              batchSize: 1,
-              message: "测活中...",
-          }))
-          if (ev.stage === "done" && ev.data && typeof ev.data === "object" && "items" in ev.data) {
-            finalResult = ev.data as GatewayHealthResult
-          }
-        },
-      }, enabledTargets.map((group) => group.id))
-      const completedResult = finalResult as GatewayHealthResult | undefined
-      if (completedResult) {
-        const nextItems = Object.fromEntries((completedResult.items ?? []).map((item) => [item.id, item]))
-        setHealthResults((prev) => ({ ...prev, ...nextItems }))
-        toast.success(`测活完成：${healthResultSummaryText(completedResult)}`)
-      } else {
-        toast.success("测活完成")
-      }
-      await load()
+      // The backend owns the serial probe. Closing or reloading this page can
+      // no longer cancel a running health check.
+      const job = await apiFetch<GatewayHealthJob>(`/gateway/group-keys/test?ids=${enabledTargets.map((group) => group.id).join(",")}`, {
+        method: "POST",
+      })
+      toast.success("后台测活已启动，可继续操作此页面")
+      // Do not freeze the rest of the control panel while the server works.
+      // The one-click button itself is disabled from healthProgress below.
+      setBusy(null)
+      void monitorHealthJob(job.id, enabledTargets.length)
     } catch (e) {
       const err = e as Error
-      toast.error(err.message || "一键测活失败")
+      toast.error(err.message || "一键测活启动失败")
+      setBusy(null)
+      setHealthProgress((prev) => prev ? { ...prev, running: false } : null)
+    }
+  }
+
+  async function monitorHealthJob(jobID: string, targetCount: number) {
+    try {
+      for (;;) {
+        const job = await apiFetch<GatewayHealthJob>(`/gateway/group-keys/test/jobs/${encodeURIComponent(jobID)}`)
+        setHealthProgress({
+          running: job.status === "running",
+          completed: job.completed || 0,
+          total: job.total || targetCount,
+          batch: 0,
+          batches: 0,
+          batchSize: 1,
+          message: job.message || "后台测活中…",
+        })
+        if (job.status === "running") {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 1500))
+          continue
+        }
+        if (job.result) {
+          const nextItems = Object.fromEntries((job.result.items ?? []).map((item) => [item.id, item]))
+          setHealthResults((prev) => ({ ...prev, ...nextItems }))
+        }
+        if (job.status === "completed") {
+          toast.success(job.result ? `测活完成：${healthResultSummaryText(job.result)}` : "测活完成")
+        } else {
+          toast.error(job.error || "后台测活失败")
+        }
+        await load()
+        return
+      }
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "后台测活状态获取失败")
     } finally {
       setBusy(null)
       setHealthProgress((prev) => prev ? { ...prev, running: false } : null)
@@ -2009,7 +2000,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               <Plus className="size-3.5" />
               手动添加渠道
             </Button>
-            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || enabledFilteredOpenAIHealthGroups.length === 0} onClick={testGroups}>
+            <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy || !!healthProgress?.running || enabledFilteredOpenAIHealthGroups.length === 0} onClick={testGroups}>
               {busy === "test" ? <Loader2 className="size-3.5 animate-spin" /> : <RefreshCw className="size-3.5" />}
               一键测活
             </Button>

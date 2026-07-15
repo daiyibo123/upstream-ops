@@ -766,3 +766,15 @@ export interface GatewayHealthResult {
     batch?: number
   }>
 }
+
+export interface GatewayHealthJob {
+  id: string
+  status: "running" | "completed" | "failed" | string
+  message?: string
+  total: number
+  completed: number
+  started_at: string
+  finished_at?: string | null
+  result?: GatewayHealthResult
+  error?: string
+}

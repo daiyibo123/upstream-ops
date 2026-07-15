@@ -286,6 +286,14 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": item})
 	})
+	gp.GET("/group-keys/test/jobs/:id", func(c *gin.Context) {
+		job, err := d.Gateway.HealthJob(c.Param("id"))
+		if err != nil {
+			fail(c, http.StatusNotFound, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": job})
+	})
 	gp.POST("/group-keys/bootstrap", func(c *gin.Context) {
 		result, err := d.Gateway.BootstrapGroupKeys(c.Request.Context())
 		if err != nil {
@@ -313,6 +321,15 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		// service also enforces the OpenAI/effective-ratio policy server-side, so
 		// callers cannot accidentally test costly or non-OpenAI groups.
 		opts := gatewaySvc.OneClickHealthTestOptions(groupIDs)
+		if !wantsSSE(c) {
+			job, err := d.Gateway.StartOneClickHealthJob(groupIDs)
+			if err != nil {
+				fail(c, http.StatusInternalServerError, err)
+				return
+			}
+			c.JSON(http.StatusAccepted, gin.H{"data": job})
+			return
+		}
 		if wantsSSE(c) {
 			obs := setupSSE(c)
 			ctx := progress.WithObserver(context.Background(), obs)

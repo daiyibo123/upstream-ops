@@ -164,6 +164,46 @@ func TestUpstreamGroupKeySearchMatchesChannelURLNameAndGroup(t *testing.T) {
 	}
 }
 
+func TestUpsertKeepsManualRatioScaleDuringAutomaticSync(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewUpstreamGroupKeys(db)
+	initial := &UpstreamGroupKey{
+		ChannelID:         7,
+		ChannelName:       "upstream",
+		GroupRef:          "auto-group",
+		GroupName:         "old group",
+		Ratio:             0.2,
+		RatioScalePercent: 25,
+		KeyCipher:         "cipher",
+		Enabled:           true,
+		Status:            "alive",
+	}
+	if err := repo.Upsert(initial); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	// This mirrors an overwrite sync: upstream metadata and the advertised
+	// ratio are refreshed, but the operator's real-cost correction is local
+	// configuration and must survive the sync.
+	if err := repo.Upsert(&UpstreamGroupKey{
+		ChannelID:         initial.ChannelID,
+		ChannelName:       initial.ChannelName,
+		GroupRef:          initial.GroupRef,
+		GroupName:         "renamed group",
+		Ratio:             0.5,
+		RatioScalePercent: 100,
+		Enabled:           true,
+	}); err != nil {
+		t.Fatalf("upsert synced group: %v", err)
+	}
+	stored, err := repo.FindByChannelGroup(initial.ChannelID, initial.GroupRef)
+	if err != nil || stored == nil {
+		t.Fatalf("reload synced group: group=%#v err=%v", stored, err)
+	}
+	if stored.Ratio != 0.5 || stored.RatioScalePercent != 25 {
+		t.Fatalf("sync overwrote manual ratio correction: %#v", stored)
+	}
+}
+
 func TestAggregateBalanceTrend(t *testing.T) {
 	db := openTestDB(t)
 	rates := NewRates(db)

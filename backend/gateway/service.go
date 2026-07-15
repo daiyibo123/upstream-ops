@@ -108,6 +108,8 @@ type Service struct {
 	keyRuntime       sync.Map
 	ipRuntime        sync.Map
 	healthProbeSlots sync.Map
+	healthJobs       sync.Map
+	healthJobMu      sync.Mutex
 	configMu         sync.RWMutex
 	upstream         config.UpstreamConfig
 	app              config.AppConfig
@@ -333,6 +335,54 @@ type HealthTestOptions struct {
 	InterGroupDelay time.Duration
 }
 
+// HealthJobOutput is a durable-in-process snapshot of a background one-click
+// health check. The browser can poll it after navigation or reload; the check
+// itself never depends on an SSE connection remaining open.
+type HealthJobOutput struct {
+	ID         string        `json:"id"`
+	Status     string        `json:"status"`
+	Message    string        `json:"message,omitempty"`
+	Total      int           `json:"total"`
+	Completed  int           `json:"completed"`
+	StartedAt  time.Time     `json:"started_at"`
+	FinishedAt *time.Time    `json:"finished_at,omitempty"`
+	Result     *HealthResult `json:"result,omitempty"`
+	Error      string        `json:"error,omitempty"`
+}
+
+type healthJob struct {
+	mu  sync.RWMutex
+	out HealthJobOutput
+}
+
+func (j *healthJob) snapshot() HealthJobOutput {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	return j.out
+}
+
+type healthJobObserver struct{ job *healthJob }
+
+func (o healthJobObserver) Emit(event progress.Event) {
+	if o.job == nil {
+		return
+	}
+	o.job.mu.Lock()
+	defer o.job.mu.Unlock()
+	if event.Message != "" {
+		o.job.out.Message = event.Message
+	}
+	if event.Total > 0 {
+		o.job.out.Total = event.Total
+	}
+	if event.Index > o.job.out.Completed {
+		o.job.out.Completed = event.Index
+	}
+	if event.Stage == progress.StageError {
+		o.job.out.Error = event.Message
+	}
+}
+
 // OneClickHealthTestOptions returns the safe policy used by the dashboard's
 // one-click check: OpenAI groups at an effective rate no higher than 0.1 are
 // checked strictly serially, with a two-second gap between upstream requests.
@@ -344,6 +394,109 @@ func OneClickHealthTestOptions(groupIDs []uint) HealthTestOptions {
 		Serial:          true,
 		InterGroupDelay: oneClickHealthProbeInterval,
 	}
+}
+
+// StartOneClickHealthJob starts the deliberately serial low-cost OpenAI probe
+// in the background. It is intentionally detached from the HTTP request so a
+// slow large batch does not make the control page appear frozen or get
+// cancelled when the browser navigates away.
+func (s *Service) StartOneClickHealthJob(groupIDs []uint) (*HealthJobOutput, error) {
+	if s == nil || s.groupKeys == nil {
+		return nil, errors.New("gateway health service is unavailable")
+	}
+	// A second automatic batch would defeat the deliberately serial policy and
+	// could make a shared upstream appear to have failed under a probe burst.
+	// Keep at most one dashboard batch running per gateway process.
+	s.healthJobMu.Lock()
+	defer s.healthJobMu.Unlock()
+	var active *HealthJobOutput
+	s.healthJobs.Range(func(_, value any) bool {
+		job, ok := value.(*healthJob)
+		if !ok {
+			return true
+		}
+		snapshot := job.snapshot()
+		if snapshot.Status == "running" {
+			active = &snapshot
+			return false
+		}
+		return true
+	})
+	if active != nil {
+		return active, nil
+	}
+	jobID, err := randomHealthJobID()
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	job := &healthJob{out: HealthJobOutput{ID: jobID, Status: "running", Message: "后台测活任务已启动", StartedAt: now}}
+	s.healthJobs.Store(jobID, job)
+	s.pruneHealthJobs(now)
+	opts := OneClickHealthTestOptions(groupIDs)
+	go func() {
+		ctx := progress.WithObserver(context.Background(), healthJobObserver{job: job})
+		result, runErr := s.TestGroupKeys(ctx, opts)
+		finished := time.Now()
+		job.mu.Lock()
+		defer job.mu.Unlock()
+		job.out.FinishedAt = &finished
+		job.out.Result = result
+		if result != nil {
+			job.out.Total = result.Total
+			job.out.Completed = result.Checked
+		}
+		if runErr != nil {
+			job.out.Status = "failed"
+			job.out.Error = runErr.Error()
+			job.out.Message = "后台测活失败"
+			return
+		}
+		job.out.Status = "completed"
+		job.out.Message = "后台测活完成"
+	}()
+	out := job.snapshot()
+	return &out, nil
+}
+
+func (s *Service) HealthJob(id string) (*HealthJobOutput, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, errors.New("health job id is required")
+	}
+	value, ok := s.healthJobs.Load(id)
+	if !ok {
+		return nil, errors.New("health job not found or expired")
+	}
+	out := value.(*healthJob).snapshot()
+	return &out, nil
+}
+
+func (s *Service) pruneHealthJobs(now time.Time) {
+	if s == nil {
+		return
+	}
+	const retention = time.Hour
+	s.healthJobs.Range(func(key, value any) bool {
+		job, ok := value.(*healthJob)
+		if !ok {
+			s.healthJobs.Delete(key)
+			return true
+		}
+		snapshot := job.snapshot()
+		if snapshot.FinishedAt != nil && now.Sub(*snapshot.FinishedAt) > retention {
+			s.healthJobs.Delete(key)
+		}
+		return true
+	})
+}
+
+func randomHealthJobID() (string, error) {
+	buf := make([]byte, 12)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate health job id: %w", err)
+	}
+	return "health_" + hex.EncodeToString(buf), nil
 }
 
 type UpdateGroupKeyInput struct {
@@ -371,6 +524,10 @@ type normalizedRequest struct {
 	AltBody      []byte
 	AltMode      string
 	AltStream    bool
+	// ToolKinds preserves the Responses declaration while a Chat-only upstream
+	// is used. In particular, Codex routes `custom_tool_call` (exec/apply_patch)
+	// differently from a JSON-schema `function_call`.
+	ToolKinds map[string]string
 }
 
 type usageTokens struct {
@@ -1317,13 +1474,22 @@ func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.U
 			return nil, err
 		}
 	}
-	if shouldDetect || keyChanged {
+	// Replacing a secret in a healthy manual group normally means the operator
+	// rotated a Key at the same provider. Its proven protocol and authentication
+	// header are group configuration, not properties that should be discarded
+	// for every new Key. Keep them until a real request receives 401/403; the
+	// pre-first-byte alternate-header retry below then repairs only that Key
+	// without making the edit flow send extra probes or flipping a working
+	// Bearer/x-api-key contract.
+	preserveHealthyManualContract := keyChanged && !shouldDetect && isManualGroupKey(key) &&
+		strings.EqualFold(strings.TrimSpace(key.Status), "alive") &&
+		strings.TrimSpace(key.AuthMode) != ""
+	if shouldDetect || (keyChanged && !preserveHealthyManualContract) {
 		ctx, cancel := context.WithTimeout(context.Background(), manualRequestModeDetectTimeout)
 		defer cancel()
-		// Replacing a key changes both its protocol capability and, for some
-		// relays, the required authentication header. Automatic configurations
-		// are therefore re-detected before the next real request. A manual
-		// protocol still gets a header-only probe below.
+		// Automatic configurations are re-detected after a Key replacement. A
+		// manual group that has not yet proved healthy receives a header-only
+		// probe; healthy manual groups retain their established contract above.
 		if shouldDetect {
 			if detected, detectErr := s.DetectGroupRequestMode(ctx, id); detectErr == nil && detected != nil {
 				return detected, nil
@@ -2709,19 +2875,51 @@ func ensureCodexResponsesLiteReasoningContext(request normalizedRequest) normali
 	if json.Unmarshal(request.Body, &raw) != nil || raw == nil {
 		return request
 	}
+	_, suppliedReasoning := raw["reasoning"]
 	reasoning, _ := raw["reasoning"].(map[string]any)
 	if reasoning == nil {
 		reasoning = map[string]any{}
 	}
-	if strings.EqualFold(strings.TrimSpace(stringValue(reasoning["context"])), "all_turns") {
-		return request
+	if !strings.EqualFold(strings.TrimSpace(stringValue(reasoning["context"])), "all_turns") {
+		reasoning["context"] = "all_turns"
 	}
-	reasoning["context"] = "all_turns"
 	raw["reasoning"] = reasoning
+	// Codex carries encrypted reasoning between response/tool turns. Native
+	// Responses upstreams need it explicitly included; without it a model can
+	// still answer text but lose the context required to continue a tool edit.
+	if suppliedReasoning {
+		raw["include"] = appendUniqueStringValue(raw["include"], "reasoning.encrypted_content")
+	}
 	if body, err := json.Marshal(raw); err == nil {
 		request.Body = body
 	}
 	return request
+}
+
+func appendUniqueStringValue(value any, wanted string) []any {
+	wanted = strings.TrimSpace(wanted)
+	items := make([]any, 0, 2)
+	switch current := value.(type) {
+	case []any:
+		items = append(items, current...)
+	case []string:
+		for _, item := range current {
+			items = append(items, item)
+		}
+	case string:
+		if strings.TrimSpace(current) != "" {
+			items = append(items, current)
+		}
+	}
+	for _, item := range items {
+		if strings.EqualFold(strings.TrimSpace(stringValue(item)), wanted) {
+			return items
+		}
+	}
+	if wanted != "" {
+		items = append(items, wanted)
+	}
+	return items
 }
 
 // The Lite header belongs to native Responses traffic. A fallback Chat request
@@ -3148,7 +3346,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 				return true, usageTokens{}, fmt.Errorf("response content intercepted: %s", matched)
 			}
 			if request.Stream && (request.ResponseMode == "responses" || request.ResponseMode == "responses_from_chat") {
-				usage, err := streamNonSSEAsResponsesEvents(w, resp.StatusCode, header, respBody, key, request.ResponseMode)
+				usage, err := streamNonSSEAsResponsesEvents(w, resp.StatusCode, header, respBody, key, request.ResponseMode, request.ToolKinds)
 				return false, usage, err
 			}
 			writeProxyResponse(w, resp.StatusCode, header, respBody, key, request.ResponseMode)
@@ -3197,11 +3395,11 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 				usage, err := streamRawSSE(w, buffered, reader, "responses")
 				return false, usage, err
 			}
-			usage, err := streamChatAsResponsesEvents(w, buffered, reader)
+			usage, err := streamChatAsResponsesEvents(w, buffered, reader, request.ToolKinds)
 			return false, usage, err
 		}
 		if request.ResponseMode == "responses" && bufferedSSELooksLikeChatCompletion(buffered) {
-			usage, err := streamChatAsResponsesEvents(w, buffered, reader)
+			usage, err := streamChatAsResponsesEvents(w, buffered, reader, request.ToolKinds)
 			return false, usage, err
 		}
 		usage, err := streamRawSSE(w, buffered, reader, request.ResponseMode)
@@ -4995,6 +5193,7 @@ func normalizeProxyRequest(r *http.Request, path string, body []byte) (normalize
 		}
 		req.ResponseMode = "responses"
 		req.Stream = wantsStream
+		req.ToolKinds = responsesToolKinds(body)
 		if wantsStream {
 			req.Body = ensureRequestStreamFlag(req.Body, true)
 		}
@@ -5127,6 +5326,47 @@ func responsesToolsToChatTools(value any) []map[string]any {
 		}
 	}
 	return out
+}
+
+// responsesToolKinds keeps the semantic type of tools that must be flattened
+// for a Chat Completions upstream. A Codex custom tool (such as exec or
+// apply_patch) may travel upstream as a Chat function, but it must be restored
+// as custom_tool_call on the return path or the Codex client will not dispatch
+// the local tool.
+func responsesToolKinds(body []byte) map[string]string {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil || raw == nil {
+		return nil
+	}
+	tools, _ := raw["tools"].([]any)
+	if len(tools) == 0 {
+		return nil
+	}
+	kinds := make(map[string]string)
+	for _, value := range tools {
+		tool, _ := value.(map[string]any)
+		if tool == nil || !strings.EqualFold(strings.TrimSpace(stringValue(tool["type"])), "custom") {
+			continue
+		}
+		if name := strings.TrimSpace(stringValue(tool["name"])); name != "" {
+			kinds[name] = "custom"
+		}
+	}
+	if len(kinds) == 0 {
+		return nil
+	}
+	return kinds
+}
+
+func responseToolKind(kindSets []map[string]string, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || len(kindSets) == 0 || kindSets[0] == nil {
+		return "function"
+	}
+	if kindSets[0][name] == "custom" {
+		return "custom"
+	}
+	return "function"
 }
 
 func responsesToolToChatTools(tool map[string]any, namespace string, seen map[string]bool) []map[string]any {
@@ -6331,7 +6571,7 @@ func responsesToChat(body []byte) ([]byte, error) {
 
 // chatToResponsesResponse 把上游返回的 chat.completion（非流式）转换成 Responses 对象，
 // 用于 responses→chat 降级后，把 chat 回复还原成客户端期待的 responses 格式。
-func chatToResponsesResponse(body []byte) ([]byte, error) {
+func chatToResponsesResponse(body []byte, toolKinds ...map[string]string) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
@@ -6364,7 +6604,11 @@ func chatToResponsesResponse(body []byte) ([]byte, error) {
 			if callID == "" {
 				callID = fmt.Sprintf("call_%s_%d", strings.TrimPrefix(id, "resp_"), index)
 			}
-			output = append(output, responsesFunctionCallOutputItem(id, len(output), callID, name, stringValue(fn["arguments"])))
+			if responseToolKind(toolKinds, name) == "custom" {
+				output = append(output, responsesCustomToolCallOutputItem(id, len(output), callID, name, stringValue(fn["arguments"])))
+			} else {
+				output = append(output, responsesFunctionCallOutputItem(id, len(output), callID, name, stringValue(fn["arguments"])))
+			}
 		}
 		if legacy, _ := message["function_call"].(map[string]any); legacy != nil && stringValue(legacy["name"]) != "" {
 			output = append(output, responsesFunctionCallOutputItem(id, len(output), "call_"+strings.TrimPrefix(id, "resp_"), stringValue(legacy["name"]), stringValue(legacy["arguments"])))
@@ -6397,10 +6641,10 @@ func chatToResponsesResponse(body []byte) ([]byte, error) {
 	return json.Marshal(resp)
 }
 
-func streamNonSSEAsResponsesEvents(w http.ResponseWriter, status int, header http.Header, body []byte, key *storage.UpstreamGroupKey, mode string) (usageTokens, error) {
+func streamNonSSEAsResponsesEvents(w http.ResponseWriter, status int, header http.Header, body []byte, key *storage.UpstreamGroupKey, mode string, toolKinds ...map[string]string) (usageTokens, error) {
 	outBody := body
 	if mode == "responses_from_chat" || looksLikeChatCompletionResponse(body) {
-		if converted, err := chatToResponsesResponse(body); err == nil {
+		if converted, err := chatToResponsesResponse(body, toolKinds...); err == nil {
 			outBody = converted
 		}
 	}
@@ -6573,6 +6817,13 @@ func responsesFunctionCallOutputItem(responseID string, outputIndex int, callID,
 	}
 }
 
+func responsesCustomToolCallOutputItem(responseID string, outputIndex int, callID, name, input string) map[string]any {
+	return map[string]any{
+		"id": responseFunctionItemID(responseID, outputIndex), "type": "custom_tool_call", "call_id": callID,
+		"name": name, "input": input, "status": "completed",
+	}
+}
+
 func writeResponsesStreamStart(w http.ResponseWriter, id, model string) error {
 	if err := writeResponsesCreated(w, id, model); err != nil {
 		return err
@@ -6667,6 +6918,27 @@ func writeResponsesFunctionCallAdded(w http.ResponseWriter, responseID string, o
 	return writeSSEEvent(w, sseEvent{Event: "response.output_item.added", Data: mustJSON(payload)})
 }
 
+func writeResponsesCustomToolCallAdded(w http.ResponseWriter, responseID string, outputIndex int, callID, name string) error {
+	itemID := responseFunctionItemID(responseID, outputIndex)
+	payload := map[string]any{
+		"type":         "response.output_item.added",
+		"response_id":  responseID,
+		"output_index": outputIndex,
+		"item": map[string]any{
+			"id": itemID, "type": "custom_tool_call", "call_id": callID,
+			"name": name, "input": "", "status": "in_progress",
+		},
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.output_item.added", Data: mustJSON(payload)})
+}
+
+func writeResponsesToolCallAdded(w http.ResponseWriter, responseID string, outputIndex int, callID, name, kind string) error {
+	if kind == "custom" {
+		return writeResponsesCustomToolCallAdded(w, responseID, outputIndex, callID, name)
+	}
+	return writeResponsesFunctionCallAdded(w, responseID, outputIndex, callID, name)
+}
+
 func writeResponsesFunctionCallArgumentsDelta(w http.ResponseWriter, responseID string, outputIndex int, callID, delta string) error {
 	payload := map[string]any{
 		"type":         "response.function_call_arguments.delta",
@@ -6677,6 +6949,25 @@ func writeResponsesFunctionCallArgumentsDelta(w http.ResponseWriter, responseID 
 		"delta":        delta,
 	}
 	return writeSSEEvent(w, sseEvent{Event: "response.function_call_arguments.delta", Data: mustJSON(payload)})
+}
+
+func writeResponsesCustomToolCallInputDelta(w http.ResponseWriter, responseID string, outputIndex int, callID, delta string) error {
+	payload := map[string]any{
+		"type":         "response.custom_tool_call_input.delta",
+		"response_id":  responseID,
+		"item_id":      responseFunctionItemID(responseID, outputIndex),
+		"output_index": outputIndex,
+		"call_id":      callID,
+		"delta":        delta,
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.custom_tool_call_input.delta", Data: mustJSON(payload)})
+}
+
+func writeResponsesToolCallInputDelta(w http.ResponseWriter, responseID string, outputIndex int, callID, delta, kind string) error {
+	if kind == "custom" {
+		return writeResponsesCustomToolCallInputDelta(w, responseID, outputIndex, callID, delta)
+	}
+	return writeResponsesFunctionCallArgumentsDelta(w, responseID, outputIndex, callID, delta)
 }
 
 func writeResponsesFunctionCallDone(w http.ResponseWriter, responseID string, outputIndex int, callID, name, arguments string) error {
@@ -6706,6 +6997,29 @@ func writeResponsesFunctionCallDone(w http.ResponseWriter, responseID string, ou
 		},
 	}
 	return writeSSEEvent(w, sseEvent{Event: "response.output_item.done", Data: mustJSON(itemDone)})
+}
+
+func writeResponsesCustomToolCallDone(w http.ResponseWriter, responseID string, outputIndex int, callID, name, input string) error {
+	itemID := responseFunctionItemID(responseID, outputIndex)
+	inputDone := map[string]any{
+		"type": "response.custom_tool_call_input.done", "response_id": responseID, "item_id": itemID,
+		"output_index": outputIndex, "call_id": callID, "input": input,
+	}
+	if err := writeSSEEvent(w, sseEvent{Event: "response.custom_tool_call_input.done", Data: mustJSON(inputDone)}); err != nil {
+		return err
+	}
+	itemDone := map[string]any{
+		"type": "response.output_item.done", "response_id": responseID, "output_index": outputIndex,
+		"item": responsesCustomToolCallOutputItem(responseID, outputIndex, callID, name, input),
+	}
+	return writeSSEEvent(w, sseEvent{Event: "response.output_item.done", Data: mustJSON(itemDone)})
+}
+
+func writeResponsesToolCallDone(w http.ResponseWriter, responseID string, outputIndex int, callID, name, input, kind string) error {
+	if kind == "custom" {
+		return writeResponsesCustomToolCallDone(w, responseID, outputIndex, callID, name, input)
+	}
+	return writeResponsesFunctionCallDone(w, responseID, outputIndex, callID, name, input)
 }
 
 func writeResponsesStreamEnd(w http.ResponseWriter, id, model, text string, usage usageTokens) error {
@@ -7466,7 +7780,7 @@ func streamResponsesAsChat(w http.ResponseWriter, r io.Reader) (usageTokens, err
 // streamChatAsResponsesEvents 把上游的 chat.completion.chunk SSE 流转换成 Responses SSE 事件流，
 // 用于 responses→chat 降级：客户端要 responses 格式，上游只会 chat，这里做流式桥接。
 // 发出的事件序列：response.created → response.output_text.delta* → response.completed → [DONE]
-func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader) (usageTokens, error) {
+func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader, toolKinds ...map[string]string) (usageTokens, error) {
 	id := "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	model := ""
 	createdSent := false
@@ -7479,6 +7793,7 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		OutputIndex int
 		CallID      string
 		Name        string
+		Kind        string
 		Added       bool
 		Args        strings.Builder
 	}
@@ -7536,6 +7851,7 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 				fn, _ := call["function"].(map[string]any)
 				if name := stringValue(fn["name"]); name != "" {
 					state.Name = name
+					state.Kind = responseToolKind(toolKinds, name)
 				}
 				argsDelta := stringValue(fn["arguments"])
 				if state.CallID == "" {
@@ -7548,14 +7864,14 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 					if err := emitCreated(); err != nil {
 						return err
 					}
-					if err := writeResponsesFunctionCallAdded(w, id, state.OutputIndex, state.CallID, state.Name); err != nil {
+					if err := writeResponsesToolCallAdded(w, id, state.OutputIndex, state.CallID, state.Name, state.Kind); err != nil {
 						return err
 					}
 					state.Added = true
 				}
 				if argsDelta != "" {
 					state.Args.WriteString(argsDelta)
-					if err := writeResponsesFunctionCallArgumentsDelta(w, id, state.OutputIndex, state.CallID, argsDelta); err != nil {
+					if err := writeResponsesToolCallInputDelta(w, id, state.OutputIndex, state.CallID, argsDelta, state.Kind); err != nil {
 						return err
 					}
 				}
@@ -7637,7 +7953,7 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		if state == nil || !state.Added {
 			continue
 		}
-		if err := writeResponsesFunctionCallDone(w, id, state.OutputIndex, state.CallID, state.Name, state.Args.String()); err != nil {
+		if err := writeResponsesToolCallDone(w, id, state.OutputIndex, state.CallID, state.Name, state.Args.String(), state.Kind); err != nil {
 			return best, err
 		}
 	}
@@ -7648,7 +7964,11 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	for _, idx := range toolOrder {
 		state := toolCalls[idx]
 		if state != nil && state.Added {
-			outputByIndex[state.OutputIndex] = responsesFunctionCallOutputItem(id, state.OutputIndex, state.CallID, state.Name, state.Args.String())
+			if state.Kind == "custom" {
+				outputByIndex[state.OutputIndex] = responsesCustomToolCallOutputItem(id, state.OutputIndex, state.CallID, state.Name, state.Args.String())
+			} else {
+				outputByIndex[state.OutputIndex] = responsesFunctionCallOutputItem(id, state.OutputIndex, state.CallID, state.Name, state.Args.String())
+			}
 		}
 	}
 	if len(outputByIndex) == 0 {

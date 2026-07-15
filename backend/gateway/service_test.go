@@ -1286,6 +1286,10 @@ func TestCodexResponsesLiteReasoningContextIsAddedForNativeResponses(t *testing.
 	if reasoning["effort"] != "high" || reasoning["context"] != "all_turns" {
 		t.Fatalf("reasoning contract not preserved: %#v", reasoning)
 	}
+	include, _ := raw["include"].([]any)
+	if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+		t.Fatalf("reasoning encrypted-content include missing: %#v", raw["include"])
+	}
 
 	chat := stripCodexResponsesLiteHeader(normalizedRequest{Header: request.Header})
 	if chat.Header.Get(codexResponsesLiteHeader) != "" {
@@ -1967,6 +1971,73 @@ func TestOneClickHealthTestOptionsAreStrictAndLowCost(t *testing.T) {
 	}
 	if len(opts.GroupIDs) != 2 || opts.GroupIDs[0] != 3 || opts.GroupIDs[1] != 7 {
 		t.Fatalf("group IDs = %#v", opts.GroupIDs)
+	}
+}
+
+func TestOneClickHealthJobRunsInBackgroundAndDeduplicatesBatches(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		started <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"resp_probe","output_text":"2"}`))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("j", 32))
+	channel := &storage.Channel{Name: "background-health", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-background-health")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type,
+		GroupRef: "background", GroupName: "background", Ratio: 0.05, KeyCipher: cipher,
+		Enabled: true, Status: "alive", ClientFormat: "openai", RequestMode: "responses",
+	}); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	first, err := env.svc.StartOneClickHealthJob(nil)
+	if err != nil {
+		t.Fatalf("start health job: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background health job did not start")
+	}
+	second, err := env.svc.StartOneClickHealthJob(nil)
+	if err != nil {
+		t.Fatalf("deduplicate health job: %v", err)
+	}
+	if second.ID != first.ID {
+		t.Fatalf("concurrent one-click batch created a second job: first=%s second=%s", first.ID, second.ID)
+	}
+	close(release)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		job, err := env.svc.HealthJob(first.ID)
+		if err != nil {
+			t.Fatalf("load health job: %v", err)
+		}
+		if job.Status == "completed" {
+			if job.Result == nil || job.Result.Alive != 1 || job.Completed != 1 {
+				t.Fatalf("completed health job result = %#v", job)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("health job did not finish: %#v", job)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -3655,6 +3726,33 @@ func TestStreamChatAsResponsesEventsConvertsToolCalls(t *testing.T) {
 	}
 }
 
+func TestChatFallbackRestoresCodexCustomToolCalls(t *testing.T) {
+	kinds := responsesToolKinds([]byte(`{"tools":[{"type":"custom","name":"exec"}]}`))
+	if kinds["exec"] != "custom" {
+		t.Fatalf("custom tool kind was not retained: %#v", kinds)
+	}
+	body := strings.NewReader(
+		"data: {\"id\":\"chatcmpl_custom\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_exec\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"dir\"}}]}}]}\n\n" +
+			"data: [DONE]\n\n")
+	rec := httptest.NewRecorder()
+	if _, err := streamChatAsResponsesEvents(rec, nil, newSSEStreamReader(body), kinds); err != nil {
+		t.Fatalf("stream custom tool bridge: %v", err)
+	}
+	out := rec.Body.String()
+	for _, want := range []string{"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done", `"type":"custom_tool_call"`, `"input":"dir"`, "response.completed"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing custom tool wire field %q:\n%s", want, out)
+		}
+	}
+	converted, err := chatToResponsesResponse([]byte(`{"id":"chatcmpl_custom","choices":[{"message":{"tool_calls":[{"id":"call_exec","type":"function","function":{"name":"exec","arguments":"dir"}}]}}]}`), kinds)
+	if err != nil {
+		t.Fatalf("non-stream custom tool bridge: %v", err)
+	}
+	if !strings.Contains(string(converted), `"type":"custom_tool_call"`) || !strings.Contains(string(converted), `"input":"dir"`) {
+		t.Fatalf("non-stream custom tool was not restored: %s", converted)
+	}
+}
+
 func TestChatToResponsesResponseKeepsToolCalls(t *testing.T) {
 	converted, err := chatToResponsesResponse([]byte(`{"id":"chatcmpl_tool","model":"gpt-test","choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"call_exec","type":"function","function":{"name":"exec","arguments":"{\"cmd\":\"pwd\"}"}}]}}]}`))
 	if err != nil {
@@ -4311,6 +4409,64 @@ func TestReplacingManualKeyRedetectsAuthenticationHeader(t *testing.T) {
 	}
 	if updated.Status != "alive" {
 		t.Fatalf("status after successful replacement detection = %q, want alive", updated.Status)
+	}
+}
+
+func TestReplacingHealthyManualKeyKeepsProvenAuthenticationHeader(t *testing.T) {
+	var hits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != "/v1/responses" || r.Header.Get("Authorization") != "Bearer sk-new" || r.Header.Get("X-Api-Key") != "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"message":"invalid api key"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_manual\",\"status\":\"in_progress\"}}\n\n"))
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_manual\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("r", 32))
+	channel := &storage.Channel{Name: "manual-contract", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: false}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-old")
+	if err != nil {
+		t.Fatalf("encrypt old key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type,
+		ClientFormat: "openai", RequestMode: "responses", RequestModeSource: "manual", AuthMode: "bearer",
+		GroupRef: "manual:contract", GroupName: "contract", Ratio: 1, KeyCipher: cipher, Enabled: true, Status: "alive",
+	}); err != nil {
+		t.Fatalf("insert manual group key: %v", err)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "manual:contract")
+	if err != nil || group == nil {
+		t.Fatalf("find manual group key: %v", err)
+	}
+	nextKey := "sk-new"
+	updated, err := env.svc.UpdateGroupKey(group.ID, UpdateGroupKeyInput{Key: &nextKey})
+	if err != nil {
+		t.Fatalf("replace manual key: %v", err)
+	}
+	if updated.AuthMode != "bearer" || hits.Load() != 0 {
+		t.Fatalf("healthy manual replacement changed/probed header: auth=%q hits=%d", updated.AuthMode, hits.Load())
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy after key rotation: %v", err)
+	}
+	if hits.Load() != 1 || rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "response.completed") {
+		t.Fatalf("rotated key request = hits=%d status=%d body=%s", hits.Load(), rec.Code, rec.Body.String())
 	}
 }
 

@@ -8,6 +8,20 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.25.0 - 2026-07-15
+
+### Added
+
+- One-click OpenAI health checks now run as a server-side background job. The dashboard starts quickly and polls progress, so navigating away no longer cancels a long batch.
+
+### Fixed
+
+- A one-click health batch remains strictly serial, checks only enabled OpenAI routes whose effective ratio is at most `0.1`, waits two seconds between completed probes, and rejects duplicate batches to prevent probe bursts from causing collective false failures.
+- Cover-sync continues to refresh upstream names and advertised ratios, while preserving each operator-set `ratio_scale_percent` correction used by real-cost display and scheduling.
+- Health-check regression coverage now verifies strict generation success, temporary-failure isolation, same-upstream serialization, background-job de-duplication, and ratio-correction preservation.
+- Manual Key rotation now retains the established protocol and authentication header for a healthy group; only a real pre-output 401/403 can trigger the one-time alternate-header recovery.
+- Chat-only fallback now restores Codex `custom_tool_call` events for custom tools such as `exec` and `apply_patch`, including their input lifecycle and terminal output. Native Responses-Lite requests preserve encrypted reasoning context across tool turns.
+
 ## v0.24.8 - 2026-07-15
 
 ### Fixed
