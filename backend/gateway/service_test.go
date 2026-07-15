@@ -1231,6 +1231,63 @@ func TestApplyUpstreamAuthHeadersMatchesChannelFormat(t *testing.T) {
 	}
 }
 
+func TestProxyStreamFailsOverFromForbiddenCharityKeyBeforeWritingTerminal(t *testing.T) {
+	var forbiddenHits atomic.Int64
+	forbidden := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forbiddenHits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream access forbidden"}}`))
+	}))
+	defer forbidden.Close()
+
+	var healthyHits atomic.Int64
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		healthyHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_healthy\",\"status\":\"in_progress\"}}\n\n"))
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_healthy\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"))
+	}))
+	defer healthy.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("f", 32))
+	for _, spec := range []struct {
+		name string
+		url  string
+		key  string
+	}{
+		{name: "forbidden-charity", url: forbidden.URL, key: "sk-forbidden"},
+		{name: "healthy-charity", url: healthy.URL, key: "sk-healthy"},
+	} {
+		channel := &storage.Channel{Name: spec.name, Type: storage.ChannelTypeSub2API, SiteURL: spec.url, MonitorEnabled: true}
+		if err := env.channels.Create(channel); err != nil {
+			t.Fatalf("create %s: %v", spec.name, err)
+		}
+		cipher, err := env.cipher.Encrypt(spec.key)
+		if err != nil {
+			t.Fatalf("encrypt %s: %v", spec.name, err)
+		}
+		if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+			ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type,
+			ClientFormat: "openai", RequestMode: "responses", GroupRef: spec.name, GroupName: spec.name,
+			Ratio: 1, Charity: true, KeyCipher: cipher, Enabled: true, Status: "alive",
+		}); err != nil {
+			t.Fatalf("create %s group: %v", spec.name, err)
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping","stream":true}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("charity fallback request: %v", err)
+	}
+	if forbiddenHits.Load() == 0 || healthyHits.Load() != 1 || rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "resp_healthy") || !strings.Contains(rec.Body.String(), "response.completed") {
+		t.Fatalf("forbidden charity did not fail over: forbidden=%d healthy=%d status=%d body=%s", forbiddenHits.Load(), healthyHits.Load(), rec.Code, rec.Body.String())
+	}
+}
+
 func TestProxyFailurePolicyRequiresThreeTransientFailures(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("b", 32))
 	channel := &storage.Channel{Name: "transient", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.invalid", MonitorEnabled: true}

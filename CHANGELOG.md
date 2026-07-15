@@ -8,6 +8,13 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.25.1 - 2026-07-15
+
+### Fixed
+
+- A streamed request whose first charity upstream returns 401, 403, 404, 429, or 5xx before emitting any event now retries the next healthy compatible charity Key. The gateway only returns a terminal error after every eligible candidate has failed, preventing a single refused Key from making several live public routes appear unavailable.
+- One-click OpenAI health probing keeps the low-cost order: probe `gpt-5.4` first, stop immediately on success, and probe `gpt-5.5` only if 5.4 did not complete a valid generation.
+
 ## v0.25.0 - 2026-07-15
 
 ### Added

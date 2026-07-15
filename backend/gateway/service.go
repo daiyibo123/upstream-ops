@@ -3150,6 +3150,9 @@ func (s *Service) attemptStream(
 		// streamProxyCandidate returns retry=false after response headers/body may
 		// already have been written to the downstream client. From that point on
 		// we must not try fallbacks or another candidate on the same writer.
+		if !timedWriter.Started() && shouldFailoverBeforeStreamWrite(err) {
+			return candOutcome{kind: candRetryable, err: err, errMsg: errMsg, markFailure: true}
+		}
 		return failBeforeStreamBody(err, errMsg, true)
 	}
 	if fallback, reason, ok := fallbackRequestAfterFailure(normalized, errMsg); ok {
@@ -3175,6 +3178,9 @@ func (s *Service) attemptStream(
 		}
 		errMsg = reason + " retry failed: " + err.Error()
 		if !retry {
+			if !timedWriter.Started() && shouldFailoverBeforeStreamWrite(err) {
+				return candOutcome{kind: candRetryable, err: err, errMsg: errMsg, markFailure: true}
+			}
 			return failBeforeStreamBody(err, errMsg, true)
 		}
 	}
@@ -3203,9 +3209,32 @@ func (s *Service) attemptStream(
 	if retry {
 		return candOutcome{kind: candRetryable, err: err, errMsg: errMsg}
 	}
+	if !timedWriter.Started() && shouldFailoverBeforeStreamWrite(err) {
+		return candOutcome{kind: candRetryable, err: err, errMsg: errMsg, markFailure: true}
+	}
 	// 流已经开始写 / 明确 fatal：仍然记一次失败（这样下次调度不会又选中这个坏候选），
 	// 但不再切候选（否则会往同一个 ResponseWriter 上二次写头/写字节）。
 	return failBeforeStreamBody(err, errMsg, true)
+}
+
+// shouldFailoverBeforeStreamWrite separates an upstream-specific refusal from
+// a malformed client request. When no downstream byte has been written yet,
+// 401/403/404/429/5xx from one upstream must not become a final Codex error:
+// another healthy Key in the same charity group can still serve the request.
+func shouldFailoverBeforeStreamWrite(err error) bool {
+	if err == nil {
+		return false
+	}
+	var gatewayErr *GatewayError
+	if !errors.As(err, &gatewayErr) {
+		return true
+	}
+	switch gatewayErr.Status {
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return false
+	default:
+		return gatewayErr.Status >= http.StatusUnauthorized && gatewayErr.Status <= http.StatusNetworkAuthenticationRequired
+	}
 }
 
 func (s *Service) attemptNonStream(
