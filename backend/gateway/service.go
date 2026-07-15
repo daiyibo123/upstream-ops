@@ -774,9 +774,6 @@ func usageStatus(usage usageTokens) string {
 	if strings.TrimSpace(usage.SoftFailure) != "" {
 		return "interrupted"
 	}
-	if usage.Estimated {
-		return "estimated"
-	}
 	return "success"
 }
 
@@ -1323,7 +1320,10 @@ func isManualGroupKey(key *storage.UpstreamGroupKey) bool {
 	return key != nil && strings.HasPrefix(strings.ToLower(strings.TrimSpace(key.GroupRef)), "manual:")
 }
 
-const manualRequestModeDetectTimeout = 12 * time.Second
+const (
+	manualRequestModeDetectTimeout   = 45 * time.Second
+	requestModeDetectionProbeTimeout = 8 * time.Second
+)
 
 // DetectGroupRequestMode probes the protocol that belongs to this channel
 // format. OpenAI relays are detected as Responses or Chat; Claude and Grok are
@@ -1452,7 +1452,7 @@ func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key
 			for _, authMode := range upstreamAuthModesForProbe(key) {
 				candidate := *key
 				candidate.AuthMode = authMode
-				status, _, body, probeErr := s.requestHealthProbeCandidate(ctx, request, &candidate, healthProbeTimeout)
+				status, _, body, probeErr := s.requestHealthProbeCandidate(ctx, request, &candidate, requestModeDetectionProbeTimeout)
 				if !healthProbeSucceeded(status, body, probeErr) {
 					continue
 				}
@@ -1547,6 +1547,8 @@ func (s *Service) detectGroupRequestModes(ids []uint) {
 			if err != nil || key == nil || strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
 				return
 			}
+			release := s.acquireHealthProbeUpstreamSlot(*key)
+			defer release()
 			ctx, cancel := context.WithTimeout(context.Background(), manualRequestModeDetectTimeout)
 			defer cancel()
 			_, _ = s.DetectGroupRequestMode(ctx, groupID)
@@ -3839,8 +3841,23 @@ func looksLikeHealthGenerationSuccess(body []byte) bool {
 		if strings.Contains(typ, "failed") || strings.Contains(typ, "error") {
 			return false
 		}
-		if typ == "response.completed" || typ == "response.output_item.done" || typ == "response.content_part.done" {
-			return true
+		if typ == "response.completed" {
+			if response, ok := raw["response"].(map[string]any); ok {
+				return strings.TrimSpace(responseText(response)) != ""
+			}
+			return strings.TrimSpace(responseText(raw)) != ""
+		}
+		if typ == "response.output_item.done" || typ == "response.content_part.done" {
+			if strings.TrimSpace(responseText(raw)) != "" || strings.TrimSpace(stringValue(raw["text"])) != "" {
+				return true
+			}
+			if item, ok := raw["item"].(map[string]any); ok && strings.TrimSpace(responseText(map[string]any{"output": []any{item}})) != "" {
+				return true
+			}
+			if part, ok := raw["part"].(map[string]any); ok && strings.TrimSpace(stringValue(part["text"])) != "" {
+				return true
+			}
+			return false
 		}
 		if typ == "response.output_text.delta" {
 			return strings.TrimSpace(stringValue(raw["delta"])) != ""
@@ -3858,20 +3875,15 @@ func looksLikeHealthGenerationSuccess(body []byte) bool {
 	if choices, ok := raw["choices"].([]any); ok && len(choices) > 0 {
 		return chatChoicesHaveGeneration(choices)
 	}
-	for _, key := range []string{"output", "output_text", "content"} {
-		if _, ok := raw[key]; ok {
-			return true
-		}
+	if strings.TrimSpace(responseText(raw)) != "" || strings.TrimSpace(stringValue(raw["output_text"])) != "" {
+		return true
 	}
 	if response, ok := raw["response"].(map[string]any); ok {
 		if _, ok := response["error"]; ok {
 			return false
 		}
 		status := strings.ToLower(stringValue(response["status"]))
-		if status == "completed" || status == "complete" || status == "succeeded" {
-			return true
-		}
-		if stringValue(response["output_text"]) != "" || response["output"] != nil {
+		if (status == "completed" || status == "complete" || status == "succeeded") && strings.TrimSpace(responseText(response)) != "" {
 			return true
 		}
 	}
@@ -3903,9 +3915,6 @@ func chatChoicesHaveGeneration(choices []any) bool {
 		choice, ok := item.(map[string]any)
 		if !ok {
 			continue
-		}
-		if finish := strings.TrimSpace(stringValue(choice["finish_reason"])); finish != "" {
-			return true
 		}
 		if delta, ok := choice["delta"].(map[string]any); ok {
 			if strings.TrimSpace(stringValue(delta["content"])) != "" || strings.TrimSpace(stringValue(delta["reasoning_content"])) != "" {

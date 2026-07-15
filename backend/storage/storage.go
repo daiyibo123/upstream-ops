@@ -139,6 +139,12 @@ func AutoMigrate(db *gorm.DB) error {
 	); err != nil {
 		return err
 	}
+	// "estimated" described how token counts were calculated, not whether the
+	// request succeeded. Keep request outcome in Status and avoid showing a
+	// successful call as an unfamiliar pseudo-error in usage history.
+	if err := db.Model(&UsageLog{}).Where("status = ?", "estimated").Update("status", "success").Error; err != nil {
+		return fmt.Errorf("normalize estimated usage statuses: %w", err)
+	}
 	return backfillGatewayKeyGroupScopes(db)
 }
 

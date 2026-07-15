@@ -1596,6 +1596,21 @@ func TestHealthGenerationSuccessAcceptsPlainMathAnswer(t *testing.T) {
 	if looksLikeHealthGenerationSuccess([]byte(`{"type":"response.failed","response":{"error":{"message":"boom"}}}`)) {
 		t.Fatal("response.failed must not count as a successful health generation")
 	}
+	if looksLikeHealthGenerationSuccess([]byte(`{"type":"response.completed","response":{"status":"completed","output":[]}}`)) {
+		t.Fatal("empty response.completed must not count as generated output")
+	}
+	if looksLikeHealthGenerationSuccess([]byte(`{"object":"chat.completion.chunk","choices":[{"delta":{},"finish_reason":"stop"}]}`)) {
+		t.Fatal("finish_reason without generated content must not count as healthy")
+	}
+	if !looksLikeHealthGenerationSuccess([]byte(`{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"2"}]}]}}`)) {
+		t.Fatal("completed response with output text should count as healthy")
+	}
+}
+
+func TestUsageStatusTreatsLocalTokenEstimateAsSuccessfulRequest(t *testing.T) {
+	if got := usageStatus(usageTokens{Estimated: true}); got != "success" {
+		t.Fatalf("estimated local accounting status = %q, want success", got)
+	}
 }
 
 func TestHealthProbeRetriesCompatibleModelWhenPrimaryRouteLooksUnavailable(t *testing.T) {

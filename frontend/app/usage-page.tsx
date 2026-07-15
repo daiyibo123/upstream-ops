@@ -43,6 +43,7 @@ function durationLabel(ms: number | null | undefined) {
 function usageStatusLabel(status?: string | null) {
   switch ((status ?? "success").toLowerCase()) {
     case "success":
+    case "estimated":
       return "完成"
     case "interrupted":
       return "中断"
@@ -56,6 +57,7 @@ function usageStatusLabel(status?: string | null) {
 function usageStatusTone(status?: string | null) {
   switch ((status ?? "success").toLowerCase()) {
     case "success":
+    case "estimated":
       return "border-success/20 bg-success/10 text-success"
     case "interrupted":
       return "border-warning/20 bg-warning/10 text-warning"

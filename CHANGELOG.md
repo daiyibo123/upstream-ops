@@ -8,6 +8,15 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.3 - 2026-07-15
+
+### Fixed
+
+- Successful usage records no longer use the misleading `estimated` status. Local token estimation remains an internal accounting detail while the request outcome is stored and displayed as `success` / “完成”; existing `estimated` rows are normalized during migration.
+- Fixed automatic request-mode detection timing out before it could try Chat Completions or the alternate authentication header. Detection now has a realistic overall deadline and a bounded timeout per protocol attempt.
+- Automatic protocol detection is serialized per upstream website, preventing several keys on the same relay from being probed simultaneously and triggering avoidable 5XX responses.
+- Tightened health-check success recognition: an empty `response.completed` event or a Chat chunk containing only `finish_reason` no longer marks a channel alive. Actual text/reasoning generation is required, while completed Responses events containing real output remain supported.
+
 ## v0.24.2 - 2026-07-15
 
 ### Fixed
