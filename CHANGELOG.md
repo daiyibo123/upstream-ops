@@ -8,6 +8,18 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.4 - 2026-07-15
+
+### Fixed
+
+- Fixed manual OpenAI-compatible channels whose native Responses endpoint requires the official Codex input-list shape. Health checks and protocol detection now send a streamed `1+1=` request using `input` message/content blocks and `reasoning.effort=low` instead of the rejected shorthand string form.
+- A manually selected request protocol is now tested exactly as configured. Health checking no longer reports a manual Responses channel alive merely because a hidden Chat fallback succeeded.
+- Increased the tiny probe output allowance to 16 tokens so low-effort reasoning models can complete the math response without turning a healthy route into a false failure.
+
+### Added
+
+- Added a refresh icon to Usage Details. It reloads the current page of records without refreshing the whole browser page and shows a spinner while loading.
+
 ## v0.24.3 - 2026-07-15
 
 ### Fixed

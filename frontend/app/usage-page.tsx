@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { ChevronLeft, ChevronRight, HeartHandshake, KeyRound, Loader2, ScrollText, Trash2 } from "lucide-react"
+import { ChevronLeft, ChevronRight, HeartHandshake, KeyRound, Loader2, RefreshCw, ScrollText, Trash2 } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -71,6 +71,7 @@ export default function UsagePage() {
   const [loading, setLoading] = useState(true)
   const [clearing, setClearing] = useState(false)
   const [page, setPage] = useState(1)
+  const [refreshTick, setRefreshTick] = useState(0)
 
   const items = data?.items ?? []
   const keys = data?.keys ?? []
@@ -96,7 +97,7 @@ export default function UsagePage() {
     return () => {
       cancelled = true
     }
-  }, [page])
+  }, [page, refreshTick])
 
   const rows = useMemo(() => items, [items])
   const keyRows = useMemo(
@@ -235,6 +236,17 @@ export default function UsagePage() {
             <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
               共 {total} 条
             </Badge>
+            <Button
+              variant="outline"
+              size="icon-sm"
+              className="size-8"
+              disabled={loading || clearing}
+              title="刷新调用明细"
+              aria-label="刷新调用明细"
+              onClick={() => setRefreshTick((value) => value + 1)}
+            >
+              <RefreshCw className={`size-3.5 ${loading ? "animate-spin" : ""}`} />
+            </Button>
             <Button
               variant="outline"
               size="sm"

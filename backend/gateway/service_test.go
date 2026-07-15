@@ -1561,7 +1561,9 @@ func TestHealthProbeUsesNativeStreamingOpenAIResponsesRequest(t *testing.T) {
 	if chatHits != 0 || responsesHits != 1 {
 		t.Fatalf("health probe must use native responses directly, chat=%d responses=%d", chatHits, responsesHits)
 	}
-	if seen["stream"] != true || seen["max_output_tokens"] != float64(healthProbeMaxOutputTokens) || seen["input"] != healthProbePrompt {
+	input, _ := seen["input"].([]any)
+	reasoning, _ := seen["reasoning"].(map[string]any)
+	if seen["stream"] != true || seen["max_output_tokens"] != float64(healthProbeMaxOutputTokens) || len(input) != 1 || reasoning["effort"] != "low" {
 		t.Fatalf("probe body = %#v", seen)
 	}
 	if seen["model"] != openAIHealthProbePrimaryModel {
@@ -1604,6 +1606,53 @@ func TestHealthGenerationSuccessAcceptsPlainMathAnswer(t *testing.T) {
 	}
 	if !looksLikeHealthGenerationSuccess([]byte(`{"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"2"}]}]}}`)) {
 		t.Fatal("completed response with output text should count as healthy")
+	}
+}
+
+func TestHealthGenerationProbeUsesCodexInputListAndLowReasoning(t *testing.T) {
+	request := healthGenerationProbeRequest("gpt-test")
+	var body map[string]any
+	if err := json.Unmarshal(request.Body, &body); err != nil {
+		t.Fatalf("decode probe body: %v", err)
+	}
+	input, ok := body["input"].([]any)
+	if !ok || len(input) != 1 {
+		t.Fatalf("probe input must use Responses list shape: %#v", body["input"])
+	}
+	reasoning, _ := body["reasoning"].(map[string]any)
+	if reasoning["effort"] != "low" || intField(body, "max_output_tokens") != healthProbeMaxOutputTokens || body["stream"] != true {
+		t.Fatalf("probe must be low-effort streamed generation: %#v", body)
+	}
+}
+
+func TestManualRequestModeHealthDoesNotSucceedThroughAnotherProtocol(t *testing.T) {
+	var chatHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/chat/completions" {
+			chatHits++
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"2\"}}]}\n\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":{"message":"responses endpoint not found"}}`))
+	}))
+	defer upstream.Close()
+	env := newGatewayProxyTestEnv(t, strings.Repeat("q", 32))
+	channel := &storage.Channel{Name: "manual-exact-mode", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, _ := env.cipher.Encrypt("sk-exact")
+	key := &storage.UpstreamGroupKey{ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type, ClientFormat: "openai", RequestMode: "responses", RequestModeSource: "manual", AuthMode: "bearer", GroupRef: "manual:exact", GroupName: "exact", Ratio: 1, KeyCipher: cipher, Enabled: true}
+	if err := env.groupKeys.Upsert(key); err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	stored, _ := env.groupKeys.FindByChannelGroup(channel.ID, key.GroupRef)
+	status, _, err := env.svc.healthProbeOpenAIModel(context.Background(), stored, "gpt-test", false)
+	if status != http.StatusNotFound || chatHits != 0 {
+		t.Fatalf("manual responses probe incorrectly used Chat: status=%d chatHits=%d err=%v", status, chatHits, err)
 	}
 }
 

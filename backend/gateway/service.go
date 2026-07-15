@@ -68,7 +68,7 @@ const (
 	openAIHealthProbePrimaryModel  = "gpt-5.4"
 	openAIHealthProbeFallbackModel = "gpt-4o-mini"
 	healthProbePrompt              = "1+1="
-	healthProbeMaxOutputTokens     = 2
+	healthProbeMaxOutputTokens     = 16
 )
 
 var errResponsesStreamTerminal = errors.New("responses stream terminal event emitted")
@@ -3430,27 +3430,29 @@ func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.Upstr
 	if allowCompatibleModelRetry && shouldRetryHealthWithCompatibleModel(body, err) {
 		return status, body, err
 	}
-	if fallback, _, ok := healthProbeFallbackRequest(req, status, body, err); ok {
-		originalStatus, originalBody, originalErr := status, body, err
-		fallbackStatus, _, fallbackBody, fallbackErr := s.requestHealthProbeCandidate(ctx, fallback, key, healthProbeTimeout)
-		if fallbackErr == nil && healthProbeSucceeded(fallbackStatus, fallbackBody, nil) {
-			// The health request is a real streamed generation probe. If its
-			// alternate protocol succeeds, remember that capability immediately
-			// so the next Codex request does not need to rediscover it.
-			mode := "responses"
-			if fallback.ResponseMode == "responses_from_chat" {
-				mode = "chat"
+	if !strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
+		if fallback, _, ok := healthProbeFallbackRequest(req, status, body, err); ok {
+			originalStatus, originalBody, originalErr := status, body, err
+			fallbackStatus, _, fallbackBody, fallbackErr := s.requestHealthProbeCandidate(ctx, fallback, key, healthProbeTimeout)
+			if fallbackErr == nil && healthProbeSucceeded(fallbackStatus, fallbackBody, nil) {
+				// The health request is a real streamed generation probe. If its
+				// alternate protocol succeeds, remember that capability immediately
+				// so the next Codex request does not need to rediscover it.
+				mode := "responses"
+				if fallback.ResponseMode == "responses_from_chat" {
+					mode = "chat"
+				}
+				if normalizeUpstreamRequestMode(key.RequestMode) != mode &&
+					!strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
+					_ = s.groupKeys.UpdateRequestMode(key.ID, mode)
+				}
+				return fallbackStatus, fallbackBody, nil
 			}
-			if normalizeUpstreamRequestMode(key.RequestMode) != mode &&
-				!strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
-				_ = s.groupKeys.UpdateRequestMode(key.ID, mode)
-			}
-			return fallbackStatus, fallbackBody, nil
+			// Keep the original result when the alternate protocol also fails. That
+			// preserves meaningful statuses such as rate limit or non-generation
+			// instead of replacing them with a misleading 404 from the fallback URL.
+			return originalStatus, originalBody, originalErr
 		}
-		// Keep the original result when the alternate protocol also fails. That
-		// preserves meaningful statuses such as rate limit or non-generation
-		// instead of replacing them with a misleading 404 from the fallback URL.
-		return originalStatus, originalBody, originalErr
 	}
 	return status, body, err
 }
@@ -3660,10 +3662,19 @@ func healthProbeModelIsOneOf(model string, values ...string) bool {
 }
 
 func healthGenerationProbeRequest(model string) normalizedRequest {
-	// 测活探针：发一道极短数学题，并把输出限制到 2 tokens，验证真实流式生成且尽量少烧 token。
+	// Use the native Codex/Responses input-list shape. Several compatible
+	// relays reject the shorthand string input even though real Codex requests
+	// work, which previously caused a false protocol fallback to Chat.
 	responsesBody, _ := json.Marshal(map[string]any{
-		"model":             model,
-		"input":             healthProbePrompt,
+		"model": model,
+		"input": []map[string]any{{
+			"role": "user",
+			"content": []map[string]any{{
+				"type": "input_text",
+				"text": healthProbePrompt,
+			}},
+		}},
+		"reasoning":         map[string]any{"effort": "low"},
 		"max_output_tokens": healthProbeMaxOutputTokens,
 		"stream":            true,
 	})
