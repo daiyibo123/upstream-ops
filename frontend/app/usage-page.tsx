@@ -107,7 +107,6 @@ export default function UsagePage() {
         .sort((a, b) => b.total_tokens - a.total_tokens || b.today_tokens - a.today_tokens || a.name.localeCompare(b.name)),
     [keys],
   )
-  const publicKeyIDs = useMemo(() => new Set(keys.filter((key) => key.is_public).map((key) => key.id)), [keys])
 
   async function clearUsageLogs() {
     if (total <= 0 || clearing) return
@@ -334,8 +333,8 @@ export default function UsagePage() {
                             <span className="truncate font-medium text-foreground" title={log.channel_name || log.group_name || ""}>
                               {log.channel_name || log.group_name || "未知上游"}
                             </span>
-                            {(log.gateway_key_is_public || (log.gateway_key_id != null && publicKeyIDs.has(log.gateway_key_id))) ? (
-                              <HeartHandshake className="size-3 shrink-0 text-amber-500" aria-label="公益 Key" />
+                            {log.upstream_group_charity ? (
+                              <HeartHandshake className="size-3 shrink-0 text-amber-500" aria-label="公益渠道" />
                             ) : null}
                           </div>
                           <span className="mt-0.5 block font-mono text-[10px] text-muted-foreground">

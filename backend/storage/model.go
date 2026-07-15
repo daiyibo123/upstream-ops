@@ -300,22 +300,27 @@ type UsageLog struct {
 	// GatewayKeyIsPublic snapshots the local Key's public status at request
 	// time.  A usage row must keep this display attribute even if the Key is
 	// later reconfigured, disabled, or no longer returned by the Key list.
-	GatewayKeyIsPublic bool      `gorm:"not null;default:false;index" json:"gateway_key_is_public"`
-	RequestIP          string    `gorm:"size:64;index" json:"request_ip,omitempty"`
-	ChannelID          uint      `gorm:"index" json:"channel_id"`
-	ChannelName        string    `gorm:"size:128" json:"channel_name,omitempty"`
-	GroupName          string    `gorm:"size:128" json:"group_name,omitempty"`
-	Model              string    `gorm:"size:256;index" json:"model,omitempty"`
-	ClientFormat       string    `gorm:"size:16" json:"client_format,omitempty"`
-	PromptTokens       int64     `json:"prompt_tokens"`
-	CompletionTokens   int64     `json:"completion_tokens"`
-	TotalTokens        int64     `json:"total_tokens"`
-	CachedTokens       int64     `gorm:"not null;default:0" json:"cached_tokens"`
-	Ratio              float64   `json:"ratio"`
-	Status             string    `gorm:"size:32;not null;default:'success';index" json:"status"`
-	FirstTokenMS       int64     `gorm:"not null;default:0" json:"first_token_ms"`
-	DurationMS         int64     `gorm:"not null;default:0" json:"duration_ms"`
-	CreatedAt          time.Time `gorm:"index" json:"created_at"`
+	GatewayKeyIsPublic bool   `gorm:"not null;default:false;index" json:"gateway_key_is_public"`
+	RequestIP          string `gorm:"size:64;index" json:"request_ip,omitempty"`
+	ChannelID          uint   `gorm:"index" json:"channel_id"`
+	ChannelName        string `gorm:"size:128" json:"channel_name,omitempty"`
+	// UpstreamGroupKeyID/Charity snapshot the actual upstream route selected
+	// for this request. They must not be inferred from the caller's gateway Key:
+	// a public caller can use a paid route and a normal caller can use charity.
+	UpstreamGroupKeyID   uint      `gorm:"index" json:"upstream_group_key_id,omitempty"`
+	UpstreamGroupCharity bool      `gorm:"not null;default:false;index" json:"upstream_group_charity"`
+	GroupName            string    `gorm:"size:128" json:"group_name,omitempty"`
+	Model                string    `gorm:"size:256;index" json:"model,omitempty"`
+	ClientFormat         string    `gorm:"size:16" json:"client_format,omitempty"`
+	PromptTokens         int64     `json:"prompt_tokens"`
+	CompletionTokens     int64     `json:"completion_tokens"`
+	TotalTokens          int64     `json:"total_tokens"`
+	CachedTokens         int64     `gorm:"not null;default:0" json:"cached_tokens"`
+	Ratio                float64   `json:"ratio"`
+	Status               string    `gorm:"size:32;not null;default:'success';index" json:"status"`
+	FirstTokenMS         int64     `gorm:"not null;default:0" json:"first_token_ms"`
+	DurationMS           int64     `gorm:"not null;default:0" json:"duration_ms"`
+	CreatedAt            time.Time `gorm:"index" json:"created_at"`
 }
 
 func (UsageLog) TableName() string { return "usage_logs" }

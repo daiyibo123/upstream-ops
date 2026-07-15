@@ -4924,7 +4924,7 @@ func TestProxyUsageLogStoresRequestedModelOverUpstreamModel(t *testing.T) {
 	}
 	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
 		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
-		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+		GroupRef: "default", GroupName: "default", Ratio: 1, Charity: true, KeyCipher: keyCipher, Status: "alive",
 	}); err != nil {
 		t.Fatalf("insert group key: %v", err)
 	}
@@ -4949,6 +4949,9 @@ func TestProxyUsageLogStoresRequestedModelOverUpstreamModel(t *testing.T) {
 	}
 	if items[0].Model != "gpt-5.6" {
 		t.Fatalf("usage log model = %q, want requested model gpt-5.6", items[0].Model)
+	}
+	if items[0].UpstreamGroupKeyID == 0 || !items[0].UpstreamGroupCharity {
+		t.Fatalf("usage log must snapshot selected charity route, got %#v", items[0])
 	}
 }
 

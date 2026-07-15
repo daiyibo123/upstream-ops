@@ -8,6 +8,12 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.25.2 - 2026-07-15
+
+### Fixed
+
+- Usage Details now shows the charity icon only when the actual upstream group selected for that request has `charity` enabled. It no longer uses the caller's public Gateway Key as a proxy. New rows persist the selected group-key ID and charity snapshot; old rows are backfilled only when their channel/group match is unambiguous.
+
 ## v0.25.1 - 2026-07-15
 
 ### Fixed

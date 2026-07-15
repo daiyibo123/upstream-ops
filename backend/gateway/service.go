@@ -837,7 +837,53 @@ func (s *Service) ListUsageLogs(limit, offset int) ([]storage.UsageLog, int64, e
 	if s.usageLogs == nil {
 		return []storage.UsageLog{}, 0, nil
 	}
-	return s.usageLogs.List(limit, offset)
+	items, total, err := s.usageLogs.List(limit, offset)
+	if err != nil || len(items) == 0 || s.groupKeys == nil {
+		return items, total, err
+	}
+	// Old rows were written before the selected group-key ID/charity snapshot
+	// existed. Enrich only an unambiguous channel+group match; never guess when
+	// several group Keys with the same visible name disagree about charity.
+	if groups, listErr := s.groupKeys.List(); listErr == nil {
+		type legacyCharity struct {
+			set     bool
+			charity bool
+			mixed   bool
+		}
+		matches := make(map[string]legacyCharity, len(groups))
+		for _, group := range groups {
+			key := usageLogGroupIdentity(group.ChannelID, group.GroupName)
+			if key == "" {
+				continue
+			}
+			current := matches[key]
+			if !current.set {
+				matches[key] = legacyCharity{set: true, charity: group.Charity}
+				continue
+			}
+			if current.charity != group.Charity {
+				current.mixed = true
+				matches[key] = current
+			}
+		}
+		for i := range items {
+			if items[i].UpstreamGroupKeyID != 0 {
+				continue
+			}
+			if match := matches[usageLogGroupIdentity(items[i].ChannelID, items[i].GroupName)]; match.set && !match.mixed {
+				items[i].UpstreamGroupCharity = match.charity
+			}
+		}
+	}
+	return items, total, nil
+}
+
+func usageLogGroupIdentity(channelID uint, groupName string) string {
+	groupName = strings.TrimSpace(groupName)
+	if channelID == 0 || groupName == "" {
+		return ""
+	}
+	return strconv.FormatUint(uint64(channelID), 10) + "\x00" + strings.ToLower(groupName)
 }
 
 // ClearUsageLogs 删除请求明细日志，但保留 GatewayKey 上的当日/累计用量统计。
@@ -854,20 +900,22 @@ func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *stor
 		return
 	}
 	entry := &storage.UsageLog{
-		ChannelID:        candidate.ChannelID,
-		ChannelName:      candidate.ChannelName,
-		GroupName:        candidate.GroupName,
-		Model:            model,
-		ClientFormat:     candidate.ClientFormat,
-		PromptTokens:     usage.Prompt,
-		CompletionTokens: usage.Completion,
-		TotalTokens:      usage.Total,
-		CachedTokens:     usage.Cached,
-		Ratio:            effectiveGroupRatio(*candidate),
-		Status:           usageStatus(usage),
-		FirstTokenMS:     maxInt64(0, usage.FirstTokenMS),
-		DurationMS:       maxInt64(0, usage.DurationMS),
-		RequestIP:        strings.TrimSpace(requestIP),
+		ChannelID:            candidate.ChannelID,
+		ChannelName:          candidate.ChannelName,
+		UpstreamGroupKeyID:   candidate.ID,
+		UpstreamGroupCharity: candidate.Charity,
+		GroupName:            candidate.GroupName,
+		Model:                model,
+		ClientFormat:         candidate.ClientFormat,
+		PromptTokens:         usage.Prompt,
+		CompletionTokens:     usage.Completion,
+		TotalTokens:          usage.Total,
+		CachedTokens:         usage.Cached,
+		Ratio:                effectiveGroupRatio(*candidate),
+		Status:               usageStatus(usage),
+		FirstTokenMS:         maxInt64(0, usage.FirstTokenMS),
+		DurationMS:           maxInt64(0, usage.DurationMS),
+		RequestIP:            strings.TrimSpace(requestIP),
 	}
 	if gatewayKey != nil {
 		entry.GatewayKeyID = gatewayKey.ID

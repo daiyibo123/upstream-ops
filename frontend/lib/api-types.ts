@@ -685,6 +685,8 @@ export interface UsageLog {
   request_ip?: string
   channel_id?: number
   channel_name?: string
+  upstream_group_key_id?: number
+  upstream_group_charity?: boolean
   group_name?: string
   model?: string
   client_format?: string
