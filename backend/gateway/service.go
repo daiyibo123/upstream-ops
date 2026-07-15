@@ -2233,6 +2233,16 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		}
 		return failGatewayRequest(http.StatusTooManyRequests, "gateway_quota_exceeded", err.Error())
 	}
+	// Codex normally supplies previous_response_id or prompt_cache_key, but
+	// independent requests do not always carry either.  Without a soft affinity
+	// every such request is re-ranked from scratch and can bounce between two
+	// healthy, similarly-priced channels.  Keep a short, per-key/per-IP/model
+	// route affinity so a working channel is reused for cache warmth and lower
+	// connection/first-token variance.  It is soft: unhealthy or cooling-down
+	// channels still immediately fall back to another candidate.
+	if normalized.AffinityKey == "" {
+		normalized.AffinityKey = implicitRequestAffinityKey(gatewayKey, normalized)
+	}
 
 	now := time.Now()
 	candidates, err := s.groupKeys.ListCandidates(now)
@@ -2252,7 +2262,10 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	modelUnsupportedFailures := 0
 	requestedModel := routingRequestModel(normalized)
 	rememberUnsupportedModel := func(candidate storage.UpstreamGroupKey, errMsg string) {
-		if requestedModel == "" || !looksLikeUnsupportedModelError(errMsg) {
+		// Provider routers may return “model temporarily unavailable” with an
+		// HTTP 503. That is a transient routing fault, not proof this upstream
+		// can never serve the requested model.
+		if requestedModel == "" || !isDefinitiveUnsupportedModelFailure(errMsg) {
 			return
 		}
 		s.rememberCandidateModelCapability(candidate.ID, requestedModel, false)
@@ -5630,10 +5643,31 @@ func (s *Service) rememberAffinity(request normalizedRequest, responseID string,
 			continue
 		}
 		seen[key] = struct{}{}
-		if err := s.affinities.Upsert(HashKey(key), groupKeyID, expiresAt, now); err != nil && s.log != nil {
+		keyExpiresAt := expiresAt
+		if strings.HasPrefix(key, "chat:implicit:") {
+			// A fallback used only when the client gave no conversation/cache
+			// identity should not pin unrelated work for an entire day.
+			keyExpiresAt = now.Add(30 * time.Minute)
+		}
+		if err := s.affinities.Upsert(HashKey(key), groupKeyID, keyExpiresAt, now); err != nil && s.log != nil {
 			s.log.Warn("remember gateway affinity failed", "err", err)
 		}
 	}
+}
+
+func implicitRequestAffinityKey(gatewayKey *storage.GatewayKey, request normalizedRequest) string {
+	if gatewayKey == nil || gatewayKey.ID == 0 {
+		return ""
+	}
+	model := normalizeModelCapabilityKey(routingRequestModel(request))
+	if model == "" {
+		return ""
+	}
+	client := strings.TrimSpace(request.ClientIP)
+	if client == "" {
+		client = "unknown"
+	}
+	return fmt.Sprintf("chat:implicit:%d:%s:%s", gatewayKey.ID, client, model)
 }
 
 func writeProxyResponse(w http.ResponseWriter, status int, header http.Header, body []byte, key *storage.UpstreamGroupKey, mode string) {
@@ -9543,6 +9577,38 @@ func looksLikeUnsupportedModelError(msg string) bool {
 			strings.Contains(s, "无法访问") ||
 			strings.Contains(s, "未开通") ||
 			strings.Contains(s, "未开放"))
+}
+
+// isDefinitiveUnsupportedModelFailure is intentionally stricter than
+// looksLikeUnsupportedModelError. The latter is useful for an inconclusive
+// health probe, but live routing must not cache a transient 5xx/router error
+// as a permanent model capability miss.
+func isDefinitiveUnsupportedModelFailure(msg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	if lower == "" || looksLikeUpstreamRoutingUnavailable(lower) ||
+		strings.Contains(lower, "http 5") || strings.Contains(lower, "status 5") ||
+		strings.Contains(lower, "http 429") || strings.Contains(lower, "status 429") ||
+		strings.Contains(lower, "timeout") || strings.Contains(lower, "connection ") ||
+		strings.Contains(lower, "network") {
+		return false
+	}
+	if !looksLikeUnsupportedModelError(lower) {
+		return false
+	}
+	// Generic “model unavailable” is commonly emitted during a temporary
+	// provider-router outage. Cache only explicit model capability/access
+	// rejections from a client-error response.
+	for _, marker := range []string{
+		"unsupported", "not support", "model_not_found", "model_not_supported",
+		"no such model", "unknown model", "invalid model", "does not exist",
+		"not enabled", "model access", "model_not_available", "not permitted",
+		"do not have access", "don't have access", "not have access",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncateBody(body []byte, max int) string {

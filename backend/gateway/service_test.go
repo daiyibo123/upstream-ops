@@ -3531,6 +3531,32 @@ func TestShouldMarkProxyFailureKeepsUnsupportedModelGroupHealthy(t *testing.T) {
 	}
 }
 
+func TestDefinitiveUnsupportedModelFailureDoesNotPoisonTransientRouterFailure(t *testing.T) {
+	if isDefinitiveUnsupportedModelFailure(`HTTP 503: model gpt-5.6 temporarily unavailable; Provider Agent Router`) {
+		t.Fatal("temporary 503 must not be cached as a model capability miss")
+	}
+	if isDefinitiveUnsupportedModelFailure(`HTTP 429: model gpt-5.6 unavailable while rate limited`) {
+		t.Fatal("rate-limited model response must not be cached as unsupported")
+	}
+	if !isDefinitiveUnsupportedModelFailure(`HTTP 400: {"error":{"code":"model_not_supported","message":"model gpt-5.6 is not supported"}}`) {
+		t.Fatal("explicit model_not_supported response must be cached as unsupported")
+	}
+}
+
+func TestImplicitRequestAffinityIsScopedToKeyIPAndModel(t *testing.T) {
+	key := &storage.GatewayKey{ID: 7}
+	request := normalizedRequest{ClientIP: "203.0.113.8", RequestModel: "gpt-5.6"}
+	if got, want := implicitRequestAffinityKey(key, request), "chat:implicit:7:203.0.113.8:gpt-5.6"; got != want {
+		t.Fatalf("implicit affinity = %q, want %q", got, want)
+	}
+	if got := implicitRequestAffinityKey(key, normalizedRequest{ClientIP: "203.0.113.9", RequestModel: "gpt-5.6"}); got == implicitRequestAffinityKey(key, request) {
+		t.Fatal("different client IPs must not share an implicit route affinity")
+	}
+	if got := implicitRequestAffinityKey(key, normalizedRequest{ClientIP: request.ClientIP}); got != "" {
+		t.Fatalf("missing model affinity = %q, want empty", got)
+	}
+}
+
 func TestDetectManualGroupKeyRequestModeUsesChat(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

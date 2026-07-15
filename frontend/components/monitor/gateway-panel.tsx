@@ -56,7 +56,7 @@ type UpstreamRequestMode = "responses" | "chat" | "messages"
 type GroupFormatFilter = "all" | ColumnClientFormat
 type RateFilter = "all" | "0-0.05" | "0.06-0.1" | "0.1-0.2" | "0.2+"
 type CharityFilter = "all" | "charity" | "normal"
-type GroupStatusFilter = "all" | "alive" | "dead" | "zero_balance" | "rate_limited" | "forbidden"
+type GroupStatusFilter = "all" | "alive" | "dead" | "unknown" | "zero_balance" | "rate_limited" | "forbidden"
 type MaxGroupRatioLimit = "0" | "0.05" | "0.1"
 
 interface GroupFilters {
@@ -206,6 +206,8 @@ function statusText(status: string) {
       return "排队中"
     case "disabled":
       return "停用"
+    case "unknown":
+      return "待复测"
     default:
       return "未知"
   }
@@ -1642,7 +1644,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       <div
         key={group.id}
         className={cn(
-          "grid gap-2 border-t border-border p-3 text-xs lg:grid-cols-[minmax(260px,1.6fr)_110px_132px_96px_145px_110px] lg:items-center",
+          "grid gap-2 border-t border-border p-3 text-xs lg:grid-cols-[minmax(240px,1fr)_96px_minmax(0,180px)_76px_132px_100px] lg:items-center",
           group.charity && "bg-success/5",
         )}
       >
@@ -1677,14 +1679,14 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           {statusText(status)}
         </Badge>
 
-        <div className="grid gap-1.5">
+        <div className="grid min-w-0 gap-1.5">
           <Select
             value={format}
             disabled={!!busy}
             onValueChange={(value) => void changeGroupClientFormat(group, value)}
           >
-            <SelectTrigger className="h-8 w-full text-xs" aria-label="渠道格式">
-              <SelectValue />
+            <SelectTrigger className="h-8 w-full min-w-0 text-xs" aria-label="渠道格式">
+              <SelectValue className="min-w-0 truncate" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem value="openai">OpenAI</SelectItem>
@@ -1697,8 +1699,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             disabled={!!busy}
             onValueChange={(value) => void changeGroupRequestMode(group, value)}
           >
-            <SelectTrigger className="h-8 w-full text-xs" aria-label="上游请求方式">
-              <SelectValue />
+            <SelectTrigger className="h-8 w-full min-w-0 text-xs" aria-label="上游请求方式">
+              <SelectValue className="min-w-0 truncate" />
             </SelectTrigger>
             <SelectContent>
               {requestModeOptions(format).map((option) => (
@@ -1712,7 +1714,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </Select>
         </div>
 
-        <div className="grid gap-1.5">
+        <div className="grid min-w-0 gap-1.5">
           <Input
             value={priorityDrafts[group.id] ?? String(group.priority || 0)}
             inputMode="numeric"
@@ -2256,6 +2258,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <SelectItem value="all">全部状态</SelectItem>
                     <SelectItem value="alive">存活</SelectItem>
                     <SelectItem value="dead">死亡</SelectItem>
+                    <SelectItem value="unknown">待复测</SelectItem>
                     <SelectItem value="zero_balance">零余额</SelectItem>
                     <SelectItem value="rate_limited">限流</SelectItem>
                     <SelectItem value="forbidden">403</SelectItem>

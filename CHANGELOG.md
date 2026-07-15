@@ -8,6 +8,18 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.23.1 - 2026-07-15
+
+### Fixed
+
+- Fixed false “no configured upstream supports requested model” errors: temporary 503/429, network, and provider-router responses that mention a model are no longer cached as a permanent model capability miss. Only explicit model-support/access rejections are cached.
+- Clarified inconclusive health-check status as “待复测” and added it to Available Channels status filtering. This status remains schedulable and does not mean the channel is dead.
+- Fixed overlapping controls in Available Channels. Format/request-method selects and priority/concurrency inputs now shrink and truncate safely on narrow layouts.
+
+### Changed
+
+- Added short-lived soft route affinity for requests without a conversation, response, or prompt-cache identity. It is scoped to the calling gateway Key, source IP, and model, keeping healthy channels stable to reduce reconnects and first-token variance while still failing over immediately on a real fault.
+
 ## v0.23.0 - 2026-07-14
 
 ### Fixed
