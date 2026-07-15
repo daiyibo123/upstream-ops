@@ -8,6 +8,13 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.24.2 - 2026-07-15
+
+### Fixed
+
+- Fixed Available Channels search after adding or renaming a channel. Searching now refreshes both channel management data and group-key data before filtering, then enriches every group with the channel's current name and URL.
+- Channels that match the search but do not yet have a synchronized or manually bound group Key are now shown explicitly with an “尚无可用分组” state and an action to add a group Key, instead of incorrectly reporting that the channel cannot be found.
+
 ## v0.24.1 - 2026-07-15
 
 ### Added

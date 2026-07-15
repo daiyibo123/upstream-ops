@@ -47,6 +47,7 @@ import type {
   IPPolicy,
   UpstreamGroupKey,
   ResponseInterceptionRule,
+  Channel,
 } from "@/lib/api-types"
 
 const TOKEN_M = 1_000_000
@@ -1128,6 +1129,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const showGroups = section === "all" || section === "groups"
   const [keys, setKeys] = useState<GatewayKey[]>([])
   const [groups, setGroups] = useState<UpstreamGroupKey[]>([])
+  const [channels, setChannels] = useState<Channel[]>([])
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
   const [createDraft, setCreateDraft] = useState<KeyDraft>(() => createDefaultDraft())
@@ -1161,10 +1163,14 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     () => keys.filter(isOpenAIGatewayKey),
     [keys],
   )
-  const displayGroups = useMemo(
-    () => groups,
-    [groups],
-  )
+  const displayGroups = useMemo(() => {
+    const channelByID = new Map(channels.map((channel) => [channel.id, channel]))
+    return groups.map((group) => {
+      const channel = channelByID.get(group.channel_id)
+      if (!channel) return group
+      return { ...group, channel_name: channel.name || group.channel_name, channel_url: channel.site_url || group.channel_url }
+    })
+  }, [groups, channels])
   const filteredKeys = useMemo(() => {
     const query = keySearch.trim().toLowerCase()
     if (!query) return displayKeys
@@ -1180,6 +1186,16 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     () => sortGroupsForDisplay(displayGroups.filter((group) => groupMatchesFilters(group, groupFilters))),
     [displayGroups, groupFilters],
   )
+  const matchedChannelsWithoutGroups = useMemo(() => {
+    const terms = normalizeSearchText(groupFilters.search).split(/\s+/).filter(Boolean)
+    if (terms.length === 0) return []
+    const groupedChannelIDs = new Set(groups.map((group) => group.channel_id))
+    return channels.filter((channel) => {
+      if (groupedChannelIDs.has(channel.id)) return false
+      const text = normalizeSearchText([channel.name, channel.site_url, channel.type, channel.id].join(" "))
+      return terms.every((term) => text.includes(term))
+    })
+  }, [channels, groups, groupFilters.search])
   const groupPages = Math.max(1, Math.ceil(filteredGroups.length / groupPageSize))
   const safeGroupPage = Math.min(groupPage, groupPages)
   const pagedGroups = useMemo(
@@ -1227,13 +1243,15 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   async function load() {
     setLoading(true)
     try {
-      const [keyList, groupResult, policyResult] = await Promise.all([
+      const [keyList, groupResult, policyResult, channelList] = await Promise.all([
         apiFetch<GatewayKey[]>("/gateway/keys"),
         apiFetch<UpstreamGroupKey[]>("/gateway/group-keys"),
         apiFetch<IPPolicy[]>("/gateway/ip-policies"),
+        apiFetch<Channel[]>("/channels"),
       ])
       setKeys(Array.isArray(keyList) ? keyList : [])
       setIPPolicies(Array.isArray(policyResult) ? policyResult : [])
+      setChannels(Array.isArray(channelList) ? channelList : [])
       const nextGroups = sortGroupsForDisplay(Array.isArray(groupResult) ? groupResult : [])
       setGroups(nextGroups)
       setConcurrencyDrafts(
@@ -1251,6 +1269,11 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     } finally {
       setLoading(false)
     }
+  }
+
+  async function runGroupSearch() {
+    setGroupFilters({ ...groupFilterDraft, search: groupFilterDraft.search.trim() })
+    await load()
   }
 
   async function loadInterceptionRules() {
@@ -2320,7 +2343,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     onChange={(event) => setGroupFilterDraft((prev) => ({ ...prev, search: event.target.value }))}
                     onKeyDown={(event) => {
                       if (event.key === "Enter") {
-                        setGroupFilters({ ...groupFilterDraft, search: groupFilterDraft.search.trim() })
+                        void runGroupSearch()
                       }
                     }}
                     className="h-9 pl-8 text-xs"
@@ -2399,7 +2422,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                   <Button
                     size="sm"
                     className="h-9 flex-1 gap-1.5 text-xs lg:flex-none"
-                    onClick={() => setGroupFilters({ ...groupFilterDraft, search: groupFilterDraft.search.trim() })}
+                    onClick={() => void runGroupSearch()}
                   >
                     <Search className="size-3.5" />
                     搜索
@@ -2444,16 +2467,29 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
                 加载中...
               </div>
-            ) : groups.length === 0 ? (
+            ) : groups.length === 0 && matchedChannelsWithoutGroups.length === 0 ? (
               <div className="rounded-md border border-dashed border-border bg-background px-3 py-12 text-center text-xs text-muted-foreground">
                 还没有分组 Key，先点“一键创建分组 Key”
               </div>
-            ) : filteredGroups.length === 0 ? (
+            ) : filteredGroups.length === 0 && matchedChannelsWithoutGroups.length === 0 ? (
               <div className="rounded-md border border-dashed border-border bg-background px-3 py-12 text-center text-xs text-muted-foreground">
                 没有符合当前筛选条件的渠道
               </div>
             ) : (
               <div className="space-y-2">
+                {matchedChannelsWithoutGroups.map((channel) => (
+                  <div key={`channel-${channel.id}`} className="flex flex-col gap-2 rounded-md border border-warning/30 bg-warning/5 p-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="truncate text-sm font-medium text-foreground">{channel.name}</span>
+                        <Badge variant="outline" className="border-warning/30 bg-warning/10 text-warning">尚无可用分组</Badge>
+                      </div>
+                      <p className="mt-1 truncate text-[11px] text-muted-foreground" title={channel.site_url}>{channel.site_url}</p>
+                      <p className="mt-1 text-[11px] text-muted-foreground">渠道已经添加成功，但还没有同步或手动绑定上游 Key，因此暂时不能参与调度。</p>
+                    </div>
+                    <Button size="sm" variant="outline" className="shrink-0 text-xs" onClick={() => setManualGroupDialogOpen(true)}>添加分组 Key</Button>
+                  </div>
+                ))}
                 {pagedGroups.map((group) => renderGroupRow(group))}
               </div>
             )}
@@ -2588,7 +2624,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       <ManualGroupKeyDialog
         open={manualGroupDialogOpen}
         onOpenChange={setManualGroupDialogOpen}
-        channels={[]}
+        channels={channels}
         onCreated={async () => {
           await load()
         }}
