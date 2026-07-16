@@ -10,7 +10,9 @@
 #   或在 docker-compose 里写 context: .
 
 # ---------- Stage 1: 前端 ----------
-FROM node:20-alpine AS frontend-builder
+# The frontend bundle is architecture-independent. Build it on Buildx's native
+# platform once instead of running pnpm under QEMU for every target image.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
 WORKDIR /web
 
 # pnpm-workspace.yaml 用了 allowBuilds: 这种 pnpm 10.4+ 才支持的字段，
@@ -26,9 +28,13 @@ COPY frontend/ ./
 RUN pnpm build
 
 # ---------- Stage 2: 后端 ----------
-FROM golang:1.23-alpine AS go-builder
+# CGO is disabled, so Go can cross-compile the target binary without emulating
+# arm64. This also keeps go mod download on the native build platform.
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS go-builder
 WORKDIR /src
-ARG VERSION=0.26.0
+ARG VERSION=0.26.1
+ARG TARGETOS
+ARG TARGETARCH
 
 # 先 go.mod / go.sum 走缓存
 COPY go.mod go.sum ./
@@ -41,7 +47,7 @@ COPY . ./
 RUN rm -rf ./web/dist
 COPY --from=frontend-builder /web/dist ./web/dist
 
-RUN CGO_ENABLED=0 GOOS=linux go build \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
         -trimpath \
         -ldflags="-s -w -X github.com/bejix/upstream-ops/backend/global.VERSION=${VERSION}" \
         -o /out/upstream-ops \

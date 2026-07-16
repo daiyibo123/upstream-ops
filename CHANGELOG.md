@@ -8,6 +8,12 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.26.1 - 2026-07-16
+
+### Fixed
+
+- Multi-platform Docker releases now build the frontend and download Go modules on the native Buildx platform, then cross-compile the CGO-free binary for each target architecture. This removes the QEMU-emulated ARM64 `pnpm install` and `go mod download` bottleneck that could make release builds appear stalled.
+
 ## v0.26.0 - 2026-07-16
 
 ### Fixed
