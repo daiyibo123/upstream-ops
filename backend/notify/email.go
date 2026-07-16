@@ -145,25 +145,25 @@ func buildEmailHTML(appTitle, subject, body string, msg Message) string {
 <html>
 <body style="margin:0;padding:0;background:#eef2ff;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'PingFang SC','Microsoft YaHei',sans-serif;color:#172033;">
   <div style="display:none;max-height:0;overflow:hidden;color:transparent;">%s</div>
-  <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background:linear-gradient(145deg,#eef2ff,#f8fafc);padding:38px 12px;">
+  <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="background:linear-gradient(145deg,#eef2ff,#f8fafc);padding:28px 12px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="max-width:680px;overflow:hidden;border-radius:22px;background:#ffffff;border:1px solid #dbe4ff;box-shadow:0 18px 48px rgba(49,46,129,.14);">
+        <table role="presentation" width="100%%" cellspacing="0" cellpadding="0" style="max-width:640px;overflow:hidden;border-radius:18px;background:#ffffff;border:1px solid #dbe4ff;box-shadow:0 18px 48px rgba(49,46,129,.14);">
           <tr>
-            <td style="padding:30px 34px;background:linear-gradient(135deg,#312e81,#2563eb);color:#ffffff;">
+            <td style="padding:26px 28px;background:linear-gradient(135deg,#312e81,#2563eb);color:#ffffff;">
               <div style="font-size:13px;letter-spacing:.08em;color:#bfdbfe;font-weight:800;">%s</div>
-              <h1 style="margin:12px 0 0;font-size:24px;line-height:1.35;font-weight:800;color:#ffffff;">%s</h1>
+              <h1 style="margin:12px 0 0;font-size:22px;line-height:1.45;font-weight:800;color:#ffffff;word-break:break-word;overflow-wrap:anywhere;">%s</h1>
             </td>
           </tr>
           <tr>
-            <td style="padding:24px 30px 8px;">
-              <div style="margin-bottom:12px;">%s</div>
-              <div style="margin-bottom:20px;color:#334155;font-size:14px;line-height:1.6;">发送时间：<span style="color:#111827;font-weight:700;">%s</span></div>
+            <td style="padding:22px 24px 8px;">
+              <div style="margin-bottom:14px;line-height:1.4;">%s</div>
+              <div style="margin-bottom:20px;color:#334155;font-size:14px;line-height:1.7;">发送时间：<span style="color:#111827;font-weight:700;">%s</span></div>
               %s
             </td>
           </tr>
           <tr>
-            <td style="padding:18px 30px 26px;color:#64748b;font-size:13px;line-height:1.7;border-top:1px solid #e5e7eb;background:#f8fafc;">
+            <td style="padding:18px 24px 24px;color:#64748b;font-size:13px;line-height:1.7;border-top:1px solid #e5e7eb;background:#f8fafc;">
               这封邮件由 %s 自动发送。你可以在系统设置的通知渠道和通知策略里调整接收范围。
             </td>
           </tr>
@@ -187,20 +187,20 @@ func emailContentHTML(body string) string {
 		label, value, ok := splitEmailLine(line)
 		if !ok {
 			notes = append(notes, fmt.Sprintf(
-				`<div style="margin:0 0 10px;border-radius:12px;background:#f8fafc;border:1px solid #e5e7eb;padding:12px 14px;color:#111827;font-size:15px;line-height:1.7;">%s</div>`,
+				`<div style="margin:0 0 10px;border-radius:12px;background:#f8fafc;border:1px solid #e5e7eb;padding:12px 14px;color:#111827;font-size:15px;line-height:1.7;word-break:break-word;overflow-wrap:anywhere;">%s</div>`,
 				html.EscapeString(line),
 			))
 			continue
 		}
 		rows = append(rows, fmt.Sprintf(
-			`<tr><td style="padding:13px 14px;color:#334155;font-size:14px;line-height:1.5;border-bottom:1px solid #e5e7eb;width:148px;vertical-align:top;font-weight:700;background:#f8fafc;">%s</td><td style="padding:13px 14px;color:#111827;font-size:15px;line-height:1.55;border-bottom:1px solid #e5e7eb;font-weight:700;vertical-align:top;">%s</td></tr>`,
+			`<div style="padding:14px 16px;border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;margin-bottom:12px;"><div style="color:#64748b;font-size:13px;line-height:1.5;font-weight:700;">%s</div><div style="margin-top:6px;color:#111827;font-size:15px;line-height:1.7;font-weight:700;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;">%s</div></div>`,
 			html.EscapeString(label),
 			html.EscapeString(value),
 		))
 	}
 	blocks := make([]string, 0, 2)
 	if len(rows) > 0 {
-		blocks = append(blocks, `<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #d1d5db;border-radius:14px;border-collapse:separate;border-spacing:0;overflow:hidden;background:#ffffff;">`+strings.Join(rows, "")+`</table>`)
+		blocks = append(blocks, `<div style="border:1px solid #d1d5db;border-radius:14px;background:#f8fafc;padding:14px;">`+strings.Join(rows, "")+`</div>`)
 	}
 	if len(notes) > 0 {
 		blocks = append(blocks, `<div style="margin-top:14px;">`+strings.Join(notes, "")+`</div>`)

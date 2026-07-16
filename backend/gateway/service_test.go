@@ -3208,6 +3208,74 @@ func TestResponsesStreamUsesExplicitChatBridgeWithoutCodexHeaders(t *testing.T) 
 	}
 }
 
+func TestProxyResponsesToolStateErrorFallsBackToChatBridge(t *testing.T) {
+	var responsesHits, chatHits int
+	var chatBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/responses":
+			responsesHits++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"No tool call found for function call output with call_id call_cpFS8qnQHTNUtbUWmaFJDaMx"}}`))
+		case "/v1/chat/completions":
+			chatHits++
+			body, _ := io.ReadAll(r.Body)
+			chatBody = string(body)
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_tool_state\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"continued\"},\"finish_reason\":\"stop\"}]}\n\n" +
+				"data: [DONE]\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("s", 32))
+	channel := &storage.Channel{Name: "tool-state-fallback", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	keyCipher, err := env.cipher.Encrypt("sk-upstream")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: "tool-state-fallback", ChannelType: storage.ChannelTypeSub2API,
+		GroupRef: "default", GroupName: "default", Ratio: 1, KeyCipher: keyCipher, Status: "alive",
+		RequestMode: "responses",
+	}); err != nil {
+		t.Fatalf("insert group key: %v", err)
+	}
+
+	body := `{"model":"gpt-test","stream":true,"previous_response_id":"resp_previous","tools":[{"type":"function","name":"apply_patch","parameters":{"type":"object"}}],"input":[{"type":"function_call_output","call_id":"call_cpFS8qnQHTNUtbUWmaFJDaMx","output":"ok"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+		t.Fatalf("proxy request: %v", err)
+	}
+	out := rec.Body.String()
+	if rec.Code != http.StatusOK || !strings.Contains(out, "response.completed") || !strings.Contains(out, "continued") {
+		t.Fatalf("tool-state fallback stream malformed: status=%d body=%s", rec.Code, out)
+	}
+	if responsesHits != 1 || chatHits != 1 {
+		t.Fatalf("hits responses=%d chat=%d, want fallback 1/1", responsesHits, chatHits)
+	}
+	if !strings.Contains(chatBody, `"tool_call_id":"call_cpFS8qnQHTNUtbUWmaFJDaMx"`) || !strings.Contains(chatBody, `"tool_calls"`) {
+		t.Fatalf("chat bridge did not synthesize tool context: %s", chatBody)
+	}
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "default")
+	if err != nil || group == nil {
+		t.Fatalf("reload group key: %v", err)
+	}
+	if group.RequestMode != "responses" {
+		t.Fatalf("stateless tool recovery must not permanently switch protocol, got %q", group.RequestMode)
+	}
+}
+
 func TestResponsesStreamChoosesChatBridgeByProtocolNotHeaders(t *testing.T) {
 	req := normalizedRequest{
 		Path:         "/v1/responses",
@@ -3737,6 +3805,60 @@ func TestResponsesToChatRequestBodyPreservesToolExecutionResults(t *testing.T) {
 	}
 }
 
+func TestResponsesToChatRequestBodySynthesizesMissingPriorToolCall(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-test",
+		"stream":true,
+		"previous_response_id":"resp_previous",
+		"tools":[{"type":"function","name":"apply_patch","parameters":{"type":"object"}}],
+		"input":[{"type":"function_call_output","call_id":"call_cpFS8qnQHTNUtbUWmaFJDaMx","output":"ok"}]
+	}`)
+	converted, _, err := responsesToChatRequestBody(body)
+	if err != nil {
+		t.Fatalf("convert orphan tool output: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(converted, &raw); err != nil {
+		t.Fatalf("decode converted body: %v", err)
+	}
+	messages, _ := raw["messages"].([]any)
+	if len(messages) != 2 {
+		t.Fatalf("messages len = %d, want synthetic tool call + tool output: %#v", len(messages), raw["messages"])
+	}
+	call, _ := messages[0].(map[string]any)
+	calls, _ := call["tool_calls"].([]any)
+	if call["role"] != "assistant" || len(calls) != 1 {
+		t.Fatalf("synthetic assistant tool call missing: %#v", call)
+	}
+	toolCall, _ := calls[0].(map[string]any)
+	fn, _ := toolCall["function"].(map[string]any)
+	if toolCall["id"] != "call_cpFS8qnQHTNUtbUWmaFJDaMx" || fn["name"] != "apply_patch" {
+		t.Fatalf("synthetic tool call mismatch: %#v", toolCall)
+	}
+	result, _ := messages[1].(map[string]any)
+	if result["role"] != "tool" || result["tool_call_id"] != "call_cpFS8qnQHTNUtbUWmaFJDaMx" || result["content"] != "ok" {
+		t.Fatalf("tool output mismatch: %#v", result)
+	}
+	if !responsesBodyHasOrphanToolOutputs(body) {
+		t.Fatal("orphan tool output should be detected")
+	}
+	msg := "No tool call found for function call output with call_id call_cpFS8qnQHTNUtbUWmaFJDaMx"
+	if !shouldRetryUpstreamStatus(http.StatusBadRequest, msg) || looksLikeClientRequestError(msg) {
+		t.Fatal("missing prior tool call must be a recoverable upstream state error")
+	}
+	req := normalizedRequest{
+		ResponseMode: "responses",
+		AltPath:      "/v1/chat/completions",
+		AltBody:      converted,
+		AltMode:      "responses_from_chat",
+		AltStream:    true,
+	}
+	fallback, _, ok := fallbackRequestAfterFailure(req, msg)
+	if !ok || fallback.ResponseMode != "responses_from_chat" {
+		t.Fatalf("fallback = (%v, %q), want chat bridge", ok, fallback.ResponseMode)
+	}
+}
+
 func TestStreamChatAsResponsesEventsConvertsToolCalls(t *testing.T) {
 	body := strings.NewReader(
 		"data: {\"id\":\"chatcmpl_tool\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_exec\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"cmd\\\"\"}}]}}]}\n\n" +
@@ -3780,6 +3902,19 @@ func TestStreamChatAsResponsesEventsConvertsToolCalls(t *testing.T) {
 	item, _ := output[0].(map[string]any)
 	if item["type"] != "function_call" || item["name"] != "exec" || item["arguments"] != `{"cmd":"ls"}` {
 		t.Fatalf("completed event lost tool call: %#v", item)
+	}
+}
+
+func TestStreamChatAsResponsesEventsCompletesOnEOFAfterContent(t *testing.T) {
+	body := strings.NewReader(
+		"data: {\"id\":\"chatcmpl_text\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"pong\"}}]}\n\n")
+	rec := httptest.NewRecorder()
+	if _, err := streamChatAsResponsesEvents(rec, nil, newSSEStreamReader(body)); err != nil {
+		t.Fatalf("stream chat as responses: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "response.completed") || !strings.Contains(out, "pong") || strings.Contains(out, "response.failed") || strings.Contains(out, "upstream chat stream ended before normal completion") {
+		t.Fatalf("EOF after content must complete cleanly:\n%s", out)
 	}
 }
 

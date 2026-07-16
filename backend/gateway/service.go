@@ -5356,7 +5356,7 @@ func responsesToChatRequestBody(body []byte) ([]byte, bool, error) {
 			out[k] = v
 		}
 	}
-	messages := responsesInputToChatMessages(raw["input"])
+	messages := responsesInputToChatMessages(raw["input"], raw["tools"])
 	// instructions 在 Responses 里相当于 system 提示，转成一条 system 消息放最前。
 	if instr := strings.TrimSpace(fmt.Sprint(raw["instructions"])); instr != "" && raw["instructions"] != nil {
 		messages = append([]map[string]any{{"role": "system", "content": instr}}, messages...)
@@ -5547,7 +5547,7 @@ func firstNonNil(values ...any) any {
 }
 
 // responsesInputToChatMessages converts Responses input into Chat Completions messages.
-func responsesInputToChatMessages(input any) []map[string]any {
+func responsesInputToChatMessages(input any, tools ...any) []map[string]any {
 	switch v := input.(type) {
 	case string:
 		if strings.TrimSpace(v) == "" {
@@ -5556,6 +5556,8 @@ func responsesInputToChatMessages(input any) []map[string]any {
 		return []map[string]any{{"role": "user", "content": v}}
 	case []any:
 		out := make([]map[string]any, 0, len(v))
+		seenToolCalls := map[string]bool{}
+		defaultToolName := firstResponsesToolName(firstNonNil(tools...))
 		for _, item := range v {
 			msg, _ := item.(map[string]any)
 			if msg == nil {
@@ -5571,6 +5573,10 @@ func responsesInputToChatMessages(input any) []map[string]any {
 			if typ == "function_call_output" || strings.HasSuffix(typ, "_call_output") {
 				callID := strings.TrimSpace(stringValue(firstNonNil(msg["call_id"], msg["id"])))
 				if callID != "" {
+					if !seenToolCalls[callID] {
+						out = append(out, syntheticChatToolCallMessage(callID, responseCallOutputName(msg, defaultToolName)))
+						seenToolCalls[callID] = true
+					}
 					out = append(out, map[string]any{
 						"role":         "tool",
 						"tool_call_id": callID,
@@ -5582,7 +5588,7 @@ func responsesInputToChatMessages(input any) []map[string]any {
 			// Preserve explicit prior function calls when a client sends the
 			// complete Responses input. Chat APIs require the assistant tool-call
 			// message immediately before its role=tool result.
-			if typ == "function_call" {
+			if typ == "function_call" || typ == "custom_tool_call" {
 				name := strings.TrimSpace(stringValue(msg["name"]))
 				callID := strings.TrimSpace(stringValue(firstNonNil(msg["call_id"], msg["id"])))
 				if name != "" && callID != "" {
@@ -5594,10 +5600,11 @@ func responsesInputToChatMessages(input any) []map[string]any {
 							"type": "function",
 							"function": map[string]any{
 								"name":      name,
-								"arguments": stringValue(msg["arguments"]),
+								"arguments": stringValue(firstNonNil(msg["arguments"], msg["input"])),
 							},
 						}},
 					})
+					seenToolCalls[callID] = true
 					continue
 				}
 			}
@@ -5614,6 +5621,74 @@ func responsesInputToChatMessages(input any) []map[string]any {
 	default:
 		return nil
 	}
+}
+
+func syntheticChatToolCallMessage(callID, name string) map[string]any {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "previous_tool_call"
+	}
+	return map[string]any{
+		"role":    "assistant",
+		"content": nil,
+		"tool_calls": []map[string]any{{
+			"id":   callID,
+			"type": "function",
+			"function": map[string]any{
+				"name":      name,
+				"arguments": "{}",
+			},
+		}},
+	}
+}
+
+func responseCallOutputName(msg map[string]any, fallback string) string {
+	for _, key := range []string{"name", "tool_name", "function_name"} {
+		if value := strings.TrimSpace(stringValue(msg[key])); value != "" {
+			return value
+		}
+	}
+	if fn, ok := msg["function"].(map[string]any); ok {
+		if value := strings.TrimSpace(stringValue(fn["name"])); value != "" {
+			return value
+		}
+	}
+	return fallback
+}
+
+func firstResponsesToolName(value any) string {
+	items, _ := value.([]any)
+	for _, item := range items {
+		switch tool := item.(type) {
+		case string:
+			if name := strings.TrimSpace(tool); name != "" {
+				return name
+			}
+		case map[string]any:
+			if name := firstResponsesToolNameFromMap(tool); name != "" {
+				return name
+			}
+		}
+	}
+	return ""
+}
+
+func firstResponsesToolNameFromMap(tool map[string]any) string {
+	if tool == nil {
+		return ""
+	}
+	if name := strings.TrimSpace(stringValue(tool["name"])); name != "" {
+		return name
+	}
+	if fn, ok := tool["function"].(map[string]any); ok {
+		if name := strings.TrimSpace(stringValue(fn["name"])); name != "" {
+			return name
+		}
+	}
+	if children, ok := tool["tools"].([]any); ok {
+		return firstResponsesToolName(children)
+	}
+	return ""
 }
 
 // responsesToolOutputToChatContent keeps structured tool output intact for a
@@ -5839,6 +5914,9 @@ func fallbackRequestAfterFailure(request normalizedRequest, errMsg string) (norm
 		// downstream SSE byte has been written*. This is a protocol recovery path,
 		// not a general model/content fallback: reasoning, tools and input remain
 		// native whenever the Responses endpoint exists.
+		if looksLikeResponsesToolCallStateError(errMsg) {
+			return stripCodexResponsesLiteHeader(request.alt()), "stateless tool-call chat bridge", true
+		}
 		if looksLikeResponsesEndpointError(errMsg) || looksLikeEndpointMissingError(errMsg) {
 			return request.alt(), "upstream chat-completions compatibility", true
 		}
@@ -5862,6 +5940,9 @@ func (s *Service) rememberSuccessfulProtocolFallback(
 	if s == nil || candidate == nil || normalizeClientFormat(candidate.ClientFormat) != "openai" {
 		return
 	}
+	if original.ResponseMode == "responses" && fallback.ResponseMode == "responses_from_chat" && responsesBodyHasOrphanToolOutputs(original.Body) {
+		return
+	}
 	mode := ""
 	switch {
 	case original.ResponseMode == "responses" && fallback.ResponseMode == "responses_from_chat":
@@ -5875,6 +5956,50 @@ func (s *Service) rememberSuccessfulProtocolFallback(
 	if err := s.groupKeys.UpdateRequestMode(candidate.ID, mode); err != nil && s.log != nil {
 		s.log.Warn("persist recovered upstream request protocol", "id", candidate.ID, "mode", mode, "err", err)
 	}
+}
+
+func looksLikeResponsesToolCallStateError(msg string) bool {
+	s := strings.ToLower(strings.TrimSpace(msg))
+	if s == "" {
+		return false
+	}
+	return (strings.Contains(s, "no tool call found") && strings.Contains(s, "function call output")) ||
+		(strings.Contains(s, "function_call_output") && strings.Contains(s, "call_id") && strings.Contains(s, "not found")) ||
+		(strings.Contains(s, "tool_call_id") && strings.Contains(s, "preceding") && strings.Contains(s, "tool_calls")) ||
+		(strings.Contains(s, "messages with role") && strings.Contains(s, "tool") && strings.Contains(s, "tool_calls"))
+}
+
+func responsesBodyHasOrphanToolOutputs(body []byte) bool {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil || raw == nil {
+		return false
+	}
+	input, _ := raw["input"].([]any)
+	if len(input) == 0 {
+		return false
+	}
+	seen := map[string]bool{}
+	for _, item := range input {
+		msg, _ := item.(map[string]any)
+		if msg == nil {
+			continue
+		}
+		typ := strings.ToLower(strings.TrimSpace(stringValue(msg["type"])))
+		callID := strings.TrimSpace(stringValue(firstNonNil(msg["call_id"], msg["id"])))
+		if callID == "" {
+			continue
+		}
+		if typ == "function_call" || typ == "custom_tool_call" {
+			seen[callID] = true
+			continue
+		}
+		if typ == "function_call_output" || strings.HasSuffix(typ, "_call_output") {
+			if !seen[callID] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func shouldSkipSameKeyRetry(errMsg string) bool {
@@ -8014,16 +8139,24 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		return best, err
 	}
 	if streamErr != nil || !sawDone {
-		message := "upstream chat stream ended before normal completion"
-		if streamErr != nil {
-			message += ": " + streamErr.Error()
+		// Some OpenAI-compatible relays end a chat SSE stream with EOF instead
+		// of a final finish_reason or [DONE]. If they have already produced
+		// usable text or tool-call deltas, close the Responses lifecycle cleanly
+		// instead of surfacing a client-visible interrupted stream.
+		if streamErr == nil && (textBuf.Len() > 0 || len(toolOrder) > 0) {
+			sawDone = true
+		} else {
+			message := "upstream chat stream ended before normal completion"
+			if streamErr != nil {
+				message += ": " + streamErr.Error()
+			}
+			if err := writeResponsesStreamFailure(w, id, model, "upstream_stream_interrupted", message); err != nil {
+				return best, err
+			}
+			best.SoftFailure = message
+			best.Status = "interrupted"
+			return best, nil
 		}
-		if err := writeResponsesStreamFailure(w, id, model, "upstream_stream_interrupted", message); err != nil {
-			return best, err
-		}
-		best.SoftFailure = message
-		best.Status = "interrupted"
-		return best, nil
 	}
 	for _, idx := range toolOrder {
 		state := toolCalls[idx]
@@ -10749,6 +10882,9 @@ func shouldRetryStatus(status int) bool {
 }
 
 func shouldRetryUpstreamStatus(status int, msg string) bool {
+	if looksLikeResponsesToolCallStateError(msg) {
+		return true
+	}
 	// 模型不存在/无权限这类错误，哪怕上游塞进了 invalid_request_error 或 422，
 	// 也应该继续换下一个候选，而不是把第一次撞到的渠道当成“客户端参数错”。
 	if looksLikeUnsupportedModelError(msg) {
@@ -10769,6 +10905,9 @@ func shouldRetryUpstreamStatus(status int, msg string) bool {
 // 保守匹配，宁可多 retry 一次，也不要把可能是上游账号死掉的 400 卡在同一个 key。
 func looksLikeClientRequestError(msg string) bool {
 	s := strings.ToLower(msg)
+	if looksLikeResponsesToolCallStateError(msg) {
+		return false
+	}
 	if looksLikeUnsupportedModelError(msg) {
 		return false
 	}

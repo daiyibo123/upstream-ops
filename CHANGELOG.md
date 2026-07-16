@@ -8,6 +8,15 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.25.3 - 2026-07-15
+
+### Fixed
+
+- Responses requests that resume after a quota reset with only `function_call_output` now recover through the chat bridge when an upstream has lost the prior tool-call state, preventing `No tool call found for function call output` from disconnecting Codex.
+- Chat-compatible upstream streams that produce valid text or tool-call deltas but close without a final `[DONE]`/`finish_reason` now receive a synthetic `response.completed` terminal event, reducing unnecessary reconnects and interrupted usage rows.
+- Public/charity routing keeps the existing charity-first, low-effective-ratio order while avoiding permanent protocol flips for one-off stateless tool-call recovery.
+- Email notification details now render as mobile-friendly stacked fields with explicit long-text wrapping, so rate-change messages no longer collapse into a narrow unreadable column in mobile mail clients.
+
 ## v0.25.2 - 2026-07-15
 
 ### Fixed
