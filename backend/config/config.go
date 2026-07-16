@@ -155,8 +155,11 @@ type ProxyConfig struct {
 }
 
 const (
-	DefaultUpstreamTimeoutSeconds = 30
-	DefaultUpstreamUserAgent      = "upstream-ops/0.1"
+	DefaultUpstreamTimeoutSeconds  = 30
+	DefaultCodexOriginator         = "codex_cli_rs"
+	DefaultCodexVersion            = "0.144.1"
+	DefaultUpstreamUserAgent       = DefaultCodexOriginator + "/" + DefaultCodexVersion + " (Ubuntu 22.4.0; x86_64) xterm-256color"
+	legacyDefaultUpstreamUserAgent = "upstream-ops/0.1"
 )
 
 type UpstreamConfig struct {
@@ -177,8 +180,11 @@ func (u UpstreamConfig) WithDefaults() UpstreamConfig {
 	if u.TimeoutSeconds <= 0 {
 		u.TimeoutSeconds = DefaultUpstreamTimeoutSeconds
 	}
-	if strings.TrimSpace(u.UserAgent) == "" {
+	userAgent := strings.TrimSpace(u.UserAgent)
+	if userAgent == "" || userAgent == legacyDefaultUpstreamUserAgent {
 		u.UserAgent = DefaultUpstreamUserAgent
+	} else {
+		u.UserAgent = userAgent
 	}
 	return u
 }

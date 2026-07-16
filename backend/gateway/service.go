@@ -38,32 +38,29 @@ const (
 	healthPath       = "/v1/models"
 	responsesPath    = "/v1/responses"
 
-	proxyAttemptTimeout       = 60 * time.Second
-	healthProbeTimeout        = 15 * time.Second
-	healthProbeRunTimeout     = 45 * time.Second
+	proxyAttemptTimeout       = 45 * time.Second
+	healthProbeTimeout        = 6 * time.Second
+	healthProbeRunTimeout     = 20 * time.Second
 	healthProbeRetryJitterMax = 3 * time.Second
-	healthTransientAttempts   = 3
+	healthTransientAttempts   = 1
 	healthPerChannelParallel  = 1
 	// Some upstream routers rate-limit short probe bursts even when ordinary
 	// user traffic is healthy. Keys at the same API base are already serialized;
 	// leave a small gap before the next key is probed as well.
 	healthProbeUpstreamMinInterval = 500 * time.Millisecond
-	// One-click checks intentionally run one upstream key at a time.  A pause
-	// between completed probes prevents shared relays from treating the batch as
-	// an abusive burst and returning false network/limit statuses.
-	oneClickHealthProbeInterval = 2 * time.Second
-	// streamFirstEventTimeout 是"等上游吐出第一个有效 SSE 事件"的最长等待。
-	// Codex / o1 / o3 这类带 reasoning 的请求可能长时间没有可见文本；部分
-	// 中转站还会缓冲 response.created。这里给到 5 分钟，避免在上游仍在推理时
-	// 主动 Close，导致客户端报 "stream closed before response.completed"。
-	streamFirstEventTimeout = 5 * time.Minute
+	// streamFirstEventTimeout covers response headers plus the first usable SSE
+	// generation event. Before that semantic boundary no upstream bytes are
+	// exposed, so a stalled relay can still be replaced safely. Once output starts,
+	// streamIdleTimeout below preserves long-running reasoning streams.
+	streamFirstEventTimeout = 6 * time.Second
 	// streamIdleTimeout 是正式转发阶段"两个事件之间"的最长间隔。推理模型两次事件
 	// 之间可能有较长停顿；超过后才认为上游卡死，并由 Responses 兜底逻辑补终态/[DONE]。
 	streamIdleTimeout              = 5 * time.Minute
 	streamHeartbeatInterval        = 15 * time.Second
-	streamPreflightTimeout         = 45 * time.Second
+	streamPreflightTimeout         = 6 * time.Second
 	streamPreflightMaxEvents       = 16
 	streamPreflightMaxBytes        = 64 << 10
+	maxFirstOutputTimeoutSwitches  = 1
 	proxyTransientFailureThreshold = 3
 	proxyTransientFailureCooldown  = 45 * time.Second
 	proxyServerErrorCooldown       = 60 * time.Second
@@ -79,7 +76,7 @@ const (
 	openAIHealthProbePrimaryModel  = "gpt-5.4"
 	openAIHealthProbeFallbackModel = "gpt-5.5"
 	healthProbePrompt              = "1+1="
-	healthProbeMaxOutputTokens     = 16
+	healthProbeMaxOutputTokens     = 4
 )
 
 var errResponsesStreamTerminal = errors.New("responses stream terminal event emitted")
@@ -384,19 +381,17 @@ func (o healthJobObserver) Emit(event progress.Event) {
 }
 
 // OneClickHealthTestOptions returns the safe policy used by the dashboard's
-// one-click check: OpenAI groups at an effective rate no higher than 0.1 are
-// checked strictly serially, with a two-second gap between upstream requests.
+// one-click check. Different API base URLs run in parallel, while the
+// service-scoped upstream slots keep keys at the same API base serialized.
 func OneClickHealthTestOptions(groupIDs []uint) HealthTestOptions {
 	return HealthTestOptions{
-		BatchSize:       1,
-		GroupIDs:        groupIDs,
-		MaxRatio:        automaticHealthProbeMaxRatio,
-		Serial:          true,
-		InterGroupDelay: oneClickHealthProbeInterval,
+		BatchSize: defaultHealthProbeBatchSize,
+		GroupIDs:  groupIDs,
+		MaxRatio:  automaticHealthProbeMaxRatio,
 	}
 }
 
-// StartOneClickHealthJob starts the deliberately serial low-cost OpenAI probe
+// StartOneClickHealthJob starts the low-cost OpenAI probe
 // in the background. It is intentionally detached from the HTTP request so a
 // slow large batch does not make the control page appear frozen or get
 // cancelled when the browser navigates away.
@@ -404,9 +399,8 @@ func (s *Service) StartOneClickHealthJob(groupIDs []uint) (*HealthJobOutput, err
 	if s == nil || s.groupKeys == nil {
 		return nil, errors.New("gateway health service is unavailable")
 	}
-	// A second automatic batch would defeat the deliberately serial policy and
-	// could make a shared upstream appear to have failed under a probe burst.
-	// Keep at most one dashboard batch running per gateway process.
+	// Keep at most one dashboard batch running per gateway process. Individual
+	// API bases are still serialized inside that batch.
 	s.healthJobMu.Lock()
 	defer s.healthJobMu.Unlock()
 	var active *HealthJobOutput
@@ -588,6 +582,9 @@ type sseStreamReader struct {
 	event   string
 	data    strings.Builder
 	closed  bool
+	// sanitizeFailure is configured for proxied streams after preflight. It
+	// removes provider-specific interception text from terminal SSE events.
+	sanitizeFailure func(string) (string, bool)
 	// closer/idleTimeout 可选：设置后，正式转发阶段每次读事件都带这个 idle 超时，
 	// 避免上游中途卡住导致 reader.Next() 无限阻塞、客户端超时断流。
 	closer            io.Closer
@@ -2735,10 +2732,11 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		modelUnsupportedFailures++
 	}
 	var cooldownFallback []storage.UpstreamGroupKey
-	attemptedActiveCandidate := false
+	firstOutputTimeoutSwitches := 0
 	// finalErr 承载"客户端错、换 key 也没用"路径的返回值。
 	// 在 stream 已写字节 / 明确 client-side 400 等场景下，我们把 err 记进来后不再继续 fail-over。
 	var finalErr error
+candidateLoop:
 	for i := range candidates {
 		candidate := candidates[i]
 		if until, ok := candidateCooldownUntil(candidate, now); ok {
@@ -2751,8 +2749,6 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			cooldownFallback = append(cooldownFallback, candidate)
 			continue
 		}
-		attemptedActiveCandidate = true
-
 		// 把单个候选的尝试封装到闭包里，用 defer release() 保证 panic / 早退时不泄漏并发额度。
 		outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
 
@@ -2767,6 +2763,9 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			rememberUnsupportedModel(candidate, outcome.errMsg)
 			if shouldMarkProxyFailure(outcome.errMsg) {
 				s.markProxyFailure(candidate.ID, outcome.errMsg)
+			}
+			if firstOutputFailoverExhausted(outcome.errMsg, &firstOutputTimeoutSwitches) {
+				break candidateLoop
 			}
 			continue
 		case candFatal:
@@ -2784,8 +2783,8 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			return finalErr
 		}
 	}
-	if !attemptedActiveCandidate && len(cooldownFallback) > 0 && candidateScopeFallbackAllowed(gatewayKey, candidates) {
-		cooldownFallback = sortCooldownFallbackCandidates(filterCooldownFallbackCandidates(cooldownFallback), now)
+	if len(cooldownFallback) > 0 && candidateScopeFallbackAllowed(gatewayKey, candidates) {
+		cooldownFallback = s.orderCooldownFallbackCandidates(filterCooldownFallbackCandidates(cooldownFallback), requestedModel)
 		if msg := cooldownFallbackMessage(cooldownFallback); msg != "" && s.log != nil {
 			s.log.Warn("gateway probing cooldown upstream groups", "scope", gatewayKeyScopeLabel(gatewayKey), "message", msg)
 		}
@@ -2813,14 +2812,17 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 				rememberUnsupportedModel(candidate, outcome.errMsg)
 				finalErr = outcome.err
 			}
-			break
+			if finalErr != nil {
+				break
+			}
 		}
 		if finalErr != nil {
 			return finalErr
 		}
 	}
 	message := "all upstream group keys failed: " + strings.Join(errorsSeen, " | ")
-	if requestedModel != "" && len(errorsSeen) > 0 && modelUnsupportedFailures == len(errorsSeen) {
+	if requestedModel != "" && len(errorsSeen) > 0 && modelUnsupportedFailures == len(errorsSeen) &&
+		len(saturatedSeen) == 0 && len(disabledSeen) == 0 {
 		message = fmt.Sprintf("no configured upstream supports requested model %q", requestedModel)
 	}
 	if len(errorsSeen) == 0 && len(saturatedSeen) > 0 {
@@ -2873,18 +2875,10 @@ func (s *Service) attemptCandidate(
 	defer release()
 
 	normalized = requestForCandidate(normalized, candidate)
-	var outcome candOutcome
-	for attempt := 0; attempt < 3; attempt++ {
-		if normalized.Stream {
-			outcome = s.attemptStream(ctx, gatewayKey, normalized, candidate, w)
-		} else {
-			outcome = s.attemptNonStream(ctx, gatewayKey, normalized, candidate, w)
-		}
-		if outcome.kind != candRetryable || !strings.Contains(strings.ToLower(outcome.errMsg), "response content intercepted") {
-			return outcome
-		}
+	if normalized.Stream {
+		return s.attemptStream(ctx, gatewayKey, normalized, candidate, w)
 	}
-	return outcome
+	return s.attemptNonStream(ctx, gatewayKey, normalized, candidate, w)
 }
 
 func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamGroupKey) normalizedRequest {
@@ -2903,9 +2897,96 @@ func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamG
 	}
 	switch normalizeUpstreamRequestMode(candidate.RequestMode) {
 	case "chat":
+		if requestRequiresNativeResponsesWire(request) {
+			return request
+		}
 		return stripCodexResponsesLiteHeader(request.alt())
 	default:
 		return request
+	}
+}
+
+func requestRequiresNativeResponsesWire(request normalizedRequest) bool {
+	if request.ResponseMode != "responses" {
+		return false
+	}
+	model := normalizeModelCapabilityKey(routingRequestModel(request))
+	if strings.HasPrefix(model, "gpt-5.6") {
+		return true
+	}
+	if strings.TrimSpace(headerValueCaseInsensitive(request.Header, codexResponsesLiteHeader)) != "" {
+		return true
+	}
+	if len(request.ToolKinds) > 0 {
+		return true
+	}
+	return responsesBodyRequiresNativeWire(request.Body)
+}
+
+func responsesBodyRequiresNativeWire(body []byte) bool {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil || raw == nil {
+		return false
+	}
+	for _, key := range []string{"tools", "tool_choice", "parallel_tool_calls", "previous_response_id", "response_id"} {
+		if meaningfulJSONValue(raw[key]) {
+			return true
+		}
+	}
+	if includeRequiresNativeResponses(raw["include"]) {
+		return true
+	}
+	input, _ := raw["input"].([]any)
+	for _, value := range input {
+		item, _ := value.(map[string]any)
+		if item == nil {
+			continue
+		}
+		typ := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
+		if typ == "function_call" || typ == "custom_tool_call" ||
+			typ == "function_call_output" || strings.HasSuffix(typ, "_call_output") {
+			return true
+		}
+	}
+	return false
+}
+
+func includeRequiresNativeResponses(value any) bool {
+	switch v := value.(type) {
+	case []any:
+		for _, item := range v {
+			if strings.EqualFold(strings.TrimSpace(stringValue(item)), "reasoning.encrypted_content") {
+				return true
+			}
+		}
+	case []string:
+		for _, item := range v {
+			if strings.EqualFold(strings.TrimSpace(item), "reasoning.encrypted_content") {
+				return true
+			}
+		}
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "reasoning.encrypted_content")
+	}
+	return false
+}
+
+func meaningfulJSONValue(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case string:
+		return strings.TrimSpace(v) != ""
+	case []any:
+		return len(v) > 0
+	case []string:
+		return len(v) > 0
+	case map[string]any:
+		return len(v) > 0
+	case bool:
+		return v
+	default:
+		return true
 	}
 }
 
@@ -3001,6 +3082,72 @@ func shouldPreferChatBridgeForResponsesStream(request normalizedRequest, candida
 	return false
 }
 
+const openAIResponsesBeta = "responses=experimental"
+
+func userAgentProductName(userAgent string) (string, bool) {
+	userAgent = strings.TrimSpace(userAgent)
+	if userAgent == "" {
+		return "", false
+	}
+	end := len(userAgent)
+	for i, r := range userAgent {
+		if r == '/' || r == '(' {
+			end = i
+			break
+		}
+	}
+	product := strings.TrimSpace(userAgent[:end])
+	if product == "" || len(product) > 64 {
+		return "", false
+	}
+	for i := 0; i < len(product); i++ {
+		if product[i] < 0x20 || product[i] > 0x7e {
+			return "", false
+		}
+	}
+	return product, true
+}
+
+func codexOriginatorFromUserAgent(userAgent string) (string, bool) {
+	product, ok := userAgentProductName(userAgent)
+	if !ok {
+		return "", false
+	}
+	normalized := strings.ToLower(product)
+	switch normalized {
+	case "codex_cli_rs", "codex-tui", "codex_vscode", "codex_vscode_copilot",
+		"codex_app", "codex_chatgpt_desktop", "codex_atlas", "codex_exec", "codex_sdk_ts":
+		return normalized, true
+	default:
+		if strings.HasPrefix(normalized, "codex ") {
+			return product, true
+		}
+		return "", false
+	}
+}
+
+func applyOpenAIRequestIdentity(header http.Header, synthesizedUserAgent bool) {
+	if synthesizedUserAgent {
+		originator, ok := userAgentProductName(header.Get("User-Agent"))
+		if !ok {
+			originator = config.DefaultCodexOriginator
+		}
+		if canonical, ok := codexOriginatorFromUserAgent(header.Get("User-Agent")); ok {
+			originator = canonical
+		}
+		header.Set("Originator", originator)
+		header.Set("Version", config.DefaultCodexVersion)
+		header.Set("OpenAI-Beta", openAIResponsesBeta)
+		return
+	}
+	if originator, ok := codexOriginatorFromUserAgent(header.Get("User-Agent")); ok {
+		// The Codex upstream validates Originator against the first User-Agent
+		// product. Keep the real inbound UA byte-for-byte and repair only the
+		// paired identity field when a proxy or client supplied a stale value.
+		header.Set("Originator", originator)
+	}
+}
+
 // applyUpstreamAuthHeaders applies the credential contract detected for this
 // exact upstream key. Do not derive it only from the channel: one relay can
 // have both a Bearer key and an x-api-key key at the same time.
@@ -3030,24 +3177,17 @@ func (s *Service) applyUpstreamAuthHeaders(header http.Header, key *storage.Upst
 		header.Set("User-Agent", "upstream-ops-grok/1.0")
 		return
 	}
-	if header.Get("User-Agent") == "" {
+	synthesizedUserAgent := strings.TrimSpace(header.Get("User-Agent")) == ""
+	if synthesizedUserAgent {
 		configured := strings.TrimSpace(s.upstreamConfig().UserAgent)
-		if configured != "" && configured != config.DefaultUpstreamUserAgent {
+		if configured != "" {
 			header.Set("User-Agent", configured)
-		} else if key != nil && normalizeClientFormat(key.ClientFormat) == "openai" {
-			// NewAPI-compatible relays can apply Codex-specific routing rules.
-			// This is deliberately a stable product identifier rather than an
-			// invented version string. Real inbound Codex headers are preserved.
-			header.Set("User-Agent", "codex-cli")
 		} else {
 			header.Set("User-Agent", config.DefaultUpstreamUserAgent)
 		}
 	}
-	if key != nil && normalizeClientFormat(key.ClientFormat) == "openai" && header.Get("Originator") == "" {
-		// NewAPI's Codex compatibility templates use this header together with
-		// the Codex CLI user agent. It is required only for synthetic requests
-		// such as health probes; a real client-provided Originator is untouched.
-		header.Set("Originator", "Codex CLI")
+	if key != nil && normalizeClientFormat(key.ClientFormat) == "openai" {
+		applyOpenAIRequestIdentity(header, synthesizedUserAgent)
 	}
 }
 
@@ -3203,7 +3343,7 @@ func (s *Service) attemptStream(
 		}
 		return failBeforeStreamBody(err, errMsg, true)
 	}
-	if fallback, reason, ok := fallbackRequestAfterFailure(normalized, errMsg); ok {
+	if fallback, reason, ok := fallbackRequestAfterCandidateFailure(normalized, candidate, errMsg, timedWriter.Started()); ok {
 		start = time.Now()
 		timedWriter = &timingResponseWriter{ResponseWriter: w, start: start}
 		retry, usage, err = s.streamProxyCandidate(ctx, fallback, candidate, timedWriter)
@@ -3285,6 +3425,118 @@ func shouldFailoverBeforeStreamWrite(err error) bool {
 	}
 }
 
+func isSlowFirstOutputFailure(message string) bool {
+	message = strings.ToLower(strings.TrimSpace(message))
+	if message == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"timeout awaiting response headers",
+		"did not send a usable generation event within",
+		"did not produce first output within",
+		"first_output_timeout",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstOutputFailoverExhausted(message string, switchCount *int) bool {
+	if !isSlowFirstOutputFailure(message) {
+		return false
+	}
+	if switchCount == nil || *switchCount >= maxFirstOutputTimeoutSwitches {
+		return true
+	}
+	*switchCount++
+	return false
+}
+
+func streamCandidatePreflightBudget(elapsed time.Duration) time.Duration {
+	remaining := streamFirstEventTimeout - elapsed
+	if remaining <= 0 {
+		return 0
+	}
+	if streamPreflightTimeout > 0 && streamPreflightTimeout < remaining {
+		return streamPreflightTimeout
+	}
+	return remaining
+}
+
+type firstOutputGuard struct {
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	timer    *time.Timer
+	ready    bool
+	timedOut bool
+	timeout  time.Duration
+}
+
+func newFirstOutputGuard(parent context.Context, timeout time.Duration) (context.Context, *firstOutputGuard) {
+	ctx, cancel := context.WithCancel(parent)
+	guard := &firstOutputGuard{cancel: cancel, timeout: timeout}
+	if timeout > 0 {
+		guard.timer = time.AfterFunc(timeout, func() {
+			guard.mu.Lock()
+			defer guard.mu.Unlock()
+			if guard.ready {
+				return
+			}
+			guard.timedOut = true
+			guard.cancel()
+		})
+	}
+	return ctx, guard
+}
+
+func (g *firstOutputGuard) MarkReady() bool {
+	if g == nil {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.timedOut {
+		return false
+	}
+	g.ready = true
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+	return true
+}
+
+func (g *firstOutputGuard) TimedOut() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.timedOut
+}
+
+func (g *firstOutputGuard) Close() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.ready = true
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+	g.mu.Unlock()
+	g.cancel()
+}
+
+func (g *firstOutputGuard) timeoutError() error {
+	timeout := streamFirstEventTimeout
+	if g != nil && g.timeout > 0 {
+		timeout = g.timeout
+	}
+	return fmt.Errorf("upstream did not produce first output within %s", timeout)
+}
+
 func (s *Service) attemptNonStream(
 	ctx context.Context,
 	gatewayKey *storage.GatewayKey,
@@ -3319,7 +3571,7 @@ func (s *Service) attemptNonStream(
 		return candOutcome{kind: candSuccess}
 	}
 	errMsg := err.Error()
-	if fallback, reason, ok := fallbackRequestAfterFailure(normalized, errMsg); ok {
+	if fallback, reason, ok := fallbackRequestAfterCandidateFailure(normalized, candidate, errMsg, false); ok {
 		start = time.Now()
 		status, header, respBody, retry, err = s.tryProxyCandidate(ctx, fallback, candidate)
 		if err == nil {
@@ -3388,7 +3640,10 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	if err != nil {
 		return true, usageTokens{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, request.Method, upstreamURL, bytes.NewReader(request.Body))
+	requestCtx, firstOutput := newFirstOutputGuard(ctx, streamFirstEventTimeout)
+	defer firstOutput.Close()
+	firstOutputStartedAt := time.Now()
+	req, err := http.NewRequestWithContext(requestCtx, request.Method, upstreamURL, bytes.NewReader(request.Body))
 	if err != nil {
 		return true, usageTokens{}, err
 	}
@@ -3405,6 +3660,9 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	client := s.httpClientFor(ctx, ch)
 	resp, err := client.Do(req)
 	if err != nil {
+		if firstOutput.TimedOut() {
+			return true, usageTokens{}, firstOutput.timeoutError()
+		}
 		return true, usageTokens{}, err
 	}
 	defer resp.Body.Close()
@@ -3414,13 +3672,19 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		if !isEventStream(header) {
 			respBody, readErr := readLimitedBody(resp.Body, 64<<20)
 			if readErr != nil {
+				if firstOutput.TimedOut() {
+					return true, usageTokens{}, firstOutput.timeoutError()
+				}
 				return true, usageTokens{}, readErr
+			}
+			if s.interceptedResponseContent(key, string(respBody)) != "" {
+				return true, usageTokens{}, errors.New("response content intercepted")
 			}
 			if isUpstreamErrorBody(respBody) {
 				return true, usageTokens{}, fmt.Errorf("upstream returned error payload: %s", truncateBody(respBody, 240))
 			}
-			if matched := s.interceptedResponseContent(key, string(respBody)); matched != "" {
-				return true, usageTokens{}, fmt.Errorf("response content intercepted: %s", matched)
+			if !firstOutput.MarkReady() {
+				return true, usageTokens{}, firstOutput.timeoutError()
 			}
 			if request.Stream && (request.ResponseMode == "responses" || request.ResponseMode == "responses_from_chat") {
 				usage, err := streamNonSSEAsResponsesEvents(w, resp.StatusCode, header, respBody, key, request.ResponseMode, request.ToolKinds)
@@ -3434,17 +3698,36 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		// heartbeat before proving this upstream can produce a valid event, the
 		// request is pinned to this candidate and we can no longer fail over to a
 		// healthier charity/low-ratio key without corrupting the Codex stream.
-		buffered, err := preflightSSEStream(reader, resp.Body, streamPreflightTimeout, func(events []sseEvent) bool { return s.shouldHoldInterceptionPreflight(key, events) })
+		preflightBudget := streamCandidatePreflightBudget(time.Since(firstOutputStartedAt))
+		if preflightBudget <= 0 {
+			return true, usageTokens{}, firstOutput.timeoutError()
+		}
+		buffered, err := preflightSSEStream(reader, resp.Body, preflightBudget, func(events []sseEvent) bool { return s.shouldHoldInterceptionPreflight(key, events) })
 		if err != nil {
+			if firstOutput.TimedOut() {
+				return true, usageTokens{}, firstOutput.timeoutError()
+			}
+			if s.interceptedResponseContent(key, err.Error()) != "" {
+				return true, usageTokens{}, errors.New("response content intercepted")
+			}
 			return true, usageTokens{}, err
 		}
+		if !firstOutput.MarkReady() {
+			return true, usageTokens{}, firstOutput.timeoutError()
+		}
 		for _, event := range buffered {
-			if matched := s.interceptedResponseContent(key, event.Data); matched != "" {
-				return true, usageTokens{}, fmt.Errorf("response content intercepted: %s", matched)
+			if s.interceptedResponseContent(key, event.Data) != "" {
+				return true, usageTokens{}, errors.New("response content intercepted")
 			}
 		}
 		// 正式转发阶段的 idle 读超时：上游连续 streamIdleTimeout 没有任何新事件就判定卡死，
 		// 主动关连接返回错误，避免 reader.Next() 无限阻塞导致客户端 stream closed。
+		reader.sanitizeFailure = func(message string) (string, bool) {
+			if s.interceptedResponseContent(key, message) != "" {
+				return "upstream stream interrupted", true
+			}
+			return message, false
+		}
 		reader.closer = resp.Body
 		reader.idleTimeout = streamIdleTimeout
 		reader.heartbeatInterval = streamHeartbeatInterval
@@ -3484,9 +3767,15 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	}
 	respBody, readErr := readLimitedBody(resp.Body, 64<<20)
 	if readErr != nil {
+		if firstOutput.TimedOut() {
+			return true, usageTokens{}, firstOutput.timeoutError()
+		}
 		return true, usageTokens{}, readErr
 	}
 	errText := truncateBody(respBody, 240)
+	if s.interceptedResponseContent(key, string(respBody)) != "" {
+		return true, usageTokens{}, errors.New("response content intercepted")
+	}
 	if shouldRetryUpstreamStatus(resp.StatusCode, errText) {
 		return true, usageTokens{}, errors.New(upstreamHTTPErrorMessage(resp.StatusCode, header, respBody))
 	}
@@ -3514,6 +3803,8 @@ func (s *Service) responseInterceptionNeedles(key *storage.UpstreamGroupKey) []s
 		"公益 token",
 		"公益token休息了",
 		"公益 token 休息了",
+		"gpt休息了",
+		"gpt 休息了",
 	}
 	for _, rule := range s.appConfig().ResponseInterceptionRules {
 		needle := strings.TrimSpace(rule.Content)
@@ -3575,11 +3866,19 @@ func (s *Service) shouldHoldInterceptionPreflight(key *storage.UpstreamGroupKey,
 		if needle == "" {
 			continue
 		}
-		if strings.HasPrefix(needle, value) {
+		if len(value) >= 2 && strings.HasPrefix(needle, value) {
 			return true
 		}
 		for offset := 1; offset < len(value); offset++ {
-			if strings.HasPrefix(needle, value[offset:]) {
+			suffix := value[offset:]
+			// A one-byte suffix (for example the final "g" in "pong") is
+			// too ambiguous to reserve a stream just because a rule starts with
+			// that byte. Keep single Chinese-character prefixes intact while
+			// waiting for at least two bytes of ASCII text such as "gp".
+			if len(suffix) < 2 {
+				continue
+			}
+			if strings.HasPrefix(needle, suffix) {
 				return true
 			}
 		}
@@ -3769,6 +4068,17 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
 		return item
 	}
+	if healthProbeTransientStatus(failureStatus) {
+		// A dashboard probe runs from this gateway host and is intentionally tiny.
+		// A single timeout/reset/5xx usually means the relay was busy or the
+		// probe path was deprioritized, while a manual re-test often succeeds.
+		// Keep the route schedulable and record the diagnostic only; live traffic
+		// has its own per-key retry/cooldown path and must not inherit a noisy
+		// "network_error" display state from a probe.
+		item.Status = "alive"
+		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
+		return item
+	}
 	if shouldSkipHealthRetry(failureStatus) {
 		item.Status = failureStatus
 		s.markHealthFailureWithStatus(key.ID, item.Status, item.Error, item.LatencyMS)
@@ -3780,10 +4090,11 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 	return item
 }
 
-// healthProbeAttempts runs up to three full generation probes for transient
-// upstream faults.  A second click often succeeding after a 5XX is evidence of
-// overload or a short router flap, not a dead channel; retry it inside the same
-// health run before changing the displayed state.
+// healthProbeAttempts runs one full generation probe. The OpenAI probe already
+// performs the required gpt-5.4 -> gpt-5.5 fallback inside that attempt; replaying
+// the entire sequence for a transient fault doubled latency and quota use while
+// adding little signal. Transient results remain inconclusive and real traffic
+// owns the retry/cooldown decision.
 func (s *Service) healthProbeAttempts(ctx context.Context, key *storage.UpstreamGroupKey) ([]healthProbeAttempt, bool) {
 	attempts := make([]healthProbeAttempt, 0, healthTransientAttempts)
 	for retry := 0; retry < healthTransientAttempts; retry++ {
@@ -3805,6 +4116,15 @@ func (s *Service) healthProbeAttempts(ctx context.Context, key *storage.Upstream
 func shouldRetryTransientHealthStatus(status string) bool {
 	switch status {
 	case "dead", "server_error", "timeout", "network_error", "upstream_error":
+		return true
+	default:
+		return false
+	}
+}
+
+func healthProbeTransientStatus(status string) bool {
+	switch status {
+	case "server_error", "timeout", "network_error", "upstream_error":
 		return true
 	default:
 		return false
@@ -3952,15 +4272,8 @@ func shouldTryHealthFallbackModel(status int, body []byte, err error) bool {
 	if healthProbeSucceeded(status, body, err) {
 		return false
 	}
-	classification := healthFailureStatus(status, body, err)
-	switch classification {
-	case "zero_balance", "rate_limited", "forbidden", "auth_failed":
-		// The credential/billing failure applies to the Key, not the model;
-		// trying another model only burns another request and obscures the cause.
-		return false
-	default:
-		return true
-	}
+	text := healthFailureText(body, err)
+	return looksLikeUnsupportedModelError(text) || looksLikeUpstreamRoutingUnavailable(text)
 }
 
 func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.UpstreamGroupKey, model string, allowCompatibleModelRetry bool) (int, []byte, error) {
@@ -4777,10 +5090,16 @@ func (s *Service) tryProxyCandidate(ctx context.Context, request normalizedReque
 		return 0, nil, nil, true, err
 	}
 	if status >= 200 && status < 300 {
+		if s.interceptedResponseContent(key, string(respBody)) != "" {
+			return status, header, respBody, true, errors.New("response content intercepted")
+		}
 		if isUpstreamErrorBody(respBody) {
 			return status, header, respBody, true, fmt.Errorf("upstream returned error payload: %s", truncateBody(respBody, 240))
 		}
 		return status, header, respBody, false, nil
+	}
+	if s.interceptedResponseContent(key, string(respBody)) != "" {
+		return status, header, respBody, true, errors.New("response content intercepted")
 	}
 	errText := truncateBody(respBody, 240)
 	if shouldRetryUpstreamStatus(status, errText) {
@@ -4889,7 +5208,7 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 		return resp.StatusCode, header, respBody, nil
 	}
 	reader := newSSEStreamReader(resp.Body)
-	buffered, err := preflightHealthSSEStream(reader, resp.Body, healthProbeTimeout)
+	buffered, err := preflightHealthSSEStream(reader, resp.Body, timeout)
 	body := healthProbeSSEBody(buffered)
 	if err != nil {
 		return resp.StatusCode, header, body, err
@@ -4950,11 +5269,10 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 	transport.IdleConnTimeout = 90 * time.Second
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	transport.ExpectContinueTimeout = time.Second
-	// 流式推理请求可能在上游完成较长 reasoning 后才返回响应头；如果这里仍用
-	// 60s，会早于 streamFirstEventTimeout 断开，Codex 直连仍会看到
-	// "stream closed before response.completed"。非流请求有 requestCandidate 的
-	// per-request context 超时兜底，不会因为这个 transport 上限被无限拉长。
-	transport.ResponseHeaderTimeout = streamFirstEventTimeout
+	// Streaming requests enforce the shorter first-output budget with their
+	// request context. Keep the shared transport header timeout at the full
+	// per-attempt budget so non-stream requests are not cut off after six seconds.
+	transport.ResponseHeaderTimeout = proxyAttemptTimeout
 	if proxyURL = strings.TrimSpace(proxyURL); proxyURL != "" {
 		if parsed, err := url.Parse(proxyURL); err == nil {
 			transport.Proxy = http.ProxyURL(parsed)
@@ -4967,12 +5285,11 @@ func (s *Service) markProxyFailure(id uint, msg string) {
 	status := proxyFailureStatus(msg)
 	policy := s.proxyFailurePolicy(id, status, msg)
 	persistedStatus := status
-	// A one-off connect reset, timeout or 5xx says nothing reliable about a
-	// route's health. Preserve a per-key failure count, but keep it selectable
-	// until the same key reaches the short-circuit threshold. Previously this
-	// wrote network_error immediately, so a temporary local/upstream blip made
-	// an entire page appear unavailable even though single probes still worked.
-	if isTransientProxyFailureStatus(status) && policy.cooldown <= 0 {
+	// A one-off connect reset, timeout, 5xx, or 429 says little about a route's
+	// permanent health. Preserve per-key diagnostics and any short cooldown, but
+	// keep the displayed state alive so one noisy request does not paint a whole
+	// page of channels as dead while a manual re-test succeeds.
+	if isTemporaryProxyFailureStatus(status) {
 		persistedStatus = "alive"
 	}
 	var disabledUntil *time.Time
@@ -4993,9 +5310,9 @@ func (s *Service) markProxyFailure(id uint, msg string) {
 	}
 }
 
-func isTransientProxyFailureStatus(status string) bool {
+func isTemporaryProxyFailureStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case "network_error", "timeout", "server_error", "upstream_error", "dead":
+	case "rate_limited", "network_error", "timeout", "server_error", "upstream_error", "dead":
 		return true
 	default:
 		return false
@@ -5171,6 +5488,7 @@ func (s *Service) markHealthFailureWithStatus(id uint, status string, msg string
 	if strings.TrimSpace(status) == "" {
 		status = "dead"
 	}
+	persistedStatus := status
 	currentFailures := 0
 	if current, err := s.groupKeys.FindByID(id); err == nil && current != nil {
 		currentFailures = current.FailureCount
@@ -5184,7 +5502,10 @@ func (s *Service) markHealthFailureWithStatus(id uint, status string, msg string
 	} else {
 		s.clearRuntimeDisable(id)
 	}
-	if err := s.groupKeys.MarkHealthFailureStatus(id, status, msg, disabledUntil, latencyMS); err != nil && s.log != nil {
+	if healthProbeTransientStatus(status) {
+		persistedStatus = "alive"
+	}
+	if err := s.groupKeys.MarkHealthFailureStatus(id, persistedStatus, msg, disabledUntil, latencyMS); err != nil && s.log != nil {
 		s.log.Warn("mark upstream health failed", "id", id, "err", err)
 	}
 }
@@ -5325,6 +5646,7 @@ func chatToResponsesBody(body []byte) ([]byte, bool, error) {
 		raw["input"] = normalizeChatMessages(messages)
 		delete(raw, "messages")
 	}
+	normalizeChatReasoningForResponses(raw)
 	moveField(raw, "max_tokens", "max_output_tokens")
 	moveField(raw, "max_completion_tokens", "max_output_tokens")
 	delete(raw, "n")
@@ -5377,9 +5699,39 @@ func responsesToChatRequestBody(body []byte) ([]byte, bool, error) {
 	if mt, ok := raw["max_output_tokens"]; ok {
 		out["max_tokens"] = mt
 	}
+	if effort := responsesReasoningEffort(raw["reasoning"]); effort != "" {
+		out["reasoning_effort"] = effort
+	}
 	out["stream"] = stream
 	encoded, err := json.Marshal(out)
 	return encoded, stream, err
+}
+
+func normalizeChatReasoningForResponses(raw map[string]any) {
+	if raw == nil {
+		return
+	}
+	effort := strings.TrimSpace(stringValue(raw["reasoning_effort"]))
+	if effort == "" {
+		return
+	}
+	reasoning, _ := raw["reasoning"].(map[string]any)
+	if reasoning == nil {
+		reasoning = map[string]any{}
+	}
+	if strings.TrimSpace(stringValue(reasoning["effort"])) == "" {
+		reasoning["effort"] = effort
+	}
+	raw["reasoning"] = reasoning
+	delete(raw, "reasoning_effort")
+}
+
+func responsesReasoningEffort(value any) string {
+	reasoning, _ := value.(map[string]any)
+	if reasoning == nil {
+		return ""
+	}
+	return strings.TrimSpace(stringValue(reasoning["effort"]))
 }
 
 // responsesToolsToChatTools converts Responses API tool declarations into Chat Completions function tools.
@@ -5928,6 +6280,45 @@ func fallbackRequestAfterFailure(request normalizedRequest, errMsg string) (norm
 	return request.alt(), "upstream chat-completions compatibility", true
 }
 
+func fallbackRequestAfterCandidateFailure(
+	request normalizedRequest,
+	candidate *storage.UpstreamGroupKey,
+	errMsg string,
+	downstreamStarted bool,
+) (normalizedRequest, string, bool) {
+	if !downstreamStarted && candidate != nil && request.hasAlt() && request.ResponseMode == "responses" &&
+		normalizeUpstreamRequestMode(candidate.RequestMode) == "chat" &&
+		requestForcedNativeResponsesForChatCandidate(request) &&
+		looksLikeExplicitModelNotSupportedFailure(errMsg) {
+		return stripCodexResponsesLiteHeader(request.alt()), "chat-marked candidate model fallback", true
+	}
+	return fallbackRequestAfterFailure(request, errMsg)
+}
+
+func requestForcedNativeResponsesForChatCandidate(request normalizedRequest) bool {
+	if request.ResponseMode != "responses" {
+		return false
+	}
+	// GPT-5.6, Responses-Lite, tools, and stateful Responses payloads are
+	// intentionally tried on the native wire first even for a chat-marked key.
+	// Keep this predicate aligned with requestForCandidate so an explicit
+	// model_not_supported response can safely retry that same key through its
+	// prepared Chat bridge before the scheduler moves on.
+	return requestRequiresNativeResponsesWire(request)
+}
+
+func responsesBodyHasDeclaredTools(body []byte) bool {
+	var raw map[string]any
+	if json.Unmarshal(body, &raw) != nil || raw == nil {
+		return false
+	}
+	return meaningfulJSONValue(raw["tools"])
+}
+
+func looksLikeExplicitModelNotSupportedFailure(message string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(message)), "model_not_supported")
+}
+
 // rememberSuccessfulProtocolFallback persists only a proven endpoint
 // capability transition. It runs after a complete upstream success, so a
 // temporary network failure or an unsupported model can never flip a channel
@@ -6070,8 +6461,9 @@ func looksLikeResponsesEndpointError(msg string) bool {
 }
 
 func (s *Service) orderCandidatesForRequest(candidates []storage.UpstreamGroupKey, request normalizedRequest) []storage.UpstreamGroupKey {
-	ordered := s.orderCandidatesWithRuntime(candidates, routingRequestModel(request))
-	ordered = preferSameGroupSchedulableCandidates(ordered)
+	requestModel := routingRequestModel(request)
+	ordered := s.orderCandidatesWithRuntime(candidates, requestModel)
+	ordered = s.preferSameGroupSchedulableCandidates(ordered, requestModel)
 	if s.affinities == nil || request.AffinityKey == "" {
 		return ordered
 	}
@@ -6092,22 +6484,33 @@ func (s *Service) orderCandidatesForRequest(candidates []storage.UpstreamGroupKe
 			continue
 		}
 		if !hard {
-			// Soft affinity only keeps a paid route warm among paid routes. A
-			// healthy charity route is an explicit first-tier scheduler rule and
-			// must never be bypassed merely because a previous paid request exists.
-			if statusRank(item.Status) > statusRank("unknown") || (!item.Charity && hasSchedulableCharityCandidate(ordered)) {
+			// Soft affinity is only a cache-warming hint inside the same dispatch
+			// tier. It must not jump over a charity route, a lower ratio, or a
+			// cheaper equivalent route.
+			if !s.softAffinityCanPromote(ordered, item, requestModel) {
 				return ordered
 			}
 		}
 		out := append([]storage.UpstreamGroupKey{item}, ordered[:i]...)
 		out = append(out, ordered[i+1:]...)
-		out = preferSameGroupSchedulableCandidates(out)
+		out = s.preferSameGroupSchedulableCandidates(out, requestModel)
 		return out
 	}
 	return ordered
 }
 
-func preferSameGroupSchedulableCandidates(candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
+func (s *Service) softAffinityCanPromote(ordered []storage.UpstreamGroupKey, sticky storage.UpstreamGroupKey, model string) bool {
+	if !candidateSchedulable(sticky) {
+		return false
+	}
+	if len(ordered) == 0 || ordered[0].ID == sticky.ID {
+		return true
+	}
+	return sameDispatchOrderTier(ordered[0], sticky) &&
+		s.candidateModelCapabilityRank(ordered[0].ID, model) == s.candidateModelCapabilityRank(sticky.ID, model)
+}
+
+func (s *Service) preferSameGroupSchedulableCandidates(candidates []storage.UpstreamGroupKey, model string) []storage.UpstreamGroupKey {
 	if len(candidates) < 3 {
 		return candidates
 	}
@@ -6119,7 +6522,8 @@ func preferSameGroupSchedulableCandidates(candidates []storage.UpstreamGroupKey)
 	rest := make([]storage.UpstreamGroupKey, 0, len(candidates))
 	out = append(out, candidates[0])
 	for _, item := range candidates[1:] {
-		if candidateSchedulable(item) && dispatchGroupIdentity(item) == target {
+		if candidateSchedulable(item) && dispatchGroupIdentity(item) == target && sameDispatchOrderTier(candidates[0], item) &&
+			s.candidateModelCapabilityRank(candidates[0].ID, model) == s.candidateModelCapabilityRank(item.ID, model) {
 			out = append(out, item)
 			continue
 		}
@@ -6127,6 +6531,26 @@ func preferSameGroupSchedulableCandidates(candidates []storage.UpstreamGroupKey)
 	}
 	out = append(out, rest...)
 	return out
+}
+
+func sameDispatchOrderTier(a, b storage.UpstreamGroupKey) bool {
+	if candidateSchedulable(a) != candidateSchedulable(b) {
+		return false
+	}
+	if a.Charity != b.Charity {
+		return false
+	}
+	if statusRank(a.Status) != statusRank(b.Status) {
+		return false
+	}
+	if !nearlyEqualFloat(effectiveGroupRatio(a), effectiveGroupRatio(b)) {
+		return false
+	}
+	return nearlyEqualFloat(candidateDispatchCostScore(a), candidateDispatchCostScore(b))
+}
+
+func nearlyEqualFloat(a, b float64) bool {
+	return math.Abs(a-b) <= 1e-9
 }
 
 func dispatchGroupIdentity(item storage.UpstreamGroupKey) string {
@@ -6158,20 +6582,24 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		if schedI != schedJ {
 			return schedI
 		}
-		if supportI, supportJ := s.candidateModelCapabilityRank(out[i].ID, requestModel), s.candidateModelCapabilityRank(out[j].ID, requestModel); supportI != supportJ {
-			return supportI < supportJ
-		}
-		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
-			return rankI < rankJ
+		supportI, supportJ := s.candidateModelCapabilityRank(out[i].ID, requestModel), s.candidateModelCapabilityRank(out[j].ID, requestModel)
+		if (supportI == 2) != (supportJ == 2) {
+			return supportI != 2
 		}
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
-		if costI, costJ := candidateDispatchCostScore(out[i], requestModel), candidateDispatchCostScore(out[j], requestModel); costI != costJ {
-			return costI < costJ
+		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
+			return rankI < rankJ
 		}
 		if ratioI, ratioJ := effectiveGroupRatio(out[i]), effectiveGroupRatio(out[j]); ratioI != ratioJ {
 			return ratioI < ratioJ
+		}
+		if costI, costJ := candidateDispatchCostScore(out[i], requestModel), candidateDispatchCostScore(out[j], requestModel); costI != costJ {
+			return costI < costJ
+		}
+		if supportI != supportJ {
+			return supportI < supportJ
 		}
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
@@ -6218,23 +6646,12 @@ func normalizeModelCapabilityKey(model string) string {
 // unsupported (2). Unsupported candidates are retained as a last resort: a
 // model list can be stale, but they no longer add a failed first request after
 // the gateway has already observed their real response for this model.
-// filterKnownUnsupportedModelCandidates removes only channels for which this
-// gateway has already observed a definitive "model unsupported" response.
-// Unknown channels remain eligible so a newly added model can still be used;
-// they are ranked after proven-compatible routes by orderCandidatesWithRuntime.
+// filterKnownUnsupportedModelCandidates intentionally retains every candidate.
+// The negative cache is advisory: orderCandidatesWithRuntime places known
+// unsupported entries after supported/unknown routes, but still tries them when
+// they are the only remaining fallback because provider model maps can be stale.
 func (s *Service) filterKnownUnsupportedModelCandidates(candidates []storage.UpstreamGroupKey, model string) []storage.UpstreamGroupKey {
-	model = normalizeModelCapabilityKey(model)
-	if model == "" {
-		return candidates
-	}
-	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
-	for _, candidate := range candidates {
-		if s.candidateModelCapabilityRank(candidate.ID, model) == 2 {
-			continue
-		}
-		out = append(out, candidate)
-	}
-	return out
+	return candidates
 }
 func (s *Service) candidateModelCapabilityRank(candidateID uint, model string) int {
 	model = normalizeModelCapabilityKey(model)
@@ -6603,11 +7020,11 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 		if out[i].Charity != out[j].Charity {
 			return out[i].Charity
 		}
-		if costI, costJ := candidateDispatchCostScore(out[i]), candidateDispatchCostScore(out[j]); costI != costJ {
-			return costI < costJ
-		}
 		if ratioI, ratioJ := effectiveGroupRatio(out[i]), effectiveGroupRatio(out[j]); ratioI != ratioJ {
 			return ratioI < ratioJ
+		}
+		if costI, costJ := candidateDispatchCostScore(out[i]), candidateDispatchCostScore(out[j]); costI != costJ {
+			return costI < costJ
 		}
 		if out[i].Priority != out[j].Priority {
 			return out[i].Priority > out[j].Priority
@@ -7385,12 +7802,12 @@ func friendlyGatewayStreamFailureMessage(message string) string {
 		return "请求暂时无法完成，请稍后重试。"
 	case strings.Contains(lower, "no configured upstream supports requested model"):
 		return "所有可用上游均不支持当前请求模型，请切换模型后重试。"
-	case looksLikeUnsupportedModelError(trimmed):
-		return "当前上游不支持请求的模型，已自动尝试其他兼容渠道；请稍后重试或切换模型。"
 	case strings.Contains(lower, "no alive upstream group keys available") ||
 		strings.Contains(lower, "all upstream group keys failed") ||
 		strings.Contains(lower, "upstreams temporarily unavailable"):
 		return "当前没有可用上游，请稍后重试；如果持续出现，请检查上游渠道状态。"
+	case looksLikeUnsupportedModelError(trimmed):
+		return "当前上游不支持请求的模型，已自动尝试其他兼容渠道；请稍后重试或切换模型。"
 	case strings.Contains(lower, "concurrency") || strings.Contains(lower, "queue canceled"):
 		return "当前请求过多或排队已取消，请稍后重试。"
 	case strings.Contains(lower, "daily token limit") ||
@@ -8090,6 +8507,17 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			sawDone = true
 			return errResponsesStreamTerminal
 		}
+		if failed, message := sanitizedStreamEventFailure(reader, sseEvent{Event: event, Data: data}); failed {
+			if err := emitCreated(); err != nil {
+				return err
+			}
+			if err := writeResponsesStreamFailure(w, id, model, "upstream_error", message); err != nil {
+				return err
+			}
+			best.SoftFailure = message
+			best.Status = "failed"
+			return errResponsesStreamTerminal
+		}
 		var raw map[string]any
 		if err := json.Unmarshal([]byte(data), &raw); err != nil {
 			return fmt.Errorf("decode upstream chat stream event: %w", err)
@@ -8134,6 +8562,9 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	streamErr := err
 	if errors.Is(streamErr, errResponsesStreamTerminal) {
 		streamErr = nil
+	}
+	if best.Status == "failed" {
+		return best, nil
 	}
 	if err := emitCreated(); err != nil {
 		return best, err
@@ -8264,6 +8695,24 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		if data == "[DONE]" {
 			return errResponsesStreamTerminal
 		}
+		if failed, message := sanitizedStreamEventFailure(reader, sseEvent{Event: event, Data: data}); failed {
+			if !roleSent {
+				if err := writeChatStreamChunk(w, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
+					return err
+				}
+				roleSent = true
+			}
+			if err := writeChatStreamChunk(w, id, model, created, map[string]any{}, "stop"); err != nil {
+				return err
+			}
+			if err := writeSSEData(w, "[DONE]"); err != nil {
+				return err
+			}
+			doneSent = true
+			best.SoftFailure = message
+			best.Status = "failed"
+			return errResponsesStreamTerminal
+		}
 		var raw map[string]any
 		if err := json.Unmarshal([]byte(data), &raw); err != nil {
 			return nil
@@ -8374,6 +8823,24 @@ func streamResponsesAsClaudeEvents(w http.ResponseWriter, buffered []sseEvent, r
 			return nil
 		}
 		if data == "[DONE]" {
+			return errResponsesStreamTerminal
+		}
+		if failed, message := sanitizedStreamEventFailure(reader, sseEvent{Event: event, Data: data}); failed {
+			if !started {
+				if err := writeClaudeStart(w, id, model); err != nil {
+					return err
+				}
+				started = true
+			}
+			if err := writeClaudeEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}); err != nil {
+				return err
+			}
+			if err := writeClaudeEvent(w, "message_stop", map[string]any{"type": "message_stop"}); err != nil {
+				return err
+			}
+			stopped = true
+			best.SoftFailure = message
+			best.Status = "failed"
 			return errResponsesStreamTerminal
 		}
 		var raw map[string]any
@@ -8569,8 +9036,14 @@ func preflightHealthSSEStream(reader *sseStreamReader, closer io.Closer, timeout
 	if timeout <= 0 {
 		timeout = healthProbeTimeout
 	}
+	deadline := time.Now().Add(timeout)
 	for len(buffered) < streamPreflightMaxEvents && totalBytes < streamPreflightMaxBytes {
-		ev, err := readNextSSEWithTimeout(reader, closer, timeout, "health generation event")
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			_ = closer.Close()
+			return nil, fmt.Errorf("upstream stream did not send a health generation event within %s", timeout)
+		}
+		ev, err := readNextSSEWithTimeout(reader, closer, remaining, "health generation event")
 		if errors.Is(err, io.EOF) {
 			if len(buffered) == 0 {
 				return nil, errors.New("upstream stream ended before sending health probe data")
@@ -8641,8 +9114,14 @@ func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.
 	if timeout <= 0 {
 		timeout = streamPreflightTimeout
 	}
+	deadline := time.Now().Add(timeout)
 	for len(buffered) < streamPreflightMaxEvents && totalBytes < streamPreflightMaxBytes {
-		ev, err := readNextSSEWithTimeout(reader, closer, timeout, "first event")
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			_ = closer.Close()
+			return nil, fmt.Errorf("upstream stream did not send a usable generation event within %s", timeout)
+		}
+		ev, err := readNextSSEWithTimeout(reader, closer, remaining, "a usable generation event")
 		if errors.Is(err, io.EOF) {
 			if len(buffered) == 0 {
 				return nil, errors.New("upstream stream ended before sending data")
@@ -8815,6 +9294,17 @@ func streamEventFailure(ev sseEvent) (bool, string) {
 	return false, ""
 }
 
+func sanitizedStreamEventFailure(reader *sseStreamReader, ev sseEvent) (bool, string) {
+	failed, message := streamEventFailure(ev)
+	if !failed || reader == nil || reader.sanitizeFailure == nil {
+		return failed, message
+	}
+	if sanitized, intercepted := reader.sanitizeFailure(message); intercepted {
+		return true, sanitized
+	}
+	return true, message
+}
+
 func bufferedSSELooksLikeChatCompletion(events []sseEvent) bool {
 	for _, ev := range events {
 		if sseEventLooksLikeChatCompletion(ev) {
@@ -8895,6 +9385,15 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 	if responseMode != "responses" {
 		var textBuf strings.Builder
 		err := readSSEEvents(buffered, reader, func(event, data string) error {
+			if failed, message := sanitizedStreamEventFailure(reader, sseEvent{Event: event, Data: data}); failed {
+				payload := mustJSON(map[string]any{"error": map[string]any{"message": message, "type": "upstream_error"}})
+				if err := writeSSEEvent(w, sseEvent{Event: "error", Data: payload}); err != nil {
+					return err
+				}
+				best.SoftFailure = message
+				best.Status = "failed"
+				return errResponsesStreamTerminal
+			}
 			usage := usageFromSSEData(data)
 			if usage.ResponseID != "" {
 				best.ResponseID = usage.ResponseID
@@ -8917,6 +9416,9 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 			}
 			return writeSSEEvent(w, sseEvent{Event: event, Data: data})
 		})
+		if errors.Is(err, errResponsesStreamTerminal) {
+			return best, nil
+		}
 		return best, err
 	}
 
@@ -9003,7 +9505,7 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 		}
 
 		ev := sseEvent{Event: event, Data: data}
-		if failed, msg := streamEventFailure(ev); failed {
+		if failed, msg := sanitizedStreamEventFailure(reader, ev); failed {
 			failedSeen = true
 			if err := writeResponsesStreamFailure(w, respID, model, "upstream_error", msg); err != nil {
 				return err
@@ -9708,20 +10210,11 @@ func temporaryCooldownFallbackCandidate(candidate storage.UpstreamGroupKey) bool
 	}
 }
 
-func sortCooldownFallbackCandidates(candidates []storage.UpstreamGroupKey, now time.Time) []storage.UpstreamGroupKey {
-	out := append([]storage.UpstreamGroupKey(nil), candidates...)
-	sort.SliceStable(out, func(i, j int) bool {
-		untilI, okI := candidateCooldownUntil(out[i], now)
-		untilJ, okJ := candidateCooldownUntil(out[j], now)
-		if okI && okJ && !untilI.Equal(untilJ) {
-			return untilI.Before(untilJ)
-		}
-		if okI != okJ {
-			return okI
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out
+func (s *Service) orderCooldownFallbackCandidates(candidates []storage.UpstreamGroupKey, model string) []storage.UpstreamGroupKey {
+	// Cooldown rescue follows the same charity/cost/capability policy as normal
+	// dispatch. The cooldown timestamp is diagnostic state, not permission to
+	// jump an expensive route ahead of a cheaper fallback.
+	return s.orderCandidatesWithRuntime(candidates, model)
 }
 
 func cooldownFallbackMessage(candidates []storage.UpstreamGroupKey) string {

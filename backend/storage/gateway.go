@@ -407,12 +407,22 @@ func (r *UpstreamGroupKeys) reactivateExpiredCooldowns(now time.Time) error {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	return r.db.Model(&UpstreamGroupKey{}).
+	if err := r.db.Model(&UpstreamGroupKey{}).
 		Where("enabled = ?", true).
 		Where("status IN ?", []string{"rate_limited", "dead", "server_error", "timeout", "network_error", "upstream_error"}).
 		Where("disabled_until IS NOT NULL AND disabled_until <= ?", now).
 		Updates(map[string]any{
 			"status":         "alive",
+			"failure_count":  0,
+			"disabled_until": nil,
+		}).Error; err != nil {
+		return err
+	}
+	return r.db.Model(&UpstreamGroupKey{}).
+		Where("enabled = ?", true).
+		Where("status = ?", "alive").
+		Where("disabled_until IS NOT NULL AND disabled_until <= ?", now).
+		Updates(map[string]any{
 			"failure_count":  0,
 			"disabled_until": nil,
 		}).Error

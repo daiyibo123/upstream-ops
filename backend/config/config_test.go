@@ -5,6 +5,13 @@ import (
 	"testing"
 )
 
+func TestDefaultUpstreamUserAgentMatchesCurrentCodexCLI(t *testing.T) {
+	const want = "codex_cli_rs/0.144.1 (Ubuntu 22.4.0; x86_64) xterm-256color"
+	if DefaultUpstreamUserAgent != want {
+		t.Fatalf("default user agent = %q, want %q", DefaultUpstreamUserAgent, want)
+	}
+}
+
 func TestLoadAppliesUpstreamDefaults(t *testing.T) {
 	cfg, err := LoadFile(filepath.Join(t.TempDir(), "missing.yaml"))
 	if err != nil {
@@ -28,5 +35,12 @@ func TestUpstreamConfigWithDefaultsKeepsCustomUserAgent(t *testing.T) {
 	}
 	if cfg.UserAgent != "custom-agent" {
 		t.Fatalf("user agent = %q", cfg.UserAgent)
+	}
+}
+
+func TestUpstreamConfigWithDefaultsMigratesLegacyDefaultUserAgent(t *testing.T) {
+	cfg := UpstreamConfig{UserAgent: " upstream-ops/0.1 "}.WithDefaults()
+	if cfg.UserAgent != DefaultUpstreamUserAgent {
+		t.Fatalf("migrated user agent = %q", cfg.UserAgent)
 	}
 }

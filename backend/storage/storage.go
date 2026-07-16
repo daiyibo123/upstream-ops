@@ -154,13 +154,13 @@ func AutoMigrate(db *gorm.DB) error {
 		Update("status", "alive").Error; err != nil {
 		return fmt.Errorf("normalize unprobed upstream statuses: %w", err)
 	}
-	// Network/TLS/timeout errors describe the probing machine's ability to
-	// reach an upstream at one instant. They are not a stable channel health
-	// state. New health logic retries them and only records a confirmed death;
-	// normalize legacy rows so the UI never presents them as a separate status.
+	// Network/TLS/timeout/429 errors describe one instant of gateway-to-relay
+	// pressure. They are not a stable channel health state. New routing logic
+	// records diagnostics/cooldown separately; normalize legacy rows so the UI
+	// and scheduler do not keep presenting them as dead-like statuses.
 	if err := db.Model(&UpstreamGroupKey{}).
-		Where("status IN ?", []string{"network_error", "timeout", "upstream_error"}).
-		Updates(map[string]any{"status": "alive", "disabled_until": nil}).Error; err != nil {
+		Where("status IN ?", []string{"rate_limited", "network_error", "timeout", "upstream_error", "server_error"}).
+		Updates(map[string]any{"status": "alive", "failure_count": 0, "disabled_until": nil}).Error; err != nil {
 		return fmt.Errorf("normalize transient upstream statuses: %w", err)
 	}
 	return backfillGatewayKeyGroupScopes(db)

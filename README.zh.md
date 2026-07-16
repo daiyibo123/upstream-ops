@@ -420,7 +420,7 @@ pnpm build
 
 ## 代理与上游 HTTP 配置
 
-系统设置页可以配置全局代理和上游请求参数。代理默认关闭，协议默认 `http`；上游请求超时默认 `30` 秒，`User-Agent` 默认 `upstream-ops/0.1`。
+系统设置页可以配置全局代理和上游请求参数。代理默认关闭，协议默认 `http`；上游请求超时默认 `30` 秒，`User-Agent` 默认 `codex_cli_rs/0.144.1 (Ubuntu 22.4.0; x86_64) xterm-256color`。
 
 配置文件字段：
 
@@ -436,7 +436,7 @@ proxy:
 
 upstream:
   timeoutSeconds: 30
-  userAgent: upstream-ops/0.1
+  userAgent: codex_cli_rs/0.144.1 (Ubuntu 22.4.0; x86_64) xterm-256color
 ```
 
 - `proxy.enabled`：是否启用全局代理。

@@ -464,7 +464,7 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 		})
 	}
 	for _, group := range groups {
-		status := group.Status
+		status := dashboardEffectiveGroupStatus(group.Status)
 		if !group.Enabled {
 			status = "disabled"
 		}
@@ -514,7 +514,7 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			LastError:             group.LastError,
 		}
 		stat.Groups = append(stat.Groups, g)
-		if isOpenAI && group.Enabled && (group.Status == "alive" || group.Status == "unknown") {
+		if isOpenAI && group.Enabled && (status == "alive" || status == "unknown") {
 			if stat.Cheapest == nil || group.Ratio < stat.Cheapest.Ratio {
 				copy := g
 				stat.Cheapest = &copy
@@ -554,16 +554,28 @@ func dashboardGroupLess(a, b dashboardGatewayGroup) bool {
 	if a.Charity != b.Charity {
 		return a.Charity
 	}
-	if a.Priority != b.Priority {
-		return a.Priority > b.Priority
-	}
 	if a.Ratio != b.Ratio {
 		return a.Ratio < b.Ratio
+	}
+	if a.Priority != b.Priority {
+		return a.Priority > b.Priority
 	}
 	if a.FailureCount != b.FailureCount {
 		return a.FailureCount < b.FailureCount
 	}
 	return a.ID < b.ID
+}
+
+func dashboardEffectiveGroupStatus(status string) string {
+	switch status {
+	case "rate_limited", "network_error", "timeout", "upstream_error", "server_error":
+		// Transient transport/pressure outcomes are retained in last_error and
+		// cooldown metadata. They must not paint an otherwise enabled route as
+		// dead in the overview; dispatch still honors disabled_until.
+		return "alive"
+	default:
+		return status
+	}
 }
 
 func dashboardStatusRank(status string) int {

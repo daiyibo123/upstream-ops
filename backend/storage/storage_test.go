@@ -119,6 +119,35 @@ func TestAutoMigrateNormalizesLegacyUnprobedGroupStatuses(t *testing.T) {
 	}
 }
 
+func TestAutoMigrateNormalizesTransientGroupStatusesAndFailureCounts(t *testing.T) {
+	db := openTestDB(t)
+	future := time.Now().Add(time.Hour)
+	for index, status := range []string{"rate_limited", "network_error", "timeout", "upstream_error", "server_error"} {
+		group := &UpstreamGroupKey{
+			ChannelID: uint(index + 100), GroupRef: "transient-status-" + strconv.Itoa(index), GroupName: "transient",
+			Enabled: true, Status: status, FailureCount: 4, DisabledUntil: &future,
+		}
+		if err := db.Create(group).Error; err != nil {
+			t.Fatalf("create %q transient group: %v", status, err)
+		}
+	}
+	if err := AutoMigrate(db); err != nil {
+		t.Fatalf("rerun auto migrate: %v", err)
+	}
+	var groups []UpstreamGroupKey
+	if err := db.Where("group_ref LIKE ?", "transient-status-%").Find(&groups).Error; err != nil {
+		t.Fatalf("load normalized transient groups: %v", err)
+	}
+	if len(groups) != 5 {
+		t.Fatalf("normalized transient groups = %d, want 5", len(groups))
+	}
+	for _, group := range groups {
+		if group.Status != "alive" || group.FailureCount != 0 || group.DisabledUntil != nil {
+			t.Fatalf("transient group was not fully normalized: %#v", group)
+		}
+	}
+}
+
 func TestExpiredCooldownResetsTransientFailureCount(t *testing.T) {
 	db := openTestDB(t)
 	past := time.Now().Add(-time.Minute)

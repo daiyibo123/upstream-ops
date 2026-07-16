@@ -9,8 +9,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/bejix/upstream-ops/backend/connector"
 )
+
+func TestNewUsesDefaultUserAgent(t *testing.T) {
+	if got := New().http.Header.Get("User-Agent"); got != config.DefaultUpstreamUserAgent {
+		t.Fatalf("default user agent = %q", got)
+	}
+}
 
 func TestSetHTTPConfigAppliesUserAgentAndTimeout(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

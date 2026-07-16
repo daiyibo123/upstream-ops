@@ -28,3 +28,14 @@ func TestDashboardPublicDispatchPreviewKeepsOneCheapestGroupPerWebsite(t *testin
 		}
 	}
 }
+
+func TestDashboardEffectiveGroupStatusHidesLegacyTransientLabels(t *testing.T) {
+	for _, status := range []string{"rate_limited", "network_error", "timeout", "upstream_error", "server_error"} {
+		if got := dashboardEffectiveGroupStatus(status); got != "alive" {
+			t.Fatalf("effective status for %q = %q, want alive", status, got)
+		}
+	}
+	if got := dashboardEffectiveGroupStatus("forbidden"); got != "forbidden" {
+		t.Fatalf("permanent status changed to %q", got)
+	}
+}

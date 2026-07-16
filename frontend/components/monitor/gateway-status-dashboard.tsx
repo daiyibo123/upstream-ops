@@ -59,6 +59,13 @@ function chartValue(value: number) {
   return value.toLocaleString("en-US")
 }
 
+const transientGatewayStatuses = new Set(["rate_limited", "network_error", "timeout", "upstream_error", "server_error"])
+
+function gatewayDashboardEffectiveStatus(status: string | null | undefined) {
+  const value = status || ""
+  return transientGatewayStatuses.has(value) ? "alive" : value
+}
+
 interface TooltipItem {
   name?: string
   value?: number
@@ -151,22 +158,25 @@ export function GatewayStatusDashboard() {
     .filter((group) => group.enabled !== false)
     .slice()
     .sort((a, b) => {
-      const statusRank = (status: string) =>
-        status === "alive"
+      const statusRank = (status: string) => {
+        const normalized = gatewayDashboardEffectiveStatus(status)
+        return normalized === "alive"
           ? 0
-          : status === "unknown"
+          : normalized === "unknown"
             ? 1
-            : status === "rate_limited"
+            : normalized === "rate_limited"
               ? 2
-              : ["dead", "server_error", "timeout", "network_error", "upstream_error"].includes(status)
+              : ["dead", "server_error", "timeout", "network_error", "upstream_error"].includes(normalized)
                 ? 3
-                : ["zero_balance", "forbidden", "auth_failed", "model_error", "invalid_request", "non_generation"].includes(status)
+                : ["zero_balance", "forbidden", "auth_failed", "model_error", "invalid_request", "non_generation"].includes(normalized)
                   ? 4
                   : 5
+      }
       return (
         statusRank(a.status) - statusRank(b.status) ||
-        (b.priority || 0) - (a.priority || 0) ||
+        Number(Boolean(b.charity)) - Number(Boolean(a.charity)) ||
         a.ratio - b.ratio ||
+        (b.priority || 0) - (a.priority || 0) ||
         a.failure_count - b.failure_count
       )
     })
@@ -484,8 +494,10 @@ export function GatewayStatusDashboard() {
             <div className="space-y-2">
               {dispatchOrder
                 .slice(0, 5)
-                .map((group) => (
-                  <div key={group.id} className="flex items-center justify-between gap-2 rounded-md border border-border px-3 py-2">
+                .map((group) => {
+                  const status = gatewayDashboardEffectiveStatus(group.status)
+                  return (
+                    <div key={group.id} className="flex items-center justify-between gap-2 rounded-md border border-border px-3 py-2">
                     <div className="min-w-0">
                       <p className="truncate text-xs font-medium text-foreground">
                         {group.channel_name} / {group.group_name}
@@ -497,19 +509,20 @@ export function GatewayStatusDashboard() {
                     <span
                       className={cn(
                         "size-2 shrink-0 rounded-full",
-                        group.status === "alive"
+                        status === "alive"
                           ? "bg-success"
-                          : group.status === "dead"
+                          : status === "dead"
                             ? "bg-danger"
-                            : ["zero_balance", "rate_limited", "non_generation", "timeout", "server_error"].includes(group.status)
+                            : ["zero_balance", "rate_limited", "non_generation", "timeout", "server_error"].includes(status)
                               ? "bg-warning"
-                              : ["forbidden", "auth_failed", "network_error", "upstream_error", "model_error", "invalid_request"].includes(group.status)
+                              : ["forbidden", "auth_failed", "network_error", "upstream_error", "model_error", "invalid_request"].includes(status)
                                 ? "bg-danger"
                             : "bg-muted-foreground/40",
                       )}
                     />
-                  </div>
-                ))}
+                    </div>
+                  )
+                })}
               {groups.length === 0 ? (
                 <div className="rounded-md border border-border px-3 py-6 text-center text-xs text-muted-foreground">
                   暂无分组 Key

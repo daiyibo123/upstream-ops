@@ -172,7 +172,9 @@ function effectiveStatus(group: UpstreamGroupKey) {
   // Existing databases may still contain the historical auth_failed value.
   // Present it in the single access-refused bucket rather than showing an
   // obsolete sixth status in the available-channels page.
-  return group.status === "auth_failed" ? "forbidden" : group.status
+  if (group.status === "auth_failed") return "forbidden"
+  if (["rate_limited", "network_error", "timeout", "upstream_error", "server_error"].includes(group.status)) return "alive"
+  return group.status
 }
 
 function statusText(status: string) {
@@ -572,8 +574,9 @@ function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
   return groups.slice().sort((a, b) => {
     return (
       groupDisplayFormatRank(a) - groupDisplayFormatRank(b) ||
-      effectiveRatio(a) - effectiveRatio(b) ||
       groupStatusRank(effectiveStatus(a)) - groupStatusRank(effectiveStatus(b)) ||
+      Number(Boolean(b.charity)) - Number(Boolean(a.charity)) ||
+      effectiveRatio(a) - effectiveRatio(b) ||
       (b.priority || 0) - (a.priority || 0) ||
       a.failure_count - b.failure_count ||
       a.id - b.id

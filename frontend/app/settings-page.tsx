@@ -1128,10 +1128,13 @@ export default function SettingsPage() {
                   }
                 />
               </Field>
-              <Field label="User-Agent" description="为空时使用 upstream-ops/0.1。">
+              <Field
+                label="User-Agent"
+                description="为空时使用当前 Codex CLI 请求身份。"
+              >
                 <Input
                   value={form.upstream.userAgent}
-                  placeholder="upstream-ops/0.1"
+                  placeholder="codex_cli_rs/0.144.1 (Ubuntu 22.4.0; x86_64) xterm-256color"
                   onChange={(e) =>
                     setForm((prev) =>
                       prev

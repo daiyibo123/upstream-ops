@@ -8,6 +8,34 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.26.0 - 2026-07-16
+
+### Fixed
+
+- GPT-5.6 Responses requests still prefer the native `/v1/responses` wire, matching Sub2API passthrough behavior. When a Chat-marked upstream explicitly returns `model_not_supported` before any output, the same candidate now retries its prepared Chat Completions bridge instead of incorrectly treating the model as unavailable everywhere.
+- The GPT-5.6 same-candidate fallback preserves the model and reasoning effort during Responses-to-Chat conversion, and only runs before client-visible stream bytes are written.
+
+## v0.25.4 - 2026-07-16
+
+### Fixed
+
+- Streamed proxy dispatch now treats the first usable generation event as a 6-second budget that includes response headers. A slow first candidate can fail over once to the next ordered route, while fast 4xx/5xx failures still continue through all eligible candidates.
+- Candidate scheduling is deterministic: schedulable charity routes come first, then paid routes by effective ratio from low to high; actual model price, manual priority, failure count, and runtime first-token latency are only tie-breakers within that tier.
+- Model-capability cache no longer lets an expensive known-supported route jump ahead of a lower-ratio unknown route; known support is only a tie-breaker inside the same cost tier, while known unsupported routes are still filtered or kept last.
+- Codex/GPT-5.6 Responses requests and Responses tool requests now keep the native `/v1/responses` wire even when a candidate was previously marked chat-compatible; Chat bridge fallback is reserved for explicit endpoint/protocol misses.
+- Reasoning effort is preserved across protocol conversion: Chat `reasoning_effort` maps to Responses `reasoning.effort`, and Responses `reasoning.effort` maps back to Chat `reasoning_effort` for chat-only fallbacks.
+- User request 429/network/timeout/upstream 5xx failures are recorded as diagnostics and short cooldowns without changing the visible channel status away from `alive`, while successful user traffic immediately clears failure counters and cooldowns.
+- Health checks continue to use the minimal streamed `1+1=` generation probe with a smaller output cap, but generic timeout/network/upstream 5xx outcomes no longer spend a second fallback-model probe and are recorded as diagnostics instead of visible dead-like statuses.
+- Legacy transient upstream statuses, including `rate_limited`, are normalized back to `alive` with cleared cooldown/failure counters during migration, and expired cooldowns now clear even when the stored display status is already `alive`.
+- Gateway dashboards and channel lists render legacy transient pressure/transport statuses as alive while preserving permanent failures such as auth, access, balance, invalid request, and non-generation errors.
+- OpenAI synthetic requests now use the Codex CLI 0.144.1 identity (`codex_cli_rs/0.144.1 (Ubuntu 22.4.0; x86_64) xterm-256color`) with matching `Originator`, `Version`, and Responses beta headers; real inbound Codex user agents remain intact while `Originator` is paired to their first user-agent product, and the legacy `upstream-ops/0.1` setting migrates to the new default.
+- Chat-marked candidates that must first preserve native Responses for tools or Responses-Lite now retry the prepared Chat Completions bridge on an explicit pre-stream `model_not_supported` response before switching channels.
+- Negative model-capability cache entries are retained as last-resort candidates instead of being removed, aggregate mixed failures no longer surface as model-unsupported errors, and the shared transport response-header timeout again uses the full proxy-attempt budget.
+- Cooldown rescue now preserves normal charity/ratio ordering, runs after active candidates are exhausted, and traverses every eligible cooling candidate instead of stopping after the first failure.
+- Slow first-output failures are capped at one route switch, intercepted response content excludes the current candidate immediately rather than retrying it three times, and streamed error text is checked before it can leak into a disconnected Responses stream.
+- Default response interception now recognizes `gpt休息了` and `gpt 休息了`. Before any client-visible output it fails over to the next candidate; after output has started it sanitizes the terminal stream error and records the current route failure without splicing another upstream stream.
+- One-click health checks now probe different API base URLs in parallel while retaining per-base serialization and spacing, removing the global two-second delay between unrelated upstreams.
+
 ## v0.25.3 - 2026-07-15
 
 ### Fixed
