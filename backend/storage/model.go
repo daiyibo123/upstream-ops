@@ -318,6 +318,7 @@ type UsageLog struct {
 	CachedTokens         int64     `gorm:"not null;default:0" json:"cached_tokens"`
 	Ratio                float64   `json:"ratio"`
 	Status               string    `gorm:"size:32;not null;default:'success';index" json:"status"`
+	ErrorMessage         string    `gorm:"type:text" json:"error_message,omitempty"`
 	FirstTokenMS         int64     `gorm:"not null;default:0" json:"first_token_ms"`
 	DurationMS           int64     `gorm:"not null;default:0" json:"duration_ms"`
 	CreatedAt            time.Time `gorm:"index" json:"created_at"`
@@ -445,6 +446,7 @@ type UpstreamGroupKey struct {
 	LastCheckedAt    *time.Time `json:"last_checked_at,omitempty"`
 	LastLatencyMS    int64      `gorm:"not null;default:0" json:"last_latency_ms"`
 	LastSuccessAt    *time.Time `json:"last_success_at,omitempty"`
+	HealthProbeModel string     `gorm:"size:128;not null;default:'';index" json:"health_probe_model,omitempty"`
 	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
 	DisabledUntil    *time.Time `json:"disabled_until,omitempty"`
 	LastError        string     `gorm:"type:text" json:"last_error,omitempty"`

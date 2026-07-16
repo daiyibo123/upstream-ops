@@ -8,6 +8,15 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.26.3 - 2026-07-17
+
+### Fixed
+
+- Gateway dispatch now writes a `dispatching` usage row before forwarding to an upstream, then updates the same row to `success`, `switched`, `saturated`, `cooldown`, `interrupted`, or `failed`. The usage page also shows switched/cooldown states and the upstream error message, so a hanging Codex request is visible while it is still waiting for first output.
+- Streaming failover follows the latest Sub2API-style first-output boundary more closely: the gateway waits for real Codex-usable text or tool-call output before pinning a route, rejects empty terminal streams, intercepts wrapped upstream messages such as `stream disconnected before completion:...先用grok`, and switches channels faster on stalled first output.
+- Scheduling keeps public/charity routes ahead of paid routes and sorts both tiers by effective ratio from low to high, while delaying sibling keys from a failed dispatch group until other groups have been tried. Temporary cooldown rescue keeps the same economic ordering and no longer blocks fast failover to the next group.
+- One-click health checks use the streamed low-reasoning `1+1=` probe, try `gpt-5.4` first and `gpt-5.5` only after a failed generation, require actual Codex-usable output, and remember the successful probe model for faster future model routing.
+
 ## v0.26.1 - 2026-07-16
 
 ### Fixed

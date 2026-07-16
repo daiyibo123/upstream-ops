@@ -45,6 +45,14 @@ function usageStatusLabel(status?: string | null) {
     case "success":
     case "estimated":
       return "完成"
+    case "dispatching":
+      return "调度中"
+    case "switched":
+      return "已切换"
+    case "saturated":
+      return "并发满"
+    case "cooldown":
+      return "冷却"
     case "interrupted":
       return "中断"
     case "failed":
@@ -59,6 +67,11 @@ function usageStatusTone(status?: string | null) {
     case "success":
     case "estimated":
       return "border-success/20 bg-success/10 text-success"
+    case "dispatching":
+      return "border-warning/20 bg-warning/10 text-warning"
+    case "switched":
+    case "saturated":
+    case "cooldown":
     case "interrupted":
       return "border-warning/20 bg-warning/10 text-warning"
     default:
@@ -340,6 +353,11 @@ export default function UsagePage() {
                           <span className="mt-0.5 block font-mono text-[10px] text-muted-foreground">
                             倍率 {log.ratio != null ? formatRatio(log.ratio) : "—"}
                           </span>
+                          {log.error_message ? (
+                            <span className="mt-0.5 block truncate text-[10px] text-danger" title={log.error_message}>
+                              {log.error_message}
+                            </span>
+                          ) : null}
                         </div>
                       </TableCell>
                       <TableCell className="truncate font-mono text-[11px] text-muted-foreground" title={log.request_ip || ""}>

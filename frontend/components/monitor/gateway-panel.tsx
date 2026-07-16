@@ -1781,6 +1781,11 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             <Badge variant="outline" className="bg-background">真实倍率 {formatRatio(effectiveRatio(group))}</Badge>
             <Badge variant="outline" className="bg-background">{requestModeLabel(group.request_mode)}</Badge>
             <Badge variant="outline" className="bg-background">{authModeLabel(group.auth_mode)}</Badge>
+            {group.health_probe_model ? (
+              <Badge variant="outline" className="max-w-36 truncate bg-background" title={group.health_probe_model}>
+                测活 {group.health_probe_model}
+              </Badge>
+            ) : null}
             <Badge variant="outline" className="bg-background">{upstreamKeyLabel(group)}</Badge>
             <Badge variant="outline" className="bg-background">{formatTokens(group.total_tokens)} tok</Badge>
           </div>

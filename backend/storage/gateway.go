@@ -470,11 +470,15 @@ func (r *UpstreamGroupKeys) ClearCooldown(id uint) error {
 }
 
 func (r *UpstreamGroupKeys) MarkHealthSuccess(id uint, latencyMS int64) error {
+	return r.MarkHealthSuccessWithModel(id, latencyMS, "")
+}
+
+func (r *UpstreamGroupKeys) MarkHealthSuccessWithModel(id uint, latencyMS int64, model string) error {
 	now := time.Now()
 	if latencyMS < 0 {
 		latencyMS = 0
 	}
-	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+	updates := map[string]any{
 		"status":          "alive",
 		"failure_count":   0,
 		"last_checked_at": &now,
@@ -482,7 +486,11 @@ func (r *UpstreamGroupKeys) MarkHealthSuccess(id uint, latencyMS int64) error {
 		"last_latency_ms": latencyMS,
 		"disabled_until":  nil,
 		"last_error":      "",
-	}).Error
+	}
+	if strings.TrimSpace(model) != "" {
+		updates["health_probe_model"] = strings.TrimSpace(model)
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(updates).Error
 }
 
 func (r *UpstreamGroupKeys) MarkSuccessWithUsage(id uint, promptTokens, completionTokens, totalTokens int64) error {
@@ -720,6 +728,13 @@ func (r *UsageLogs) Add(entry *UsageLog) error {
 	return r.db.Create(entry).Error
 }
 
+func (r *UsageLogs) Update(id uint, updates map[string]any) error {
+	if id == 0 || len(updates) == 0 {
+		return nil
+	}
+	return r.db.Model(&UsageLog{}).Where("id = ?", id).Updates(updates).Error
+}
+
 // List 分页返回使用记录，按时间倒序。
 func (r *UsageLogs) List(limit, offset int) ([]UsageLog, int64, error) {
 	if limit <= 0 || limit > 200 {
@@ -733,7 +748,7 @@ func (r *UsageLogs) List(limit, offset int) ([]UsageLog, int64, error) {
 		return nil, 0, err
 	}
 	var list []UsageLog
-	if err := r.db.Order("created_at DESC").Limit(limit).Offset(offset).Find(&list).Error; err != nil {
+	if err := r.db.Order("created_at DESC, id DESC").Limit(limit).Offset(offset).Find(&list).Error; err != nil {
 		return nil, 0, err
 	}
 	return list, total, nil

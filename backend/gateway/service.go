@@ -49,19 +49,19 @@ const (
 	// leave a small gap before the next key is probed as well.
 	healthProbeUpstreamMinInterval = 500 * time.Millisecond
 	// streamFirstEventTimeout covers response headers plus the first usable SSE
-	// generation event. Before that semantic boundary no upstream bytes are
+	// generation/tool event. Before that semantic boundary no upstream bytes are
 	// exposed, so a stalled relay can still be replaced safely. Once output starts,
 	// streamIdleTimeout below preserves long-running reasoning streams.
-	streamFirstEventTimeout = 6 * time.Second
+	streamFirstEventTimeout = 3 * time.Second
 	// streamIdleTimeout 是正式转发阶段"两个事件之间"的最长间隔。推理模型两次事件
 	// 之间可能有较长停顿；超过后才认为上游卡死，并由 Responses 兜底逻辑补终态/[DONE]。
 	streamIdleTimeout              = 5 * time.Minute
 	streamHeartbeatInterval        = 15 * time.Second
-	streamPreflightTimeout         = 6 * time.Second
+	streamPreflightTimeout         = 3 * time.Second
 	streamPreflightMaxEvents       = 16
 	streamPreflightMaxBytes        = 64 << 10
-	maxFirstOutputTimeoutSwitches  = 1
 	proxyTransientFailureThreshold = 3
+	proxyFastFailoverCooldown      = 20 * time.Second
 	proxyTransientFailureCooldown  = 45 * time.Second
 	proxyServerErrorCooldown       = 60 * time.Second
 	proxyTimeoutCooldown           = 75 * time.Second
@@ -924,6 +924,92 @@ func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *stor
 	}
 }
 
+type dispatchLogAttempt struct {
+	id        uint
+	startedAt time.Time
+}
+
+func (s *Service) startDispatchLog(gatewayKey *storage.GatewayKey, candidate *storage.UpstreamGroupKey, model, requestIP string) dispatchLogAttempt {
+	startedAt := time.Now()
+	attempt := dispatchLogAttempt{startedAt: startedAt}
+	if s.usageLogs == nil {
+		return attempt
+	}
+	entry := &storage.UsageLog{
+		Model:        strings.TrimSpace(model),
+		Status:       "dispatching",
+		RequestIP:    strings.TrimSpace(requestIP),
+		CreatedAt:    startedAt,
+		DurationMS:   0,
+		FirstTokenMS: 0,
+	}
+	if gatewayKey != nil {
+		entry.GatewayKeyID = gatewayKey.ID
+		entry.GatewayKeyName = gatewayKey.Name
+		entry.GatewayKeyIsPublic = gatewayKey.IsPublic
+	}
+	if candidate != nil {
+		entry.ChannelID = candidate.ChannelID
+		entry.ChannelName = candidate.ChannelName
+		entry.UpstreamGroupKeyID = candidate.ID
+		entry.UpstreamGroupCharity = candidate.Charity
+		entry.GroupName = candidate.GroupName
+		entry.ClientFormat = candidate.ClientFormat
+		entry.Ratio = effectiveGroupRatio(*candidate)
+	}
+	if err := s.usageLogs.Add(entry); err != nil {
+		if s.log != nil {
+			s.log.Warn("record dispatch start failed", "err", err)
+		}
+		return attempt
+	}
+	attempt.id = entry.ID
+	return attempt
+}
+
+func (s *Service) finishDispatchLog(attempt dispatchLogAttempt, status, errMsg string, usage usageTokens) {
+	if s.usageLogs == nil || attempt.id == 0 {
+		return
+	}
+	status = strings.TrimSpace(status)
+	if status == "" {
+		status = usageStatus(usage)
+	}
+	durationMS := usage.DurationMS
+	if durationMS <= 0 && !attempt.startedAt.IsZero() {
+		durationMS = time.Since(attempt.startedAt).Milliseconds()
+	}
+	updates := map[string]any{
+		"status":            status,
+		"prompt_tokens":     maxInt64(0, usage.Prompt),
+		"completion_tokens": maxInt64(0, usage.Completion),
+		"total_tokens":      maxInt64(0, usage.Total),
+		"cached_tokens":     maxInt64(0, usage.Cached),
+		"first_token_ms":    maxInt64(0, usage.FirstTokenMS),
+		"duration_ms":       maxInt64(0, durationMS),
+		"error_message":     truncateLogMessage(errMsg, 1000),
+	}
+	if err := s.usageLogs.Update(attempt.id, updates); err != nil && s.log != nil {
+		s.log.Warn("record dispatch finish failed", "id", attempt.id, "err", err)
+	}
+}
+
+func (s *Service) recordDispatchSkipLog(gatewayKey *storage.GatewayKey, candidate *storage.UpstreamGroupKey, model, requestIP, status, errMsg string) {
+	attempt := s.startDispatchLog(gatewayKey, candidate, model, requestIP)
+	s.finishDispatchLog(attempt, status, errMsg, usageTokens{})
+}
+
+func truncateLogMessage(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if max <= 0 || len(value) <= max {
+		return value
+	}
+	if max <= 3 {
+		return value[:max]
+	}
+	return value[:max-3] + "..."
+}
+
 func gatewayUsageCost(usage usageTokens, candidate *storage.UpstreamGroupKey) float64 {
 	if candidate == nil {
 		return 0
@@ -1625,15 +1711,18 @@ func (s *Service) DetectGroupAuthMode(ctx context.Context, id uint) (*storage.Up
 	for _, authMode := range upstreamAuthModesForProbe(key) {
 		candidate := *key
 		candidate.AuthMode = authMode
-		status, body, _, probeErr := s.healthProbeCandidate(probeCtx, &candidate)
-		if !healthProbeSucceeded(status, body, probeErr) && !healthProbeProvesProtocolReachable(status, body, probeErr) {
+		status, body, _, usedModel, probeErr := s.healthProbeCandidateWithModel(probeCtx, &candidate)
+		succeeded := healthProbeSucceeded(status, body, probeErr)
+		if !succeeded && !healthProbeProvesProtocolReachable(status, body, probeErr) {
 			continue
 		}
 		if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
 			return nil, err
 		}
-		if err := s.groupKeys.MarkHealthSuccess(key.ID, 0); err != nil {
-			return nil, err
+		if succeeded {
+			if err := s.groupKeys.MarkHealthSuccessWithModel(key.ID, 0, usedModel); err != nil {
+				return nil, err
+			}
 		}
 		return s.groupKeys.FindByID(key.ID)
 	}
@@ -1723,7 +1812,7 @@ func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key
 				if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
 					return nil, false, err
 				}
-				if err := s.groupKeys.MarkHealthSuccess(key.ID, 0); err != nil {
+				if err := s.groupKeys.MarkHealthSuccessWithModel(key.ID, 0, model); err != nil {
 					return nil, false, err
 				}
 				detected, err := s.groupKeys.FindByID(key.ID)
@@ -1736,9 +1825,6 @@ func (s *Service) detectOpenAIGroupRequestModeForModels(ctx context.Context, key
 			return nil, false, err
 		}
 		if err := s.groupKeys.UpdateAuthMode(key.ID, tentativeAuthMode); err != nil {
-			return nil, false, err
-		}
-		if err := s.groupKeys.MarkHealthSuccess(key.ID, 0); err != nil {
 			return nil, false, err
 		}
 		detected, err := s.groupKeys.FindByID(key.ID)
@@ -1774,6 +1860,7 @@ func (s *Service) detectFixedGroupRequestMode(ctx context.Context, key *storage.
 	for _, authMode := range upstreamAuthModesForProbe(key) {
 		candidate := *key
 		candidate.AuthMode = authMode
+		usedModel := defaultHealthProbeModel(candidate.ClientFormat)
 		var (
 			status int
 			body   []byte
@@ -1796,7 +1883,7 @@ func (s *Service) detectFixedGroupRequestMode(ctx context.Context, key *storage.
 		if err := s.groupKeys.UpdateAuthMode(key.ID, authMode); err != nil {
 			return nil, err
 		}
-		if err := s.groupKeys.MarkHealthSuccess(key.ID, 0); err != nil {
+		if err := s.groupKeys.MarkHealthSuccessWithModel(key.ID, 0, usedModel); err != nil {
 			return nil, err
 		}
 		return s.groupKeys.FindByID(key.ID)
@@ -2705,15 +2792,19 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	if err != nil {
 		return failGatewayRequest(http.StatusInternalServerError, "gateway_error", err.Error())
 	}
+	requestedModel := routingRequestModel(normalized)
 	candidates = filterCandidatesForGatewayKey(gatewayKey, candidates)
 	candidates = filterCandidatesForClientFormat(gatewayKey.ClientFormat, normalized.ResponseMode, candidates)
 	if len(candidates) == 0 {
-		return failGatewayRequest(http.StatusServiceUnavailable, "upstream_unavailable", gatewayKeyScopeEmptyMessage(gatewayKey))
+		message := gatewayKeyScopeEmptyMessage(gatewayKey)
+		s.recordDispatchSkipLog(gatewayKey, nil, requestedModel, normalized.ClientIP, "failed", message)
+		return failGatewayRequest(http.StatusServiceUnavailable, "upstream_unavailable", message)
 	}
-	requestedModel := routingRequestModel(normalized)
 	candidates = s.filterKnownUnsupportedModelCandidates(candidates, requestedModel)
 	if len(candidates) == 0 {
-		return failGatewayRequest(http.StatusBadRequest, "model_not_supported", fmt.Sprintf("no configured upstream supports requested model %q", requestedModel))
+		message := fmt.Sprintf("no configured upstream supports requested model %q", requestedModel)
+		s.recordDispatchSkipLog(gatewayKey, nil, requestedModel, normalized.ClientIP, "failed", message)
+		return failGatewayRequest(http.StatusBadRequest, "model_not_supported", message)
 	}
 	candidates = s.orderCandidatesForRequest(candidates, normalized)
 
@@ -2732,45 +2823,72 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		modelUnsupportedFailures++
 	}
 	var cooldownFallback []storage.UpstreamGroupKey
-	firstOutputTimeoutSwitches := 0
+	delayedSameGroupFallback := make([]storage.UpstreamGroupKey, 0)
+	delayedDispatchGroups := map[string]struct{}{}
+	delayDispatchGroup := func(candidate storage.UpstreamGroupKey) {
+		if group := dispatchGroupIdentity(candidate); group != "" {
+			delayedDispatchGroups[group] = struct{}{}
+		}
+	}
+	delaySameDispatchGroup := func(candidate storage.UpstreamGroupKey, errMsg string) {
+		if !shouldDelaySameDispatchGroupAfterFailure(errMsg) {
+			return
+		}
+		delayDispatchGroup(candidate)
+	}
 	// finalErr 承载"客户端错、换 key 也没用"路径的返回值。
 	// 在 stream 已写字节 / 明确 client-side 400 等场景下，我们把 err 记进来后不再继续 fail-over。
 	var finalErr error
-candidateLoop:
 	for i := range candidates {
 		candidate := candidates[i]
 		if until, ok := candidateCooldownUntil(candidate, now); ok {
-			disabledSeen = append(disabledSeen, cooldownMessage(candidate, until))
+			message := cooldownMessage(candidate, until)
+			disabledSeen = append(disabledSeen, message)
 			cooldownFallback = append(cooldownFallback, candidate)
+			s.recordDispatchSkipLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, "cooldown", message)
+			delayDispatchGroup(candidate)
 			continue
 		}
 		if until, ok := s.runtimeDisabledUntil(candidate.ID); ok {
-			disabledSeen = append(disabledSeen, cooldownMessage(candidate, until))
+			message := cooldownMessage(candidate, until)
+			disabledSeen = append(disabledSeen, message)
 			cooldownFallback = append(cooldownFallback, candidate)
+			s.recordDispatchSkipLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, "cooldown", message)
+			delayDispatchGroup(candidate)
 			continue
 		}
+		if group := dispatchGroupIdentity(candidate); group != "" {
+			if _, delayed := delayedDispatchGroups[group]; delayed {
+				delayedSameGroupFallback = append(delayedSameGroupFallback, candidate)
+				continue
+			}
+		}
 		// 把单个候选的尝试封装到闭包里，用 defer release() 保证 panic / 早退时不泄漏并发额度。
+		dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
 		outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
 
 		switch outcome.kind {
 		case candSuccess:
+			s.finishDispatchLog(dispatchLog, outcome.logStatus, outcome.errMsg, outcome.usage)
 			return nil
 		case candSaturated:
+			s.finishDispatchLog(dispatchLog, "saturated", "candidate is at concurrency limit", usageTokens{})
 			saturatedSeen = append(saturatedSeen, fmt.Sprintf("%s/%s", candidate.ChannelName, candidate.GroupName))
+			delayDispatchGroup(candidate)
 			continue
 		case candRetryable:
+			s.finishDispatchLog(dispatchLog, "switched", outcome.errMsg, usageTokens{})
 			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
 			rememberUnsupportedModel(candidate, outcome.errMsg)
+			delaySameDispatchGroup(candidate, outcome.errMsg)
 			if shouldMarkProxyFailure(outcome.errMsg) {
 				s.markProxyFailure(candidate.ID, outcome.errMsg)
-			}
-			if firstOutputFailoverExhausted(outcome.errMsg, &firstOutputTimeoutSwitches) {
-				break candidateLoop
 			}
 			continue
 		case candFatal:
 			// 明确"客户端错 / 已写字节无法切换"路径：仍然记一次失败方便下次跳过，
 			// 但不再继续 fail-over，把当前错误吐给调用方。
+			s.finishDispatchLog(dispatchLog, "failed", outcome.errMsg, usageTokens{})
 			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
 			rememberUnsupportedModel(candidate, outcome.errMsg)
 			if outcome.markFailure && shouldMarkProxyFailure(outcome.errMsg) {
@@ -2783,6 +2901,56 @@ candidateLoop:
 			return finalErr
 		}
 	}
+	if len(delayedSameGroupFallback) > 0 {
+		delayedSameGroupFallback = s.orderCandidatesWithRuntime(delayedSameGroupFallback, requestedModel)
+		for i := range delayedSameGroupFallback {
+			candidate := delayedSameGroupFallback[i]
+			if until, ok := candidateCooldownUntil(candidate, time.Now()); ok {
+				message := cooldownMessage(candidate, until)
+				disabledSeen = append(disabledSeen, message)
+				cooldownFallback = append(cooldownFallback, candidate)
+				s.recordDispatchSkipLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, "cooldown", message)
+				continue
+			}
+			if until, ok := s.runtimeDisabledUntil(candidate.ID); ok {
+				message := cooldownMessage(candidate, until)
+				disabledSeen = append(disabledSeen, message)
+				cooldownFallback = append(cooldownFallback, candidate)
+				s.recordDispatchSkipLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, "cooldown", message)
+				continue
+			}
+			dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
+			outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
+			switch outcome.kind {
+			case candSuccess:
+				s.finishDispatchLog(dispatchLog, outcome.logStatus, outcome.errMsg, outcome.usage)
+				return nil
+			case candSaturated:
+				s.finishDispatchLog(dispatchLog, "saturated", "candidate is at concurrency limit", usageTokens{})
+				saturatedSeen = append(saturatedSeen, fmt.Sprintf("%s/%s", candidate.ChannelName, candidate.GroupName))
+				continue
+			case candRetryable:
+				s.finishDispatchLog(dispatchLog, "switched", outcome.errMsg, usageTokens{})
+				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
+				rememberUnsupportedModel(candidate, outcome.errMsg)
+				if shouldMarkProxyFailure(outcome.errMsg) {
+					s.markProxyFailure(candidate.ID, outcome.errMsg)
+				}
+				continue
+			case candFatal:
+				s.finishDispatchLog(dispatchLog, "failed", outcome.errMsg, usageTokens{})
+				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
+				rememberUnsupportedModel(candidate, outcome.errMsg)
+				if outcome.markFailure && shouldMarkProxyFailure(outcome.errMsg) {
+					s.markProxyFailure(candidate.ID, outcome.errMsg)
+				}
+				finalErr = outcome.err
+			}
+			if finalErr != nil {
+				return finalErr
+			}
+		}
+	}
 	if len(cooldownFallback) > 0 && candidateScopeFallbackAllowed(gatewayKey, candidates) {
 		cooldownFallback = s.orderCooldownFallbackCandidates(filterCooldownFallbackCandidates(cooldownFallback), requestedModel)
 		if msg := cooldownFallbackMessage(cooldownFallback); msg != "" && s.log != nil {
@@ -2790,14 +2958,18 @@ candidateLoop:
 		}
 		for i := range cooldownFallback {
 			candidate := cooldownFallback[i]
+			dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
 			outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
 			switch outcome.kind {
 			case candSuccess:
+				s.finishDispatchLog(dispatchLog, outcome.logStatus, outcome.errMsg, outcome.usage)
 				return nil
 			case candSaturated:
+				s.finishDispatchLog(dispatchLog, "saturated", "candidate is at concurrency limit", usageTokens{})
 				saturatedSeen = append(saturatedSeen, fmt.Sprintf("%s/%s", candidate.ChannelName, candidate.GroupName))
 				continue
 			case candRetryable:
+				s.finishDispatchLog(dispatchLog, "switched", outcome.errMsg, usageTokens{})
 				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
 				rememberUnsupportedModel(candidate, outcome.errMsg)
 				// The candidate is already in a cooldown window.  This early
@@ -2808,6 +2980,7 @@ candidateLoop:
 				// will record a fresh failure if the upstream is still bad.
 				continue
 			case candFatal:
+				s.finishDispatchLog(dispatchLog, "failed", outcome.errMsg, usageTokens{})
 				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
 				rememberUnsupportedModel(candidate, outcome.errMsg)
 				finalErr = outcome.err
@@ -2857,6 +3030,8 @@ type candOutcome struct {
 	err         error
 	errMsg      string
 	markFailure bool
+	usage       usageTokens
+	logStatus   string
 }
 
 // attemptCandidate 在单个候选上跑一次完整的请求尝试（含 rectifier 二次），
@@ -3288,7 +3463,7 @@ func (s *Service) attemptStream(
 		if shouldWriteResponsesTerminalForGatewayFailure(normalized) && !timedWriter.Started() {
 			message := friendlyGatewayStreamFailureMessage(streamFailureMessageFromError(err, errMsg))
 			if writeErr := writeResponsesGatewayFailureStream(w, "upstream_error", message); writeErr == nil {
-				return candOutcome{kind: candSuccess}
+				return candOutcome{kind: candSuccess, errMsg: errMsg, logStatus: "failed"}
 			} else {
 				return candOutcome{kind: candFatal, err: writeErr, errMsg: writeErr.Error(), markFailure: false}
 			}
@@ -3314,11 +3489,10 @@ func (s *Service) attemptStream(
 		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 		_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 		s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-		s.recordUsageLog(gatewayKey, candidate, usageLogModel(normalized, usage), normalized.ClientIP, usage)
 		if usage.SoftFailure != "" {
 			s.markProxyFailure(candidate.ID, usage.SoftFailure)
 		}
-		return candOutcome{kind: candSuccess}
+		return candOutcome{kind: candSuccess, usage: usage}
 	}
 	errMsg := err.Error()
 	// The downstream client may close a long-running stream at any time.  That
@@ -3327,7 +3501,7 @@ func (s *Service) attemptStream(
 	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 		if shouldWriteResponsesTerminalForGatewayFailure(normalized) {
 			if writeErr := writeResponsesGatewayCancelledStream(w, "gateway_request_cancelled", "请求已取消。"); writeErr == nil {
-				return candOutcome{kind: candSuccess}
+				return candOutcome{kind: candSuccess, errMsg: err.Error(), logStatus: "interrupted"}
 			} else {
 				return candOutcome{kind: candFatal, err: writeErr, errMsg: writeErr.Error(), markFailure: false}
 			}
@@ -3358,11 +3532,10 @@ func (s *Service) attemptStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-			s.recordUsageLog(gatewayKey, candidate, usageLogModel(normalized, usage), normalized.ClientIP, usage)
 			if usage.SoftFailure != "" {
 				s.markProxyFailure(candidate.ID, usage.SoftFailure)
 			}
-			return candOutcome{kind: candSuccess}
+			return candOutcome{kind: candSuccess, usage: usage}
 		}
 		errMsg = reason + " retry failed: " + err.Error()
 		if !retry {
@@ -3386,11 +3559,10 @@ func (s *Service) attemptStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-			s.recordUsageLog(gatewayKey, candidate, usageLogModel(normalized, usage), normalized.ClientIP, usage)
 			if usage.SoftFailure != "" {
 				s.markProxyFailure(candidate.ID, usage.SoftFailure)
 			}
-			return candOutcome{kind: candSuccess}
+			return candOutcome{kind: candSuccess, usage: usage}
 		}
 		errMsg = reason + " retry failed: " + err.Error()
 	}
@@ -3440,17 +3612,6 @@ func isSlowFirstOutputFailure(message string) bool {
 			return true
 		}
 	}
-	return false
-}
-
-func firstOutputFailoverExhausted(message string, switchCount *int) bool {
-	if !isSlowFirstOutputFailure(message) {
-		return false
-	}
-	if switchCount == nil || *switchCount >= maxFirstOutputTimeoutSwitches {
-		return true
-	}
-	*switchCount++
 	return false
 }
 
@@ -3566,9 +3727,8 @@ func (s *Service) attemptNonStream(
 		_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 		_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 		s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-		s.recordUsageLog(gatewayKey, candidate, usageLogModel(normalized, usage), normalized.ClientIP, usage)
 		writeProxyResponse(w, status, header, respBody, candidate, normalized.ResponseMode)
-		return candOutcome{kind: candSuccess}
+		return candOutcome{kind: candSuccess, usage: usage}
 	}
 	errMsg := err.Error()
 	if fallback, reason, ok := fallbackRequestAfterCandidateFailure(normalized, candidate, errMsg, false); ok {
@@ -3587,9 +3747,8 @@ func (s *Service) attemptNonStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-			s.recordUsageLog(gatewayKey, candidate, usageLogModel(normalized, usage), normalized.ClientIP, usage)
 			writeProxyResponse(w, status, header, respBody, candidate, fallback.ResponseMode)
-			return candOutcome{kind: candSuccess}
+			return candOutcome{kind: candSuccess, usage: usage}
 		}
 		errMsg = reason + " retry failed: " + err.Error()
 		if !retry {
@@ -3611,9 +3770,8 @@ func (s *Service) attemptNonStream(
 			_ = s.gateway.AddUsage(gatewayKey.ID, usage.Prompt, usage.Completion, usage.Total, usage.Cached, gatewayUsageCost(usage, candidate), time.Now())
 			_ = s.groupKeys.MarkSuccessWithUsage(candidate.ID, usage.Prompt, usage.Completion, usage.Total)
 			s.rememberAffinity(normalized, usage.ResponseID, candidate.ID)
-			s.recordUsageLog(gatewayKey, candidate, usageLogModel(normalized, usage), normalized.ClientIP, usage)
 			writeProxyResponse(w, status, header, respBody, candidate, normalized.ResponseMode)
-			return candOutcome{kind: candSuccess}
+			return candOutcome{kind: candSuccess, usage: usage}
 		}
 		errMsg = reason + " retry failed: " + err.Error()
 	}
@@ -3845,20 +4003,13 @@ func (s *Service) interceptedResponseContent(key *storage.UpstreamGroupKey, cont
 func (s *Service) shouldHoldInterceptionPreflight(key *storage.UpstreamGroupKey, events []sseEvent) bool {
 	var text strings.Builder
 	for _, event := range events {
-		if message := errorMessageFromJSON([]byte(event.Data)); message != "" {
-			text.WriteString(message)
-		}
-		if delta := responseDeltaText(event.Data); delta != "" {
-			text.WriteString(delta)
-			continue
-		}
-		var raw map[string]any
-		if json.Unmarshal([]byte(event.Data), &raw) == nil {
-			text.WriteString(chatChunkDeltaText(raw))
-		}
+		text.WriteString(streamEventInterceptableText(event))
 	}
 	value := normalizeResponseInterceptionText(text.String())
 	if value == "" || s.interceptedResponseContent(key, text.String()) != "" {
+		return false
+	}
+	if streamBufferedHasTerminal(events) {
 		return false
 	}
 	for _, needle := range s.responseInterceptionNeedles(key) {
@@ -3885,6 +4036,30 @@ func (s *Service) shouldHoldInterceptionPreflight(key *storage.UpstreamGroupKey,
 	}
 	return false
 }
+
+func streamEventInterceptableText(ev sseEvent) string {
+	data := strings.TrimSpace(ev.Data)
+	if data == "" || data == "[DONE]" {
+		return ""
+	}
+	var text strings.Builder
+	if message := errorMessageFromJSON([]byte(data)); message != "" {
+		text.WriteString(message)
+	}
+	if delta := responseDeltaText(data); delta != "" {
+		text.WriteString(delta)
+	}
+	var raw map[string]any
+	if json.Unmarshal([]byte(data), &raw) == nil {
+		text.WriteString(chatChunkDeltaText(raw))
+		text.WriteString(responseVisibleText(raw))
+		if response, _ := raw["response"].(map[string]any); response != nil {
+			text.WriteString(responseVisibleText(response))
+		}
+	}
+	return text.String()
+}
+
 func (s *Service) createUpstreamKey(ctx context.Context, ch storage.Channel, group connector.APIKeyGroup, groupID *int64) (*storage.UpstreamGroupKey, error) {
 	customKey, err := randomOpenAIKey()
 	if err != nil {
@@ -3978,6 +4153,7 @@ type healthProbeAttempt struct {
 	status    int
 	body      []byte
 	latencyMS int64
+	model     string
 	err       error
 }
 
@@ -4042,7 +4218,16 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 	item.CheckedAt = &now
 	if last.succeeded() {
 		item.Status = "alive"
-		_ = s.groupKeys.MarkHealthSuccess(key.ID, item.LatencyMS)
+		_ = s.groupKeys.MarkHealthSuccessWithModel(key.ID, item.LatencyMS, last.model)
+		if last.model != "" {
+			s.rememberCandidateModelCapability(key.ID, last.model, true)
+			if healthProbeModelIsOneOf(last.model, openAIHealthProbeFallbackModel) {
+				s.rememberCandidateModelCapability(key.ID, openAIHealthProbePrimaryModel, false)
+			} else if !healthProbeModelIsOneOf(last.model, openAIHealthProbePrimaryModel, openAIHealthProbeFallbackModel) {
+				s.rememberCandidateModelCapability(key.ID, openAIHealthProbePrimaryModel, false)
+				s.rememberCandidateModelCapability(key.ID, openAIHealthProbeFallbackModel, false)
+			}
+		}
 		return item
 	}
 
@@ -4051,30 +4236,11 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 	item.ErrorType = failureStatus
 	item.Error = healthProbeAttemptsError(attempts, retriesCompleted, lastErr)
 
-	if healthProbeFailureIsInconclusive(last.status, last.body, last.err, failureStatus) {
-		// A model/protocol probe mismatch is not evidence that this concrete
-		// key cannot serve real traffic. Keep it eligible; model-aware routing
-		// will avoid it only for models later proven unsupported.
-		item.Status = "alive"
-		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
-		return item
-	}
 	if failureStatus == "rate_limited" {
 		// A one-click probe must not consume the last slot in an upstream rate
 		// window and then label a generally usable channel as limited. Preserve
 		// the diagnostic in last_error, but leave routing to real traffic, where
 		// an actual 429 still applies its normal per-key cooldown.
-		item.Status = "alive"
-		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
-		return item
-	}
-	if healthProbeTransientStatus(failureStatus) {
-		// A dashboard probe runs from this gateway host and is intentionally tiny.
-		// A single timeout/reset/5xx usually means the relay was busy or the
-		// probe path was deprioritized, while a manual re-test often succeeds.
-		// Keep the route schedulable and record the diagnostic only; live traffic
-		// has its own per-key retry/cooldown path and must not inherit a noisy
-		// "network_error" display state from a probe.
 		item.Status = "alive"
 		s.markHealthInconclusive(key.ID, item.Error, item.LatencyMS)
 		return item
@@ -4085,7 +4251,7 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 		return item
 	}
 
-	item.Status = s.confirmedHealthFailureStatus(key.ID, failureStatus)
+	item.Status = failureStatus
 	s.markHealthFailureWithStatus(key.ID, item.Status, item.Error, item.LatencyMS)
 	return item
 }
@@ -4103,8 +4269,8 @@ func (s *Service) healthProbeAttempts(ctx context.Context, key *storage.Upstream
 				return attempts, false
 			}
 		}
-		status, body, latencyMS, err := s.healthProbeCandidate(ctx, key)
-		attempt := healthProbeAttempt{status: status, body: body, latencyMS: latencyMS, err: err}
+		status, body, latencyMS, model, err := s.healthProbeCandidateWithModel(ctx, key)
+		attempt := healthProbeAttempt{status: status, body: body, latencyMS: latencyMS, model: model, err: err}
 		attempts = append(attempts, attempt)
 		if attempt.succeeded() || !shouldRetryTransientHealthStatus(healthFailureStatus(status, body, err)) {
 			return attempts, true
@@ -4116,15 +4282,6 @@ func (s *Service) healthProbeAttempts(ctx context.Context, key *storage.Upstream
 func shouldRetryTransientHealthStatus(status string) bool {
 	switch status {
 	case "dead", "server_error", "timeout", "network_error", "upstream_error":
-		return true
-	default:
-		return false
-	}
-}
-
-func healthProbeTransientStatus(status string) bool {
-	switch status {
-	case "server_error", "timeout", "network_error", "upstream_error":
 		return true
 	default:
 		return false
@@ -4192,96 +4349,62 @@ func shouldSkipHealthRetry(status string) bool {
 	}
 }
 
-// healthProbeFailureIsInconclusive identifies failures caused by a probe's
-// fixed model or wire format. They do not prove that the upstream cannot serve
-// a real user request, so the caller keeps the group alive rather than
-// painting it dead and excluding it from normal routing.
-func healthProbeFailureIsInconclusive(status int, body []byte, err error, classification string) bool {
-	switch classification {
-	case "model_error", "invalid_request":
-		return true
-	}
-	if status != http.StatusNotFound && status != http.StatusMethodNotAllowed {
-		return false
-	}
-	text := healthFailureText(body, err)
-	return looksLikeEndpointMissingError(text) || looksLikeResponsesEndpointError(text)
-}
-
-// confirmedHealthFailureStatus avoids turning one ambiguous probe into a red
-// "dead" channel.  Permanent states (auth, balance, access and rate limit)
-// are classified separately and keep their immediate status.  A generic death
-// needs the same key to fail three complete health runs before it is shown as
-// dead and put into the normal cooldown path.
-func (s *Service) confirmedHealthFailureStatus(id uint, status string) string {
-	switch status {
-	case "dead", "server_error", "timeout", "network_error", "upstream_error":
-	default:
-		return status
-	}
-	if s == nil || s.groupKeys == nil {
-		return status
-	}
-	current, err := s.groupKeys.FindByID(id)
-	if err != nil || current == nil || current.FailureCount+1 < proxyTransientFailureThreshold {
-		// Keep a temporarily failing key schedulable until the configured
-		// repeated-failure threshold is reached; never expose a third state that
-		// makes a healthy sibling key appear untested.
-		return "alive"
-	}
-	return "dead"
-}
-
 func (s *Service) healthProbeCandidate(ctx context.Context, key *storage.UpstreamGroupKey) (int, []byte, int64, error) {
+	status, body, latencyMS, _, err := s.healthProbeCandidateWithModel(ctx, key)
+	return status, body, latencyMS, err
+}
+
+func (s *Service) healthProbeCandidateWithModel(ctx context.Context, key *storage.UpstreamGroupKey) (int, []byte, int64, string, error) {
 	// Claude 类型渠道：走 Anthropic Messages 格式探测，绝不用 openai 的 /v1/models + /v1/responses，
 	// 否则 claude 上游不认这些端点，测活必然失败（这正是"claude 渠道一测就死"的原因）。
 	if normalizeClientFormat(key.ClientFormat) == "claude" {
-		return s.healthProbeClaude(ctx, key)
+		status, body, latencyMS, err := s.healthProbeClaude(ctx, key)
+		return status, body, latencyMS, defaultHealthProbeModel(key.ClientFormat), err
 	}
 	if normalizeClientFormat(key.ClientFormat) == "grok" {
-		return s.healthProbeGrok(ctx, key)
+		status, body, latencyMS, err := s.healthProbeGrok(ctx, key)
+		return status, body, latencyMS, defaultHealthProbeModel(key.ClientFormat), err
 	}
 	start := time.Now()
 	// The one-click check is intentionally OpenAI-only. Use one stable model
 	// instead of /v1/models discovery: model lists are often filtered or stale,
 	// which used to make a healthy channel look dead before the real probe ran.
-	status, body, err := s.healthProbeOpenAIModel(ctx, key, openAIHealthProbePrimaryModel, true)
+	status, body, usedModel, err := s.healthProbeOpenAIModel(ctx, key, openAIHealthProbePrimaryModel, true)
 	if shouldTryHealthFallbackModel(status, body, err) {
-		status, body, err = s.healthProbeOpenAIModel(ctx, key, openAIHealthProbeFallbackModel, false)
+		status, body, usedModel, err = s.healthProbeOpenAIModel(ctx, key, openAIHealthProbeFallbackModel, false)
 	}
 	if shouldFallbackHealthModelDiscovery(status, body, err) {
 		if model, _, _, discoverErr := s.discoverHealthProbeModel(ctx, key); discoverErr == nil &&
 			!healthProbeModelIsOneOf(model, openAIHealthProbePrimaryModel, openAIHealthProbeFallbackModel) {
-			status, body, err = s.healthProbeOpenAIModel(ctx, key, model, false)
+			status, body, usedModel, err = s.healthProbeOpenAIModel(ctx, key, model, false)
 		}
 	}
 	latencyMS := time.Since(start).Milliseconds()
 	if err != nil {
-		return status, body, latencyMS, err
+		return status, body, latencyMS, usedModel, err
 	}
 	if status >= 200 && status < 300 && isUpstreamErrorBody(body) {
-		return status, body, latencyMS, fmt.Errorf("upstream returned error payload: %s", truncateBody(body, 240))
+		return status, body, latencyMS, usedModel, fmt.Errorf("upstream returned error payload: %s", truncateBody(body, 240))
 	}
 	if status >= 200 && status < 300 && !looksLikeHealthGenerationSuccess(body) {
-		return status, body, latencyMS, fmt.Errorf("upstream returned non-generation payload: %s", truncateBody(body, 240))
+		return status, body, latencyMS, usedModel, fmt.Errorf("upstream returned non-generation payload: %s", truncateBody(body, 240))
 	}
-	return status, body, latencyMS, nil
+	return status, body, latencyMS, usedModel, nil
 }
 
 func shouldTryHealthFallbackModel(status int, body []byte, err error) bool {
 	if healthProbeSucceeded(status, body, err) {
 		return false
 	}
-	text := healthFailureText(body, err)
-	return looksLikeUnsupportedModelError(text) || looksLikeUpstreamRoutingUnavailable(text)
+	return true
 }
 
-func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.UpstreamGroupKey, model string, allowCompatibleModelRetry bool) (int, []byte, error) {
+func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.UpstreamGroupKey, model string, allowCompatibleModelRetry bool) (int, []byte, string, error) {
 	req := healthGenerationProbeRequest(model)
 	req = requestForCandidate(req, key)
 	status, _, body, err := s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
 	if allowCompatibleModelRetry && shouldRetryHealthWithCompatibleModel(body, err) {
-		return status, body, err
+		return status, body, model, err
 	}
 	if !strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
 		if fallback, _, ok := healthProbeFallbackRequest(req, status, body, err); ok {
@@ -4299,15 +4422,15 @@ func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.Upstr
 					!strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
 					_ = s.groupKeys.UpdateRequestMode(key.ID, mode)
 				}
-				return fallbackStatus, fallbackBody, nil
+				return fallbackStatus, fallbackBody, model, nil
 			}
 			// Keep the original result when the alternate protocol also fails. That
 			// preserves meaningful statuses such as rate limit or non-generation
 			// instead of replacing them with a misleading 404 from the fallback URL.
-			return originalStatus, originalBody, originalErr
+			return originalStatus, originalBody, model, originalErr
 		}
 	}
-	return status, body, err
+	return status, body, model, err
 }
 
 func shouldRetryHealthWithCompatibleModel(body []byte, err error) bool {
@@ -4480,7 +4603,27 @@ func (s *Service) discoverHealthProbeModel(ctx context.Context, key *storage.Ups
 	if isUpstreamErrorBody(body) {
 		return "", status, body, fmt.Errorf("model discovery returned error payload: %s", truncateBody(body, 240))
 	}
-	return selectHealthProbeModel(extractHealthProbeModels(body), key.ClientFormat), status, body, nil
+	models := extractHealthProbeModels(body)
+	s.rememberDiscoveredModelCapabilities(key, models)
+	return selectHealthProbeModel(models, key.ClientFormat), status, body, nil
+}
+
+func (s *Service) rememberDiscoveredModelCapabilities(key *storage.UpstreamGroupKey, models []string) {
+	if s == nil || key == nil || key.ID == 0 {
+		return
+	}
+	remembered := 0
+	for _, model := range models {
+		model = normalizeModelCapabilityKey(model)
+		if model == "" {
+			continue
+		}
+		s.rememberCandidateModelCapability(key.ID, model, true)
+		remembered++
+		if remembered >= 128 {
+			return
+		}
+	}
 }
 
 func shouldFallbackHealthModelDiscovery(status int, body []byte, err error) bool {
@@ -4536,8 +4679,9 @@ func healthGenerationProbeRequest(model string) normalizedRequest {
 		"messages": []map[string]string{
 			{"role": "user", "content": healthProbePrompt},
 		},
-		"max_tokens": healthProbeMaxOutputTokens,
-		"stream":     true,
+		"reasoning_effort": "low",
+		"max_tokens":       healthProbeMaxOutputTokens,
+		"stream":           true,
 	})
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
@@ -5326,12 +5470,47 @@ func shouldMarkProxyFailure(msg string) bool {
 	return !looksLikeUnsupportedModelError(msg) && !looksLikeClientRequestError(msg)
 }
 
+func shouldDelaySameDispatchGroupAfterFailure(msg string) bool {
+	msg = strings.TrimSpace(msg)
+	if msg == "" {
+		return false
+	}
+	return !looksLikeClientRequestError(msg)
+}
+
+func shouldFastCooldownProxyFailure(msg string) bool {
+	lower := strings.ToLower(strings.TrimSpace(msg))
+	if lower == "" {
+		return false
+	}
+	if isSlowFirstOutputFailure(lower) {
+		return true
+	}
+	for _, marker := range []string{
+		"response content intercepted",
+		"completed before generating usable output",
+		"ended before sending a usable generation event",
+		"ended before sending a usable event",
+		"ended before response.completed",
+		"did not send a usable generation event",
+		"did not send a usable event",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 type proxyFailurePolicy struct {
 	cooldown   time.Duration
 	disableKey bool
 }
 
 func (s *Service) proxyFailurePolicy(id uint, status string, msg string) proxyFailurePolicy {
+	if shouldFastCooldownProxyFailure(msg) {
+		return proxyFailurePolicy{cooldown: proxyFastFailoverCooldown}
+	}
 	switch status {
 	case "rate_limited":
 		delay := proxyRateLimitCooldown
@@ -5488,7 +5667,6 @@ func (s *Service) markHealthFailureWithStatus(id uint, status string, msg string
 	if strings.TrimSpace(status) == "" {
 		status = "dead"
 	}
-	persistedStatus := status
 	currentFailures := 0
 	if current, err := s.groupKeys.FindByID(id); err == nil && current != nil {
 		currentFailures = current.FailureCount
@@ -5502,10 +5680,7 @@ func (s *Service) markHealthFailureWithStatus(id uint, status string, msg string
 	} else {
 		s.clearRuntimeDisable(id)
 	}
-	if healthProbeTransientStatus(status) {
-		persistedStatus = "alive"
-	}
-	if err := s.groupKeys.MarkHealthFailureStatus(id, persistedStatus, msg, disabledUntil, latencyMS); err != nil && s.log != nil {
+	if err := s.groupKeys.MarkHealthFailureStatus(id, status, msg, disabledUntil, latencyMS); err != nil && s.log != nil {
 		s.log.Warn("mark upstream health failed", "id", id, "err", err)
 	}
 }
@@ -6507,7 +6682,7 @@ func (s *Service) softAffinityCanPromote(ordered []storage.UpstreamGroupKey, sti
 		return true
 	}
 	return sameDispatchOrderTier(ordered[0], sticky) &&
-		s.candidateModelCapabilityRank(ordered[0].ID, model) == s.candidateModelCapabilityRank(sticky.ID, model)
+		s.candidateEffectiveModelCapabilityRank(ordered[0], model) == s.candidateEffectiveModelCapabilityRank(sticky, model)
 }
 
 func (s *Service) preferSameGroupSchedulableCandidates(candidates []storage.UpstreamGroupKey, model string) []storage.UpstreamGroupKey {
@@ -6523,7 +6698,7 @@ func (s *Service) preferSameGroupSchedulableCandidates(candidates []storage.Upst
 	out = append(out, candidates[0])
 	for _, item := range candidates[1:] {
 		if candidateSchedulable(item) && dispatchGroupIdentity(item) == target && sameDispatchOrderTier(candidates[0], item) &&
-			s.candidateModelCapabilityRank(candidates[0].ID, model) == s.candidateModelCapabilityRank(item.ID, model) {
+			s.candidateEffectiveModelCapabilityRank(candidates[0], model) == s.candidateEffectiveModelCapabilityRank(item, model) {
 			out = append(out, item)
 			continue
 		}
@@ -6582,12 +6757,12 @@ func (s *Service) orderCandidatesWithRuntime(candidates []storage.UpstreamGroupK
 		if schedI != schedJ {
 			return schedI
 		}
-		supportI, supportJ := s.candidateModelCapabilityRank(out[i].ID, requestModel), s.candidateModelCapabilityRank(out[j].ID, requestModel)
+		supportI, supportJ := s.candidateEffectiveModelCapabilityRank(out[i], requestModel), s.candidateEffectiveModelCapabilityRank(out[j], requestModel)
 		if (supportI == 2) != (supportJ == 2) {
 			return supportI != 2
 		}
-		if out[i].Charity != out[j].Charity {
-			return out[i].Charity
+		if layerI, layerJ := candidateDispatchLayer(out[i]), candidateDispatchLayer(out[j]); layerI != layerJ {
+			return layerI < layerJ
 		}
 		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
 			return rankI < rankJ
@@ -6643,16 +6818,51 @@ func normalizeModelCapabilityKey(model string) string {
 }
 
 // candidateModelCapabilityRank returns supported (0), unknown (1), or known
-// unsupported (2). Unsupported candidates are retained as a last resort: a
-// model list can be stale, but they no longer add a failed first request after
-// the gateway has already observed their real response for this model.
-// filterKnownUnsupportedModelCandidates intentionally retains every candidate.
-// The negative cache is advisory: orderCandidatesWithRuntime places known
-// unsupported entries after supported/unknown routes, but still tries them when
-// they are the only remaining fallback because provider model maps can be stale.
+// unsupported (2). Once a concrete upstream has proved it cannot serve a model,
+// skip it before dispatch so Codex does not pay for a doomed first attempt.
 func (s *Service) filterKnownUnsupportedModelCandidates(candidates []storage.UpstreamGroupKey, model string) []storage.UpstreamGroupKey {
-	return candidates
+	model = normalizeModelCapabilityKey(model)
+	if model == "" {
+		return candidates
+	}
+	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
+	for _, candidate := range candidates {
+		if s.candidateEffectiveModelCapabilityRank(candidate, model) == 2 {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
 }
+
+func (s *Service) candidateEffectiveModelCapabilityRank(candidate storage.UpstreamGroupKey, model string) int {
+	rank := s.candidateModelCapabilityRank(candidate.ID, model)
+	if rank != 1 {
+		return rank
+	}
+	return healthProbeModelCapabilityRank(candidate.HealthProbeModel, model)
+}
+
+func healthProbeModelCapabilityRank(probeModel, requestModel string) int {
+	probeModel = normalizeModelCapabilityKey(probeModel)
+	requestModel = normalizeModelCapabilityKey(requestModel)
+	if probeModel == "" || requestModel == "" {
+		return 1
+	}
+	if probeModel == requestModel {
+		return 0
+	}
+	if probeModel == normalizeModelCapabilityKey(openAIHealthProbeFallbackModel) &&
+		requestModel == normalizeModelCapabilityKey(openAIHealthProbePrimaryModel) {
+		return 2
+	}
+	if !healthProbeModelIsOneOf(probeModel, openAIHealthProbePrimaryModel, openAIHealthProbeFallbackModel) &&
+		healthProbeModelIsOneOf(requestModel, openAIHealthProbePrimaryModel, openAIHealthProbeFallbackModel) {
+		return 2
+	}
+	return 1
+}
+
 func (s *Service) candidateModelCapabilityRank(candidateID uint, model string) int {
 	model = normalizeModelCapabilityKey(model)
 	if candidateID == 0 || model == "" {
@@ -7006,19 +7216,11 @@ func (s *Service) clearRuntimeDisable(id uint) {
 func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 	out := append([]storage.UpstreamGroupKey(nil), in...)
 	sort.SliceStable(out, func(i, j int) bool {
-		schedI := candidateSchedulable(out[i])
-		schedJ := candidateSchedulable(out[j])
-		if schedI != schedJ {
-			return schedI
-		}
-		if schedI && out[i].Charity != out[j].Charity {
-			return out[i].Charity
+		if layerI, layerJ := candidateDispatchLayer(out[i]), candidateDispatchLayer(out[j]); layerI != layerJ {
+			return layerI < layerJ
 		}
 		if rankI, rankJ := statusRank(out[i].Status), statusRank(out[j].Status); rankI != rankJ {
 			return rankI < rankJ
-		}
-		if out[i].Charity != out[j].Charity {
-			return out[i].Charity
 		}
 		if ratioI, ratioJ := effectiveGroupRatio(out[i]), effectiveGroupRatio(out[j]); ratioI != ratioJ {
 			return ratioI < ratioJ
@@ -7035,6 +7237,22 @@ func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
 		return out[i].ID < out[j].ID
 	})
 	return out
+}
+
+func candidateDispatchLayer(item storage.UpstreamGroupKey) int {
+	if candidateSchedulable(item) {
+		if item.Charity {
+			return 0
+		}
+		return 1
+	}
+	if temporaryCooldownFallbackCandidate(item) {
+		if item.Charity {
+			return 2
+		}
+		return 3
+	}
+	return 4
 }
 
 func candidateSchedulable(item storage.UpstreamGroupKey) bool {
@@ -9097,15 +9315,7 @@ func healthStreamEventReady(ev sseEvent) bool {
 	if data == "" || data == "[DONE]" {
 		return false
 	}
-	if looksLikeHealthGenerationSuccess([]byte(data)) {
-		return true
-	}
-	typ := strings.ToLower(sseEventType(ev))
-	switch typ {
-	case "content_block_delta", "message_delta", "message_stop":
-		return true
-	}
-	return false
+	return streamEventHasVisibleText(ev)
 }
 
 func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.Duration, hold func([]sseEvent) bool) ([]sseEvent, error) {
@@ -9146,11 +9356,14 @@ func preflightSSEStream(reader *sseStreamReader, closer io.Closer, timeout time.
 		}
 		buffered = append(buffered, ev)
 		totalBytes += len(ev.Event) + len(ev.Data)
-		if streamEventReady(ev) {
+		if streamBufferedHasCodexOutput(buffered) {
 			if hold != nil && hold(buffered) {
 				continue
 			}
 			return buffered, nil
+		}
+		if terminal, msg := streamEventTerminalWithoutOutput(ev); terminal {
+			return nil, errors.New(msg)
 		}
 	}
 	if len(buffered) == 0 {
@@ -9207,26 +9420,249 @@ func readNextSSEWithTimeout(reader *sseStreamReader, closer io.Closer, timeout t
 }
 
 func streamEventReady(ev sseEvent) bool {
+	return streamEventHasCodexOutput(ev)
+}
+
+func streamBufferedHasCodexOutput(events []sseEvent) bool {
+	for _, ev := range events {
+		if streamEventHasCodexOutput(ev) {
+			return true
+		}
+	}
+	return false
+}
+
+func streamEventHasCodexOutput(ev sseEvent) bool {
 	data := strings.TrimSpace(ev.Data)
 	if data == "[DONE]" {
 		return false
 	}
-	typ := strings.ToLower(strings.TrimSpace(sseEventType(ev)))
-	switch typ {
-	case "response.completed", "response.done", "message_stop":
+	if streamEventHasVisibleText(ev) {
 		return true
-	case "response.created", "response.in_progress", "response.queued", "response.output_item.added", "response.content_part.added", "message_start", "content_block_start":
+	}
+	if data == "" {
 		return false
 	}
-	if sseEventLooksLikeChatCompletion(ev) {
-		return chatCompletionChunkHasGenerationOrTerminal(data)
+	var raw map[string]any
+	if json.Unmarshal([]byte(data), &raw) != nil {
+		return false
 	}
-	if strings.Contains(typ, ".delta") || strings.Contains(typ, "_delta") {
+	if chatChunkHasToolCallDelta(raw) {
 		return true
 	}
+	if responseEventHasToolOutput(raw) {
+		return true
+	}
+	return false
+}
+
+func streamEventHasVisibleText(ev sseEvent) bool {
+	data := strings.TrimSpace(ev.Data)
+	if data == "" || data == "[DONE]" {
+		return false
+	}
+	if looksLikeHealthGenerationSuccess([]byte(data)) {
+		return true
+	}
+	var raw map[string]any
+	if json.Unmarshal([]byte(data), &raw) != nil {
+		return false
+	}
+	return strings.TrimSpace(chatChunkDeltaText(raw)) != "" ||
+		strings.TrimSpace(responseVisibleText(raw)) != "" ||
+		strings.TrimSpace(anthropicEventText(raw)) != ""
+}
+
+func responseVisibleText(raw map[string]any) string {
+	if raw == nil {
+		return ""
+	}
+	var b strings.Builder
+	if text := responseText(raw); strings.TrimSpace(text) != "" {
+		b.WriteString(text)
+	}
+	typ := strings.ToLower(strings.TrimSpace(stringValue(raw["type"])))
 	switch typ {
-	case "content_block_delta", "content_block_stop":
+	case "response.output_text.delta":
+		b.WriteString(stringValue(raw["delta"]))
+	case "response.output_text.done":
+		b.WriteString(stringValue(raw["text"]))
+	case "response.content_part.done":
+		if part, _ := raw["part"].(map[string]any); part != nil {
+			b.WriteString(stringValue(part["text"]))
+		}
+	case "response.output_item.done":
+		if item, _ := raw["item"].(map[string]any); item != nil {
+			b.WriteString(responseOutputItemText(item))
+		}
+	}
+	if part, _ := raw["part"].(map[string]any); part != nil {
+		if text := stringValue(part["text"]); text != "" {
+			b.WriteString(text)
+		}
+	}
+	if item, _ := raw["item"].(map[string]any); item != nil {
+		if text := responseOutputItemText(item); strings.TrimSpace(text) != "" {
+			b.WriteString(text)
+		}
+	}
+	if response, _ := raw["response"].(map[string]any); response != nil {
+		if text := responseText(response); strings.TrimSpace(text) != "" {
+			b.WriteString(text)
+		}
+	}
+	return b.String()
+}
+
+func anthropicEventText(raw map[string]any) string {
+	if raw == nil {
+		return ""
+	}
+	var b strings.Builder
+	if delta, _ := raw["delta"].(map[string]any); delta != nil {
+		b.WriteString(stringValue(delta["text"]))
+	}
+	if block, _ := raw["content_block"].(map[string]any); block != nil {
+		b.WriteString(stringValue(block["text"]))
+	}
+	b.WriteString(anthropicContentText(raw["content"]))
+	if message, _ := raw["message"].(map[string]any); message != nil {
+		b.WriteString(anthropicContentText(message["content"]))
+	}
+	return b.String()
+}
+
+func anthropicContentText(value any) string {
+	switch v := value.(type) {
+	case string:
+		return strings.TrimSpace(v)
+	case []any:
+		var b strings.Builder
+		for _, item := range v {
+			b.WriteString(anthropicContentText(item))
+		}
+		return b.String()
+	case map[string]any:
+		if text := stringValue(v["text"]); text != "" {
+			return text
+		}
+		return anthropicContentText(v["content"])
+	default:
+		return ""
+	}
+}
+
+func chatChunkHasToolCallDelta(raw map[string]any) bool {
+	choices, _ := raw["choices"].([]any)
+	for _, c := range choices {
+		choice, _ := c.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		if calls, ok := delta["tool_calls"].([]any); ok {
+			for _, item := range calls {
+				call, _ := item.(map[string]any)
+				if chatToolCallDeltaHasContent(call) {
+					return true
+				}
+			}
+		}
+		if call, ok := delta["function_call"].(map[string]any); ok && chatToolCallDeltaHasContent(call) {
+			return true
+		}
+	}
+	return false
+}
+
+func chatToolCallDeltaHasContent(call map[string]any) bool {
+	if call == nil {
+		return false
+	}
+	for _, field := range []string{"id", "type", "name", "arguments"} {
+		if stringValue(call[field]) != "" {
+			return true
+		}
+	}
+	if fn, _ := call["function"].(map[string]any); fn != nil {
+		return stringValue(fn["name"]) != "" || stringValue(fn["arguments"]) != ""
+	}
+	return len(call) > 0
+}
+
+func responseEventHasToolOutput(raw map[string]any) bool {
+	if raw == nil {
+		return false
+	}
+	typ := strings.ToLower(strings.TrimSpace(stringValue(raw["type"])))
+	switch typ {
+	case "response.function_call_arguments.delta", "response.function_call_arguments.done",
+		"response.custom_tool_call_input.delta", "response.custom_tool_call_input.done":
 		return true
+	}
+	if responseToolOutputItem(raw) {
+		return true
+	}
+	if item, _ := raw["item"].(map[string]any); item != nil && responseToolOutputItem(item) {
+		return true
+	}
+	if response, _ := raw["response"].(map[string]any); response != nil && responseEventHasToolOutput(response) {
+		return true
+	}
+	if output, _ := raw["output"].([]any); len(output) > 0 {
+		for _, value := range output {
+			item, _ := value.(map[string]any)
+			if responseToolOutputItem(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func responseToolOutputItem(item map[string]any) bool {
+	if item == nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(stringValue(item["type"]))) {
+	case "function_call", "custom_tool_call":
+		return true
+	default:
+		return false
+	}
+}
+
+func streamBufferedHasTerminal(events []sseEvent) bool {
+	for _, ev := range events {
+		if streamEventIsTerminal(ev) {
+			return true
+		}
+	}
+	return false
+}
+
+func streamEventTerminalWithoutOutput(ev sseEvent) (bool, string) {
+	if !streamEventIsTerminal(ev) {
+		return false, ""
+	}
+	return true, "upstream stream completed before generating usable output"
+}
+
+func streamEventIsTerminal(ev sseEvent) bool {
+	if strings.TrimSpace(ev.Data) == "[DONE]" {
+		return true
+	}
+	typ := strings.ToLower(strings.TrimSpace(sseEventType(ev)))
+	switch typ {
+	case "response.completed", "response.done", "response.failed", "response.cancelled", "response.incomplete", "message_stop":
+		return true
+	}
+	if sseEventLooksLikeChatCompletion(ev) {
+		var raw map[string]any
+		return json.Unmarshal([]byte(strings.TrimSpace(ev.Data)), &raw) == nil && chatChunkHasFinish(raw)
 	}
 	return false
 }

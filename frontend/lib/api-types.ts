@@ -659,6 +659,7 @@ export interface UpstreamGroupKey {
   last_checked_at?: string | null
   last_latency_ms?: number
   last_success_at?: string | null
+  health_probe_model?: string
   last_used_at?: string | null
   disabled_until?: string | null
   last_error?: string
@@ -696,6 +697,7 @@ export interface UsageLog {
   cached_tokens: number
   ratio?: number
   status?: string
+  error_message?: string
   first_token_ms?: number
   duration_ms?: number
   created_at: string
