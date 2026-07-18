@@ -6383,6 +6383,65 @@ func TestManualBootstrapChannelIsSkipped(t *testing.T) {
 	}
 }
 
+func TestSyncBootstrapGroupModelsRefreshesAutomaticOpenAIOnly(t *testing.T) {
+	var hits atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-5.6"},{"id":"gpt-5.5"}]}`))
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("m", 32))
+	channel := &storage.Channel{Name: "bootstrap-models", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	insert := func(groupRef, groupName, format string) {
+		t.Helper()
+		cipher, err := env.cipher.Encrypt("sk-" + groupRef)
+		if err != nil {
+			t.Fatalf("encrypt %s: %v", groupRef, err)
+		}
+		if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+			ChannelID: channel.ID, ChannelName: channel.Name, ChannelURL: channel.SiteURL, ChannelType: channel.Type,
+			ClientFormat: format, RequestMode: "responses", GroupRef: groupRef, GroupName: groupName,
+			Ratio: 0.05, Enabled: true, KeyCipher: cipher, Status: "alive",
+		}); err != nil {
+			t.Fatalf("insert %s: %v", groupRef, err)
+		}
+	}
+	insert("standard", "standard", "openai")
+	insert("manual:operator", "manual", "openai")
+	insert("claude", "claude", "claude")
+
+	groups, err := env.groupKeys.List()
+	if err != nil {
+		t.Fatalf("list groups: %v", err)
+	}
+	synced, failed := env.svc.syncBootstrapGroupModels(context.Background(), groups)
+	if synced != 1 || failed != 0 || hits.Load() != 1 {
+		t.Fatalf("model sync result = synced %d failed %d hits %d", synced, failed, hits.Load())
+	}
+
+	automatic, err := env.groupKeys.FindByChannelGroup(channel.ID, "standard")
+	if err != nil || automatic == nil {
+		t.Fatalf("load automatic group: %v", err)
+	}
+	if !supportedModelsContain(automatic.SupportedModels, "gpt-5.6") || !supportedModelsContain(automatic.SupportedModels, "gpt-5.5") {
+		t.Fatalf("automatic supported models = %q", automatic.SupportedModels)
+	}
+	manual, _ := env.groupKeys.FindByChannelGroup(channel.ID, "manual:operator")
+	claude, _ := env.groupKeys.FindByChannelGroup(channel.ID, "claude")
+	if manual == nil || manual.SupportedModels != "" || claude == nil || claude.SupportedModels != "" {
+		t.Fatalf("skipped groups were modified: manual=%#v claude=%#v", manual, claude)
+	}
+}
+
 func TestInferGroupClientFormatRecognizesClaudeAliases(t *testing.T) {
 	for _, name := range []string{"cc relay", "cs relay", "kiro", "max"} {
 		if got := inferGroupClientFormat(name, ""); got != "claude" {

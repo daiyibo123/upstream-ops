@@ -1552,7 +1552,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     setBusy("bootstrap")
     try {
       const res = await apiFetch<GatewayBootstrapResult>("/gateway/group-keys/bootstrap", { method: "POST" })
-      toast.success(`分组 Key 已覆盖同步：保留/更新 ${res.updated}，新建 ${res.created}，删除 ${res.removed || 0}，跳过 ${res.skipped}，失败 ${res.failed}`)
+      const modelSummary = `模型清单成功 ${res.models_synced || 0}，失败 ${res.model_sync_failed || 0}`
+      toast.success(`分组 Key 已覆盖同步：保留/更新 ${res.updated}，新建 ${res.created}，删除 ${res.removed || 0}，跳过 ${res.skipped}，失败 ${res.failed}；${modelSummary}`)
       await load()
     } catch (e) {
       const err = e as Error
@@ -1904,16 +1905,28 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 测活 {group.health_probe_model}
               </Badge>
             ) : null}
-            <Badge
-              variant="outline"
-              className={cn(
-                "bg-background",
-                supportedModels.length > 0 ? "border-brand/20 text-brand" : "text-muted-foreground",
-              )}
-              title={supportedModels.length > 0 ? supportedModels.join(", ") : "尚未同步或手工维护支持模型"}
+            <button
+              type="button"
+              className="rounded-full disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={!!busy}
+              title={
+                supportedModels.length > 0
+                  ? `编辑支持模型：${supportedModels.join(", ")}`
+                  : "同步或手工编辑该渠道支持的模型清单"
+              }
+              onClick={() => openGroupModelEditor(group)}
             >
-              模型 {supportedModels.length > 0 ? supportedModels.length : "未知"}
-            </Badge>
+              <Badge
+                variant="outline"
+                className={cn(
+                  "gap-1 bg-background transition-colors hover:border-brand/40 hover:bg-brand/5",
+                  supportedModels.length > 0 ? "border-brand/20 text-brand" : "text-muted-foreground",
+                )}
+              >
+                模型 {supportedModels.length > 0 ? supportedModels.length : "未知"}
+                <Pencil className="size-2.5" />
+              </Badge>
+            </button>
             <Badge variant="outline" className="bg-background">{upstreamKeyLabel(group)}</Badge>
             <Badge variant="outline" className="bg-background">{formatTokens(group.total_tokens)} tok</Badge>
           </div>
@@ -2048,7 +2061,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </label>
         </div>
 
-        <div className="flex items-center justify-start gap-1 lg:justify-end">
+        <div className="flex flex-wrap items-center justify-start gap-1 lg:justify-end">
           {group.disabled_until && new Date(group.disabled_until).getTime() > Date.now() ? (
             <Button
               variant="outline"
@@ -2061,17 +2074,6 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               解冷
             </Button>
           ) : null}
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 gap-1 px-2 text-[11px]"
-            disabled={!!busy}
-            title="同步或手工编辑该渠道支持的模型清单"
-            onClick={() => openGroupModelEditor(group)}
-          >
-            <Pencil className="size-3" />
-            模型
-          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -2141,7 +2143,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             </Badge>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={bootstrapGroups}>
               {busy === "bootstrap" ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
-              覆盖同步分组 Key
+              覆盖同步分组与模型
             </Button>
             <Button size="sm" variant="outline" className="gap-1.5 text-xs" disabled={!!busy} onClick={() => setManualGroupDialogOpen(true)}>
               <Plus className="size-3.5" />

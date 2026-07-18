@@ -251,12 +251,14 @@ type PublicGatewayKeyOutput struct {
 }
 
 type BootstrapResult struct {
-	Created int             `json:"created"`
-	Updated int             `json:"updated"`
-	Skipped int             `json:"skipped"`
-	Failed  int             `json:"failed"`
-	Removed int             `json:"removed"`
-	Items   []BootstrapItem `json:"items"`
+	Created         int             `json:"created"`
+	Updated         int             `json:"updated"`
+	Skipped         int             `json:"skipped"`
+	Failed          int             `json:"failed"`
+	Removed         int             `json:"removed"`
+	ModelsSynced    int             `json:"models_synced"`
+	ModelSyncFailed int             `json:"model_sync_failed"`
+	Items           []BootstrapItem `json:"items"`
 }
 
 type BootstrapItem struct {
@@ -2032,6 +2034,50 @@ func (s *Service) detectGroupRequestModes(ids []uint) {
 	wg.Wait()
 }
 
+// syncBootstrapGroupModels refreshes /v1/models after an automatic group-key
+// reconciliation. Manual groups keep their explicitly managed model lists, and
+// Claude/Grok groups are skipped because they do not use the OpenAI models API.
+// Existing lists are preserved when an upstream is temporarily unavailable.
+func (s *Service) syncBootstrapGroupModels(ctx context.Context, groups []storage.UpstreamGroupKey) (int, int) {
+	const maxConcurrentSyncs = 10
+	sem := make(chan struct{}, maxConcurrentSyncs)
+	var wg sync.WaitGroup
+	var synced atomic.Int64
+	var failed atomic.Int64
+
+	for i := range groups {
+		key := groups[i]
+		if !key.Enabled || key.KeyCipher == "" || isManualGroupKey(&key) || normalizeClientFormat(key.ClientFormat) != "openai" {
+			continue
+		}
+		wg.Add(1)
+		go func(candidate storage.UpstreamGroupKey) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				failed.Add(1)
+				return
+			}
+			release := s.acquireHealthProbeUpstreamSlot(candidate)
+			defer release()
+			models, err := s.SyncGroupKeyModels(ctx, candidate.ID)
+			if err != nil || len(models) == 0 {
+				failed.Add(1)
+				if err != nil && s.log != nil {
+					s.log.Warn("bootstrap model sync failed", "id", candidate.ID, "channel", candidate.ChannelName, "group", candidate.GroupName, "err", err)
+				}
+				return
+			}
+			synced.Add(1)
+		}(key)
+	}
+
+	wg.Wait()
+	return int(synced.Load()), int(failed.Load())
+}
+
 // ManualGroupKeyInput 是"手动添加渠道分组"的入参：不登录上游，直接填分组名 + key。
 // 用于那些无法登录、只能拿到 key 的上游。
 type ManualGroupKeyInput struct {
@@ -2332,6 +2378,7 @@ func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, err
 			}
 		}
 		s.detectGroupRequestModes(ids)
+		result.ModelsSynced, result.ModelSyncFailed = s.syncBootstrapGroupModels(ctx, all)
 	}
 	return result, nil
 }

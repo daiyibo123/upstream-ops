@@ -8,6 +8,17 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.27.1 - 2026-07-18
+
+### Changed
+
+- Cover synchronization now refreshes `/v1/models` for enabled, automatically managed OpenAI groups after reconciling their keys. Manual groups and Claude/Grok groups remain untouched, failed upstream requests preserve the existing model list, and bounded per-upstream concurrency avoids bursts against the same API base.
+- The group action is labeled “覆盖同步分组与模型” and reports separate model-sync success and failure counts when the operation completes.
+
+### Fixed
+
+- The model action is now integrated into the model-count badge, and group action buttons wrap on narrower layouts so the model control no longer covers adjacent buttons.
+
 ## v0.27.0 - 2026-07-18
 
 ### Added

@@ -745,6 +745,8 @@ export interface GatewayBootstrapResult {
   skipped: number
   failed: number
   removed?: number
+  models_synced: number
+  model_sync_failed: number
   items: Array<{
     channel_id: number
     channel_name: string
