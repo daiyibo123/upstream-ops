@@ -709,8 +709,8 @@ func TestProxyFailsOverOnHTTP200ErrorPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load dead group key: %v", err)
 	}
-	if deadGroup.Status != "alive" || deadGroup.FailureCount != 1 || deadGroup.DisabledUntil != nil || !deadGroup.Enabled {
-		t.Fatalf("a first transient upstream error must remain schedulable: %#v", deadGroup)
+	if deadGroup.Status != "alive" || deadGroup.FailureCount != 1 || deadGroup.DisabledUntil == nil || !deadGroup.Enabled {
+		t.Fatalf("a first transient upstream error must enter temporary cooldown: %#v", deadGroup)
 	}
 }
 
@@ -970,7 +970,7 @@ func TestProxyUsesUnmonitoredChannelCandidates(t *testing.T) {
 	}
 }
 
-func TestCooldownRescueProbeDoesNotExtendFailureCount(t *testing.T) {
+func TestCooldownCandidateIsNotProbed(t *testing.T) {
 	var hits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
@@ -1010,18 +1010,18 @@ func TestCooldownRescueProbeDoesNotExtendFailureCount(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected no-upstream gateway error")
 	}
-	if hits != 1 {
-		t.Fatalf("cooldown rescue probe hits = %d, want 1", hits)
+	if hits != 0 {
+		t.Fatalf("cooling candidate was probed %d times, want 0", hits)
 	}
 	stored, err := env.groupKeys.FindByID(group.ID)
 	if err != nil {
 		t.Fatalf("reload cooling group: %v", err)
 	}
 	if stored.FailureCount != 3 {
-		t.Fatalf("cooldown rescue should not extend failure count, got %#v", stored)
+		t.Fatalf("cooldown skip should not extend failure count, got %#v", stored)
 	}
 	if stored.DisabledUntil == nil || stored.DisabledUntil.Before(until.Add(-time.Second)) {
-		t.Fatalf("cooldown rescue should not shorten/replace disabled_until, got %#v want around %s", stored.DisabledUntil, until)
+		t.Fatalf("cooldown skip should preserve disabled_until, got %#v want around %s", stored.DisabledUntil, until)
 	}
 }
 
@@ -1470,24 +1470,7 @@ func TestOrderCandidatesFiltersKnownUnsupportedModelCandidates(t *testing.T) {
 	}
 }
 
-func TestCooldownFallbackUsesNormalCharityAndRatioOrdering(t *testing.T) {
-	env := newGatewayProxyTestEnv(t, strings.Repeat("c", 32))
-	now := time.Now()
-	early := now.Add(time.Second)
-	middle := now.Add(time.Minute)
-	late := now.Add(2 * time.Minute)
-	candidates := []storage.UpstreamGroupKey{
-		{ID: 1, Status: "alive", Ratio: 0.9, DisabledUntil: &early},
-		{ID: 2, Status: "alive", Ratio: 0.05, DisabledUntil: &middle},
-		{ID: 3, Status: "alive", Ratio: 1, Charity: true, DisabledUntil: &late},
-	}
-	ordered := env.svc.orderCooldownFallbackCandidates(candidates, "gpt-test")
-	if len(ordered) != 3 || ordered[0].ID != 3 || ordered[1].ID != 2 || ordered[2].ID != 1 {
-		t.Fatalf("cooldown fallback ignored normal economic ordering: %#v", ordered)
-	}
-}
-
-func TestCooldownFallbackRunsAfterActiveFailureAndTriesAllCandidates(t *testing.T) {
+func TestCooldownCandidatesStayUnschedulableAfterActiveFailure(t *testing.T) {
 	var activeHits, firstCooldownHits, secondCooldownHits int
 	server := func(hits *int, status int, text string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1544,8 +1527,72 @@ func TestCooldownFallbackRunsAfterActiveFailureAndTriesAllCandidates(t *testing.
 	if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
 		t.Fatalf("proxy request: %v", err)
 	}
-	if activeHits != 1 || firstCooldownHits != 1 || secondCooldownHits != 1 || !strings.Contains(rec.Body.String(), "cooldown recovered") {
-		t.Fatalf("cooldown fallback traversal failed: active=%d first=%d second=%d body=%s", activeHits, firstCooldownHits, secondCooldownHits, rec.Body.String())
+	if activeHits != 1 || firstCooldownHits != 0 || secondCooldownHits != 0 {
+		t.Fatalf("cooling candidates must stay out of dispatch: active=%d first=%d second=%d body=%s", activeHits, firstCooldownHits, secondCooldownHits, rec.Body.String())
+	}
+}
+
+func TestSuccessfulFailoverStaysStickyWhileFailedCandidateCoolsDown(t *testing.T) {
+	var failedHits, healthyHits int
+	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		failedHits++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"message":"Service temporarily unavailable"}}`))
+	}))
+	defer failed.Close()
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		healthyHits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\",\"response_id\":\"resp_sticky\"}\n\n" +
+			"event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_sticky\",\"model\":\"gpt-test\"}}\n\n"))
+	}))
+	defer healthy.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("s", 32))
+	env.svc.UpdateUpstreamConfig(config.UpstreamConfig{TemporaryFailureCooldownSeconds: 300})
+	for i, spec := range []struct {
+		name  string
+		url   string
+		ratio float64
+	}{{"failed-primary", failed.URL, 0.01}, {"healthy-sticky", healthy.URL, 0.02}} {
+		channel := &storage.Channel{Name: spec.name, Type: storage.ChannelTypeSub2API, SiteURL: spec.url}
+		if err := env.channels.Create(channel); err != nil {
+			t.Fatalf("create channel %d: %v", i, err)
+		}
+		cipher, err := env.cipher.Encrypt("sk-" + spec.name)
+		if err != nil {
+			t.Fatalf("encrypt key %d: %v", i, err)
+		}
+		if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
+			ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type,
+			ClientFormat: "openai", RequestMode: "responses", GroupRef: spec.name, GroupName: spec.name,
+			Ratio: spec.ratio, Charity: true, KeyCipher: cipher, Enabled: true, Status: "alive",
+		}); err != nil {
+			t.Fatalf("create group %d: %v", i, err)
+		}
+	}
+
+	request := func() *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"same conversation","stream":true}`))
+		req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		if err := env.svc.Proxy(rec, req, "/v1/responses"); err != nil {
+			t.Fatalf("proxy request: %v", err)
+		}
+		return rec
+	}
+	first := request()
+	second := request()
+	if !strings.Contains(first.Body.String(), "ok") || !strings.Contains(second.Body.String(), "ok") {
+		t.Fatalf("healthy fallback did not complete both requests: first=%s second=%s", first.Body.String(), second.Body.String())
+	}
+	if failedHits != 1 || healthyHits != 2 {
+		t.Fatalf("failed candidate should cool after first hit while healthy route stays sticky: failed=%d healthy=%d", failedHits, healthyHits)
 	}
 }
 
@@ -1859,8 +1906,9 @@ func TestProxyStreamFailsOverFromForbiddenCharityKeyBeforeWritingTerminal(t *tes
 	}
 }
 
-func TestProxyFailurePolicyRequiresThreeTransientFailures(t *testing.T) {
+func TestProxyFailurePolicyImmediatelyUsesConfiguredCooldown(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("b", 32))
+	env.svc.UpdateUpstreamConfig(config.UpstreamConfig{TemporaryFailureCooldownSeconds: 300})
 	channel := &storage.Channel{Name: "transient", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.invalid", MonitorEnabled: true}
 	if err := env.channels.Create(channel); err != nil {
 		t.Fatalf("create channel: %v", err)
@@ -1879,23 +1927,17 @@ func TestProxyFailurePolicyRequiresThreeTransientFailures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load group key: %v", err)
 	}
-	for i := 1; i <= 2; i++ {
-		env.svc.markProxyFailure(group.ID, "upstream returned HTTP 503: temporary upstream failure")
-		stored, err := env.groupKeys.FindByID(group.ID)
-		if err != nil {
-			t.Fatalf("load group after failure %d: %v", i, err)
-		}
-		if stored.FailureCount != i || stored.DisabledUntil != nil || !stored.Enabled || stored.Status != "alive" {
-			t.Fatalf("failure %d should only be recorded, got %#v", i, stored)
-		}
-	}
+	before := time.Now()
 	env.svc.markProxyFailure(group.ID, "upstream returned HTTP 503: temporary upstream failure")
 	stored, err := env.groupKeys.FindByID(group.ID)
 	if err != nil {
-		t.Fatalf("load group after third failure: %v", err)
+		t.Fatalf("load group after failure: %v", err)
 	}
-	if stored.FailureCount != 3 || stored.DisabledUntil == nil || !stored.Enabled || stored.Status != "alive" {
-		t.Fatalf("third transient failure should short-circuit with cooldown but keep display status alive: %#v", stored)
+	if stored.FailureCount != 1 || stored.DisabledUntil == nil || !stored.Enabled || stored.Status != "alive" {
+		t.Fatalf("first transient failure should enter cooldown but keep display status alive: %#v", stored)
+	}
+	if delay := stored.DisabledUntil.Sub(before); delay < 290*time.Second || delay > 310*time.Second {
+		t.Fatalf("temporary failure cooldown = %s, want about 300s", delay)
 	}
 }
 

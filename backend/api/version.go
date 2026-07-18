@@ -24,11 +24,13 @@ const (
 	githubRepoURL              = "https://github.com/daiyibo123/upstream-ops"
 	defaultGitHubLatestRelease = "https://api.github.com/repos/daiyibo123/upstream-ops/releases/latest"
 	defaultGitHubTagsURL       = "https://api.github.com/repos/daiyibo123/upstream-ops/tags?per_page=1"
+	defaultVersionFallbackURL  = "https://cdn.jsdelivr.net/gh/daiyibo123/upstream-ops@main/backend/global/version.go"
 )
 
 var (
 	githubLatestReleaseURL = defaultGitHubLatestRelease
 	githubTagsURL          = defaultGitHubTagsURL
+	versionFallbackURL     = defaultVersionFallbackURL
 	githubReleaseClient    = &http.Client{Timeout: 2 * time.Second}
 	systemUpdateState      = &updateState{Status: "idle"}
 )
@@ -254,19 +256,62 @@ func buildVersionResponse(ctx context.Context, d *Deps, force bool) versionRespo
 
 	latest, releaseURL, err := fetchLatestGitHubRelease(ctx, versionCheckClient(proxyCfg, force))
 	if err != nil {
-		// GitHub's public API can return 403 for unauthenticated rate limiting or
-		// regional/network policy. This must not make the dashboard look broken:
-		// without a verified newer tag the only honest state is the running
-		// version, which is already up to date from this deployment's viewpoint.
-		resp.LatestVersion = global.VERSION
-		resp.ReleaseURL = githubRepoURL
-		resp.UpdateAvailable = false
-		return resp
+		latest, releaseURL, err = fetchLatestVersionFallback(ctx, versionCheckClient(proxyCfg, force))
+		if err != nil {
+			resp.LatestVersion = global.VERSION
+			resp.ReleaseURL = githubRepoURL
+			resp.UpdateAvailable = false
+			resp.UpdateError = "无法连接版本源，请检查服务器网络或版本检查代理"
+			return resp
+		}
 	}
 	resp.LatestVersion = latest
 	resp.ReleaseURL = releaseURL
 	resp.UpdateAvailable = isVersionNewer(latest, global.VERSION)
 	return resp
+}
+
+func fetchLatestVersionFallback(ctx context.Context, client *http.Client) (string, string, error) {
+	if client == nil {
+		client = githubReleaseClient
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, versionFallbackURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("User-Agent", "upstream-ops")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("version fallback status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", "", err
+	}
+	version := ""
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.Contains(line, "VERSION") || !strings.Contains(line, "=") {
+			continue
+		}
+		value := strings.TrimSpace(strings.SplitN(line, "=", 2)[1])
+		value = strings.Trim(value, "\"' `\t\r")
+		if _, ok := parseVersion(value); ok {
+			version = value
+			break
+		}
+	}
+	if version == "" {
+		return "", "", errors.New("version fallback missing VERSION")
+	}
+	tag := version
+	if !strings.HasPrefix(strings.ToLower(tag), "v") {
+		tag = "v" + tag
+	}
+	return tag, githubRepoURL + "/releases/tag/" + tag, nil
 }
 
 func versionCheckClient(proxyCfg config.ProxyConfig, force bool) *http.Client {

@@ -52,6 +52,9 @@ func TestUpstreamConfigWithDefaultsFillsTimeoutBudgets(t *testing.T) {
 	if cfg.HealthProbeTimeoutSeconds != DefaultHealthProbeTimeoutSeconds {
 		t.Fatalf("health probe timeout = %d, want %d", cfg.HealthProbeTimeoutSeconds, DefaultHealthProbeTimeoutSeconds)
 	}
+	if cfg.TemporaryFailureCooldownSeconds != DefaultTemporaryFailureCooldownSeconds {
+		t.Fatalf("temporary failure cooldown = %d, want %d", cfg.TemporaryFailureCooldownSeconds, DefaultTemporaryFailureCooldownSeconds)
+	}
 	// 自定义值必须被保留，不能被默认值覆盖。
 	custom := UpstreamConfig{StreamFirstEventTimeoutSeconds: 120, HealthProbeTimeoutSeconds: 45}.WithDefaults()
 	if custom.StreamFirstEventTimeoutSeconds != 120 || custom.HealthProbeTimeoutSeconds != 45 {

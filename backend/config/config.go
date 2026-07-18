@@ -207,10 +207,10 @@ type ProxyConfig struct {
 }
 
 const (
-	DefaultUpstreamTimeoutSeconds = 30
-	DefaultCodexOriginator        = "codex_cli_rs"
-	DefaultCodexVersion           = "0.144.1"
-	DefaultUpstreamUserAgent      = DefaultCodexOriginator + "/" + DefaultCodexVersion + " (Ubuntu 22.4.0; x86_64) xterm-256color"
+	DefaultUpstreamTimeoutSeconds  = 30
+	DefaultCodexOriginator         = "codex_cli_rs"
+	DefaultCodexVersion            = "0.144.1"
+	DefaultUpstreamUserAgent       = DefaultCodexOriginator + "/" + DefaultCodexVersion + " (Ubuntu 22.4.0; x86_64) xterm-256color"
 	legacyDefaultUpstreamUserAgent = "upstream-ops/0.1"
 	// DefaultStreamFirstEventTimeoutSeconds 是"等上游吐出第一个可见生成事件"的窗口。
 	// 推理模型（gpt-5.5/5.6 等）在真正出字前会先经历 reasoning 阶段，常需 5-30s，
@@ -226,6 +226,10 @@ const (
 	// 只测 <=0.1 倍率的低倍率/公益渠道，避免全量测活把高倍率渠道也烧一遍。
 	// 明确勾选分组测活时不套用此上限（见 gateway.OneClickHealthTestOptions）。
 	DefaultHealthProbeMaxRatio = 0.1
+	// DefaultTemporaryFailureCooldownSeconds 是真实上游故障（503、内容拦截、
+	// 网络错误等）首次出现后退出调度池的默认时长。与 Sub2API 的临时不可调度
+	// 语义一致：冷却期间不再把用户请求发送给该上游。
+	DefaultTemporaryFailureCooldownSeconds = 300
 )
 
 // DefaultOpenAIHealthProbeModels 是 OpenAI 渠道一键测活默认依次尝试的模型：
@@ -237,7 +241,7 @@ type UpstreamConfig struct {
 	TimeoutSeconds int    `mapstructure:"timeoutSeconds" yaml:"timeoutSeconds" json:"timeoutSeconds"`
 	UserAgent      string `mapstructure:"userAgent" yaml:"userAgent" json:"userAgent"`
 	// StreamFirstEventTimeoutSeconds 覆盖流式请求等待首个可见生成事件的秒数。<=0 时取默认值。
-	StreamFirstEventTimeoutSeconds int                    `mapstructure:"streamFirstEventTimeoutSeconds" yaml:"streamFirstEventTimeoutSeconds" json:"streamFirstEventTimeoutSeconds"`
+	StreamFirstEventTimeoutSeconds int `mapstructure:"streamFirstEventTimeoutSeconds" yaml:"streamFirstEventTimeoutSeconds" json:"streamFirstEventTimeoutSeconds"`
 	// HealthProbeTimeoutSeconds 覆盖测活等待可见生成事件的秒数。<=0 时取默认值。
 	HealthProbeTimeoutSeconds int `mapstructure:"healthProbeTimeoutSeconds" yaml:"healthProbeTimeoutSeconds" json:"healthProbeTimeoutSeconds"`
 	// HealthProbeModels 是一键测活/定时测活对 OpenAI 渠道按顺序尝试的模型清单。
@@ -248,8 +252,11 @@ type UpstreamConfig struct {
 	// HealthProbeMaxRatio 是"全量兜底扫描"（不指定分组的一键测活 / 定时任务）用来
 	// 控制成本的倍率上限：只测有效倍率 <= 该值的低倍率/公益渠道。<=0 时取默认值。
 	// 明确勾选分组的一键测活不受此限制（尊重用户意图，见 OneClickHealthTestOptions）。
-	HealthProbeMaxRatio float64                `mapstructure:"healthProbeMaxRatio" yaml:"healthProbeMaxRatio" json:"healthProbeMaxRatio"`
-	RequestRectifier    RequestRectifierConfig `mapstructure:"requestRectifier" yaml:"requestRectifier" json:"requestRectifier"`
+	HealthProbeMaxRatio float64 `mapstructure:"healthProbeMaxRatio" yaml:"healthProbeMaxRatio" json:"healthProbeMaxRatio"`
+	// TemporaryFailureCooldownSeconds 控制请求转发中真实上游故障的临时不可调度时长。
+	// <=0 时使用默认 300 秒；明确的 Retry-After 仍优先使用上游给出的时间。
+	TemporaryFailureCooldownSeconds int                    `mapstructure:"temporaryFailureCooldownSeconds" yaml:"temporaryFailureCooldownSeconds" json:"temporaryFailureCooldownSeconds"`
+	RequestRectifier                RequestRectifierConfig `mapstructure:"requestRectifier" yaml:"requestRectifier" json:"requestRectifier"`
 }
 
 type RequestRectifierConfig struct {
@@ -272,6 +279,9 @@ func (u UpstreamConfig) WithDefaults() UpstreamConfig {
 	}
 	if u.HealthProbeMaxRatio <= 0 {
 		u.HealthProbeMaxRatio = DefaultHealthProbeMaxRatio
+	}
+	if u.TemporaryFailureCooldownSeconds <= 0 {
+		u.TemporaryFailureCooldownSeconds = DefaultTemporaryFailureCooldownSeconds
 	}
 	// 清洗测活模型清单：去空白、去重、丢弃空串；清洗后为空则回退内置默认清单。
 	// 这样前端传来的脏数据（空行、重复模型）不会污染探测顺序，也保证探测清单永不为空。
@@ -501,6 +511,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("upstream.healthProbeTimeoutSeconds", DefaultHealthProbeTimeoutSeconds)
 	v.SetDefault("upstream.healthProbeModels", DefaultOpenAIHealthProbeModels)
 	v.SetDefault("upstream.healthProbeMaxRatio", DefaultHealthProbeMaxRatio)
+	v.SetDefault("upstream.temporaryFailureCooldownSeconds", DefaultTemporaryFailureCooldownSeconds)
 	v.SetDefault("app.homepageCheapestEnabled", true)
 	v.SetDefault("upstream.requestRectifier.enabled", true)
 	v.SetDefault("upstream.requestRectifier.thinkingSignature", true)

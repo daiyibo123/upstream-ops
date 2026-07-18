@@ -746,18 +746,25 @@ func (r *UsageLogs) Update(id uint, updates map[string]any) error {
 
 // List 分页返回使用记录，按时间倒序。
 func (r *UsageLogs) List(limit, offset int) ([]UsageLog, int64, error) {
+	return r.ListView(limit, offset, "all")
+}
+
+// ListView keeps successful usage separate from dispatch/error diagnostics,
+// matching Sub2API's usage/error tabs while preserving the same storage table.
+func (r *UsageLogs) ListView(limit, offset int, view string) ([]UsageLog, int64, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 	if offset < 0 {
 		offset = 0
 	}
+	query := usageLogViewQuery(r.db.Model(&UsageLog{}), view)
 	var total int64
-	if err := r.db.Model(&UsageLog{}).Count(&total).Error; err != nil {
+	if err := query.Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 	var list []UsageLog
-	if err := r.db.Order("created_at DESC, id DESC").Limit(limit).Offset(offset).Find(&list).Error; err != nil {
+	if err := usageLogViewQuery(r.db.Model(&UsageLog{}), view).Order("created_at DESC, id DESC").Limit(limit).Offset(offset).Find(&list).Error; err != nil {
 		return nil, 0, err
 	}
 	return list, total, nil
@@ -766,8 +773,12 @@ func (r *UsageLogs) List(limit, offset int) ([]UsageLog, int64, error) {
 // Stats 汇总当前保留的全部使用明细。平均耗时忽略尚未产生有效耗时的零值记录，
 // 避免正在调度中的请求把延迟指标人为拉低。
 func (r *UsageLogs) Stats() (UsageLogStats, error) {
+	return r.StatsView("all")
+}
+
+func (r *UsageLogs) StatsView(view string) (UsageLogStats, error) {
 	var stats UsageLogStats
-	err := r.db.Model(&UsageLog{}).Select(`
+	err := usageLogViewQuery(r.db.Model(&UsageLog{}), view).Select(`
 		COUNT(*) AS total_requests,
 		COALESCE(SUM(CASE WHEN status IN ('success', 'estimated') THEN 1 ELSE 0 END), 0) AS success_requests,
 		COALESCE(SUM(total_tokens), 0) AS total_tokens,
@@ -775,6 +786,17 @@ func (r *UsageLogs) Stats() (UsageLogStats, error) {
 		COALESCE(AVG(CASE WHEN duration_ms > 0 THEN duration_ms END), 0) AS avg_duration_ms
 	`).Scan(&stats).Error
 	return stats, err
+}
+
+func usageLogViewQuery(query *gorm.DB, view string) *gorm.DB {
+	switch strings.ToLower(strings.TrimSpace(view)) {
+	case "usage", "success":
+		return query.Where("status IN ?", []string{"success", "estimated"})
+	case "events", "errors", "dispatch":
+		return query.Where("status NOT IN ?", []string{"success", "estimated"})
+	default:
+		return query
+	}
 }
 
 // DeleteOlderThan 清理指定时间点之前的记录，返回删除条数。

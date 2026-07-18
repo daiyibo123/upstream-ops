@@ -19,6 +19,7 @@ import { dateTime, formatPercent, formatRatio, formatTokens, relativeTime } from
 import type { UsageLogsResponse } from "@/lib/api-types"
 
 const PAGE_SIZE = 50
+type DetailView = "usage" | "events"
 
 function cacheRateLabel(rate: number | null | undefined, promptTokens: number | null | undefined) {
   if (!promptTokens || promptTokens <= 0) return "—"
@@ -85,14 +86,12 @@ export default function UsagePage() {
   const [clearing, setClearing] = useState(false)
   const [page, setPage] = useState(1)
   const [refreshTick, setRefreshTick] = useState(0)
+  const [detailView, setDetailView] = useState<DetailView>("usage")
 
   const items = data?.items ?? []
   const keys = data?.keys ?? []
   const total = data?.total ?? 0
   const stats = data?.stats
-  const successRate = stats && stats.total_requests > 0
-    ? stats.success_requests / stats.total_requests
-    : 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const rangeStart = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1
   const rangeEnd = Math.min(page * PAGE_SIZE, total)
@@ -101,7 +100,7 @@ export default function UsagePage() {
     let cancelled = false
     setLoading(true)
     const offset = (page - 1) * PAGE_SIZE
-    apiFetch<UsageLogsResponse>(`/gateway/usage-logs?limit=${PAGE_SIZE}&offset=${offset}`)
+    apiFetch<UsageLogsResponse>(`/gateway/usage-logs?view=${detailView}&limit=${PAGE_SIZE}&offset=${offset}`)
       .then((res) => {
         if (!cancelled) setData(res)
       })
@@ -114,7 +113,7 @@ export default function UsagePage() {
     return () => {
       cancelled = true
     }
-  }, [page, refreshTick])
+  }, [detailView, page, refreshTick])
 
   const rows = useMemo(() => items, [items])
   const keyRows = useMemo(
@@ -174,9 +173,9 @@ export default function UsagePage() {
             tone: "border-brand/20 bg-brand/5 text-brand",
           },
           {
-            label: "完成率",
-            value: stats?.total_requests ? formatPercent(successRate) : "—",
-            detail: `${stats?.success_requests ?? 0} 次完成`,
+            label: "成功请求",
+            value: (stats?.success_requests ?? stats?.total_requests ?? 0).toLocaleString("zh-CN"),
+            detail: "失败与切换单独归入调度事件",
             icon: CircleCheckBig,
             tone: "border-success/20 bg-success/5 text-success",
           },
@@ -303,9 +302,33 @@ export default function UsagePage() {
         <CardHeader className="flex flex-row items-center justify-between pb-3">
           <CardTitle className="flex items-center gap-2 text-base font-semibold">
             <ScrollText className="size-4 text-brand" />
-            调用明细
+            {detailView === "usage" ? "用量明细" : "调度事件"}
           </CardTitle>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <div className="flex rounded-md border border-border bg-muted/20 p-0.5">
+              <Button
+                variant={detailView === "usage" ? "secondary" : "ghost"}
+                size="sm"
+                className="h-7 px-2 text-xs"
+                onClick={() => {
+                  setDetailView("usage")
+                  setPage(1)
+                }}
+              >
+                用量明细
+              </Button>
+              <Button
+                variant={detailView === "events" ? "secondary" : "ghost"}
+                size="sm"
+                className="h-7 px-2 text-xs"
+                onClick={() => {
+                  setDetailView("events")
+                  setPage(1)
+                }}
+              >
+                调度事件
+              </Button>
+            </div>
             <Badge variant="outline" className="border-border bg-muted/40 text-muted-foreground">
               共 {total} 条
             </Badge>
@@ -359,7 +382,7 @@ export default function UsagePage() {
                 ) : rows.length === 0 ? (
                   <TableRow>
                   <TableCell colSpan={9} className="h-24 text-center text-xs text-muted-foreground">
-                      还没有使用记录
+                      {detailView === "usage" ? "还没有成功用量记录" : "当前没有调度异常事件"}
                     </TableCell>
                   </TableRow>
                 ) : (

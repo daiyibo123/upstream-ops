@@ -64,20 +64,19 @@ const (
 	// 24 事件 / 96KB，覆盖拦截文案出现在稍靠后位置（前面先吐了少量 reasoning/占位）
 	// 的情况，让"公益token休息了 / 当前没有可用上游"等软失败仍能在写首字节前被拦下并
 	// 丝滑切换到下一个候选，而不是把这句话直接透传给 Codex 造成断流。
-	streamPreflightMaxEvents       = 24
-	streamPreflightMaxBytes        = 96 << 10
-	proxyTransientFailureThreshold = 3
-	proxyFastFailoverCooldown      = 20 * time.Second
-	proxyTransientFailureCooldown  = 45 * time.Second
-	proxyServerErrorCooldown       = 60 * time.Second
-	proxyTimeoutCooldown           = 75 * time.Second
-	proxyNetworkErrorCooldown      = 30 * time.Second
-	proxyRateLimitCooldown         = 90 * time.Second
-	proxyPermanentFailureCooldown  = 30 * time.Minute
-	modelSupportPositiveTTL        = 2 * time.Hour
-	modelSupportNegativeTTL        = 15 * time.Minute
-	defaultHealthProbeBatchSize    = 10
-	automaticHealthProbeMaxRatio   = 0.1
+	streamPreflightMaxEvents        = 24
+	streamPreflightMaxBytes         = 96 << 10
+	healthTransientFailureThreshold = 3
+	healthTransientFailureCooldown  = 45 * time.Second
+	healthServerErrorCooldown       = 60 * time.Second
+	healthTimeoutCooldown           = 75 * time.Second
+	healthNetworkErrorCooldown      = 30 * time.Second
+	healthRateLimitCooldown         = 90 * time.Second
+	proxyPermanentFailureCooldown   = 30 * time.Minute
+	modelSupportPositiveTTL         = 2 * time.Hour
+	modelSupportNegativeTTL         = 15 * time.Minute
+	defaultHealthProbeBatchSize     = 10
+	automaticHealthProbeMaxRatio    = 0.1
 
 	openAIHealthProbePrimaryModel  = "gpt-5.4"
 	openAIHealthProbeFallbackModel = "gpt-5.5"
@@ -870,11 +869,15 @@ func usageLogModel(request normalizedRequest, usage usageTokens) string {
 }
 
 // ListUsageLogs 分页返回使用记录。
-func (s *Service) ListUsageLogs(limit, offset int) ([]storage.UsageLog, int64, error) {
+func (s *Service) ListUsageLogs(limit, offset int, views ...string) ([]storage.UsageLog, int64, error) {
 	if s.usageLogs == nil {
 		return []storage.UsageLog{}, 0, nil
 	}
-	items, total, err := s.usageLogs.List(limit, offset)
+	view := "all"
+	if len(views) > 0 {
+		view = views[0]
+	}
+	items, total, err := s.usageLogs.ListView(limit, offset, view)
 	if err != nil || len(items) == 0 || s.groupKeys == nil {
 		return items, total, err
 	}
@@ -916,11 +919,15 @@ func (s *Service) ListUsageLogs(limit, offset int) ([]storage.UsageLog, int64, e
 }
 
 // UsageLogStats 返回当前保留使用明细的聚合指标。
-func (s *Service) UsageLogStats() (storage.UsageLogStats, error) {
+func (s *Service) UsageLogStats(views ...string) (storage.UsageLogStats, error) {
 	if s.usageLogs == nil {
 		return storage.UsageLogStats{}, nil
 	}
-	return s.usageLogs.Stats()
+	view := "all"
+	if len(views) > 0 {
+		view = views[0]
+	}
+	return s.usageLogs.StatsView(view)
 }
 
 func usageLogGroupIdentity(channelID uint, groupName string) string {
@@ -2971,7 +2978,6 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		s.rememberCandidateModelCapability(candidate.ID, requestedModel, false)
 		modelUnsupportedFailures++
 	}
-	var cooldownFallback []storage.UpstreamGroupKey
 	delayedSameGroupFallback := make([]storage.UpstreamGroupKey, 0)
 	delayedDispatchGroups := map[string]struct{}{}
 	delayDispatchGroup := func(candidate storage.UpstreamGroupKey) {
@@ -2993,16 +2999,12 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		if until, ok := candidateCooldownUntil(candidate, now); ok {
 			message := cooldownMessage(candidate, until)
 			disabledSeen = append(disabledSeen, message)
-			cooldownFallback = append(cooldownFallback, candidate)
-			s.recordDispatchSkipLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, "cooldown", message)
 			delayDispatchGroup(candidate)
 			continue
 		}
 		if until, ok := s.runtimeDisabledUntil(candidate.ID); ok {
 			message := cooldownMessage(candidate, until)
 			disabledSeen = append(disabledSeen, message)
-			cooldownFallback = append(cooldownFallback, candidate)
-			s.recordDispatchSkipLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, "cooldown", message)
 			delayDispatchGroup(candidate)
 			continue
 		}
@@ -3057,15 +3059,11 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			if until, ok := candidateCooldownUntil(candidate, time.Now()); ok {
 				message := cooldownMessage(candidate, until)
 				disabledSeen = append(disabledSeen, message)
-				cooldownFallback = append(cooldownFallback, candidate)
-				s.recordDispatchSkipLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, "cooldown", message)
 				continue
 			}
 			if until, ok := s.runtimeDisabledUntil(candidate.ID); ok {
 				message := cooldownMessage(candidate, until)
 				disabledSeen = append(disabledSeen, message)
-				cooldownFallback = append(cooldownFallback, candidate)
-				s.recordDispatchSkipLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, "cooldown", message)
 				continue
 			}
 			dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
@@ -3100,48 +3098,6 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			}
 		}
 	}
-	if len(cooldownFallback) > 0 && candidateScopeFallbackAllowed(gatewayKey, candidates) {
-		cooldownFallback = s.orderCooldownFallbackCandidates(filterCooldownFallbackCandidates(cooldownFallback), requestedModel)
-		if msg := cooldownFallbackMessage(cooldownFallback); msg != "" && s.log != nil {
-			s.log.Warn("gateway probing cooldown upstream groups", "scope", gatewayKeyScopeLabel(gatewayKey), "message", msg)
-		}
-		for i := range cooldownFallback {
-			candidate := cooldownFallback[i]
-			dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
-			outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
-			switch outcome.kind {
-			case candSuccess:
-				s.finishDispatchLog(dispatchLog, outcome.logStatus, outcome.errMsg, outcome.usage)
-				return nil
-			case candSaturated:
-				s.finishDispatchLog(dispatchLog, "saturated", "candidate is at concurrency limit", usageTokens{})
-				saturatedSeen = append(saturatedSeen, fmt.Sprintf("%s/%s", candidate.ChannelName, candidate.GroupName))
-				continue
-			case candRetryable:
-				s.finishDispatchLog(dispatchLog, "switched", outcome.errMsg, usageTokens{})
-				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
-				rememberUnsupportedModel(candidate, outcome.errMsg)
-				// The candidate is already in a cooldown window.  This early
-				// rescue probe is allowed so a recovered upstream can come back
-				// immediately, but a failed rescue must not keep extending the
-				// cooldown under user traffic; the original failure already
-				// accounted for it, and the next normal attempt after cooldown
-				// will record a fresh failure if the upstream is still bad.
-				continue
-			case candFatal:
-				s.finishDispatchLog(dispatchLog, "failed", outcome.errMsg, usageTokens{})
-				errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
-				rememberUnsupportedModel(candidate, outcome.errMsg)
-				finalErr = outcome.err
-			}
-			if finalErr != nil {
-				break
-			}
-		}
-		if finalErr != nil {
-			return finalErr
-		}
-	}
 	message := "all upstream group keys failed: " + strings.Join(errorsSeen, " | ")
 	if requestedModel != "" && len(errorsSeen) > 0 && modelUnsupportedFailures == len(errorsSeen) &&
 		len(saturatedSeen) == 0 && len(disabledSeen) == 0 {
@@ -3155,6 +3111,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	} else if len(disabledSeen) > 0 {
 		message += " | temporarily unavailable: " + strings.Join(disabledSeen, " | ")
 	}
+	s.recordDispatchSkipLog(gatewayKey, nil, requestedModel, normalized.ClientIP, "failed", message)
 	return failGatewayRequest(http.StatusServiceUnavailable, "upstream_unavailable", message)
 }
 
@@ -5665,8 +5622,11 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 }
 
 func (s *Service) markProxyFailure(id uint, msg string) {
+	if !shouldMarkProxyFailure(msg) {
+		return
+	}
 	status := proxyFailureStatus(msg)
-	policy := s.proxyFailurePolicy(id, status, msg)
+	policy := s.proxyFailurePolicy(status, msg)
 	persistedStatus := status
 	// A one-off connect reset, timeout, 5xx, or 429 says little about a route's
 	// permanent health. Preserve per-key diagnostics and any short cooldown, but
@@ -5723,41 +5683,15 @@ func shouldDelaySameDispatchGroupAfterFailure(msg string) bool {
 	return !looksLikeClientRequestError(msg)
 }
 
-func shouldFastCooldownProxyFailure(msg string) bool {
-	lower := strings.ToLower(strings.TrimSpace(msg))
-	if lower == "" {
-		return false
-	}
-	// 慢首字节不再进入任何冷却：调用方 shouldMarkProxyFailure 已对它返回 false，
-	// 这里同样不把它当作"该快速冷却"的失败，保持纵深一致，避免推理模型被误伤。
-	for _, marker := range []string{
-		"response content intercepted",
-		"completed before generating usable output",
-		"ended before sending a usable generation event",
-		"ended before sending a usable event",
-		"ended before response.completed",
-		"did not send a usable generation event",
-		"did not send a usable event",
-	} {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
-}
-
 type proxyFailurePolicy struct {
 	cooldown   time.Duration
 	disableKey bool
 }
 
-func (s *Service) proxyFailurePolicy(id uint, status string, msg string) proxyFailurePolicy {
-	if shouldFastCooldownProxyFailure(msg) {
-		return proxyFailurePolicy{cooldown: proxyFastFailoverCooldown}
-	}
+func (s *Service) proxyFailurePolicy(status string, msg string) proxyFailurePolicy {
 	switch status {
 	case "rate_limited":
-		delay := proxyRateLimitCooldown
+		delay := s.temporaryFailureCooldown()
 		if hinted, ok := retryAfterDurationFromText(msg, time.Now()); ok {
 			delay = hinted
 		}
@@ -5767,19 +5701,15 @@ func (s *Service) proxyFailurePolicy(id uint, status string, msg string) proxyFa
 	case "forbidden":
 		return proxyFailurePolicy{cooldown: proxyPermanentFailureCooldown}
 	}
-	current, err := s.groupKeys.FindByID(id)
-	if err != nil || current == nil {
-		return proxyFailurePolicy{}
+	return proxyFailurePolicy{cooldown: s.temporaryFailureCooldown()}
+}
+
+func (s *Service) temporaryFailureCooldown() time.Duration {
+	seconds := s.upstreamConfig().TemporaryFailureCooldownSeconds
+	if seconds <= 0 {
+		seconds = config.DefaultTemporaryFailureCooldownSeconds
 	}
-	nextFailures := current.FailureCount + 1
-	if nextFailures < proxyTransientFailureThreshold {
-		return proxyFailurePolicy{}
-	}
-	delay := proxyTransientCooldownBase(status) * time.Duration(nextFailures-proxyTransientFailureThreshold+1)
-	if delay > 3*time.Minute {
-		delay = 3 * time.Minute
-	}
-	return proxyFailurePolicy{cooldown: delay}
+	return time.Duration(seconds) * time.Second
 }
 
 func clampProxyCooldown(delay, minDelay, maxDelay time.Duration) time.Duration {
@@ -5793,19 +5723,6 @@ func clampProxyCooldown(delay, minDelay, maxDelay time.Duration) time.Duration {
 		return maxDelay
 	}
 	return delay
-}
-
-func proxyTransientCooldownBase(status string) time.Duration {
-	switch status {
-	case "server_error":
-		return proxyServerErrorCooldown
-	case "timeout":
-		return proxyTimeoutCooldown
-	case "network_error":
-		return proxyNetworkErrorCooldown
-	default:
-		return proxyTransientFailureCooldown
-	}
 }
 
 func proxyFailureStatus(msg string) string {
@@ -5939,20 +5856,33 @@ func (s *Service) markHealthInconclusive(id uint, msg string, latencyMS int64) {
 func healthFailureCooldown(status string, nextFailures int) time.Duration {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "rate_limited":
-		return proxyRateLimitCooldown
+		return healthRateLimitCooldown
 	case "zero_balance", "forbidden", "auth_failed":
 		return proxyPermanentFailureCooldown
 	case "invalid_request", "model_error", "non_generation":
 		return 0
 	}
-	if nextFailures < proxyTransientFailureThreshold {
+	if nextFailures < healthTransientFailureThreshold {
 		return 0
 	}
-	delay := proxyTransientCooldownBase(status) * time.Duration(nextFailures-proxyTransientFailureThreshold+1)
+	delay := healthTransientCooldownBase(status) * time.Duration(nextFailures-healthTransientFailureThreshold+1)
 	if delay > 3*time.Minute {
 		delay = 3 * time.Minute
 	}
 	return delay
+}
+
+func healthTransientCooldownBase(status string) time.Duration {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "server_error":
+		return healthServerErrorCooldown
+	case "timeout":
+		return healthTimeoutCooldown
+	case "network_error":
+		return healthNetworkErrorCooldown
+	default:
+		return healthTransientFailureCooldown
+	}
 }
 
 func normalizeProxyRequest(r *http.Request, path string, body []byte) (normalizedRequest, error) {
@@ -10967,49 +10897,6 @@ func temporaryCooldownFallbackCandidate(candidate storage.UpstreamGroupKey) bool
 	}
 }
 
-func (s *Service) orderCooldownFallbackCandidates(candidates []storage.UpstreamGroupKey, model string) []storage.UpstreamGroupKey {
-	// Cooldown rescue follows the same charity/cost/capability policy as normal
-	// dispatch. The cooldown timestamp is diagnostic state, not permission to
-	// jump an expensive route ahead of a cheaper fallback.
-	return s.orderCandidatesWithRuntime(candidates, model)
-}
-
-func cooldownFallbackMessage(candidates []storage.UpstreamGroupKey) string {
-	if len(candidates) == 0 {
-		return ""
-	}
-	names := make([]string, 0, minInt(3, len(candidates)))
-	for i, candidate := range candidates {
-		if i >= 3 {
-			break
-		}
-		name := strings.TrimSpace(candidate.ChannelName + "/" + candidate.GroupName)
-		if name == "/" {
-			name = fmt.Sprintf("#%d", candidate.ID)
-		}
-		names = append(names, name)
-	}
-	return "all matching upstream groups are cooling down; probing fallback: " + strings.Join(names, " | ")
-}
-
-func anyCharityCandidate(candidates []storage.UpstreamGroupKey) bool {
-	for _, candidate := range candidates {
-		if candidate.Charity {
-			return true
-		}
-	}
-	return false
-}
-
-func anyNormalCandidate(candidates []storage.UpstreamGroupKey) bool {
-	for _, candidate := range candidates {
-		if !candidate.Charity {
-			return true
-		}
-	}
-	return false
-}
-
 func gatewayKeyScopeEmptyMessage(key *storage.GatewayKey) string {
 	if key == nil {
 		return "no alive upstream group keys available"
@@ -11028,49 +10915,6 @@ func gatewayKeyScopeEmptyMessage(key *storage.GatewayKey) string {
 	default:
 		return "no alive upstream group keys available"
 	}
-}
-
-func gatewayKeyScopeLabel(key *storage.GatewayKey) string {
-	if key == nil {
-		return "all"
-	}
-	switch normalizeGatewayGroupScope(key.AllowedGroupScope, decodeUintList(key.AllowedGroupIDs)) {
-	case gatewayGroupScopeSelected:
-		return "selected"
-	case gatewayGroupScopeCharity:
-		return "charity"
-	case gatewayGroupScopeNormal:
-		return "non-charity"
-	default:
-		return "all"
-	}
-}
-
-func candidateScopeFallbackAllowed(key *storage.GatewayKey, candidates []storage.UpstreamGroupKey) bool {
-	scope := normalizeGatewayGroupScope("", nil)
-	if key != nil {
-		scope = normalizeGatewayGroupScope(key.AllowedGroupScope, decodeUintList(key.AllowedGroupIDs))
-	}
-	switch scope {
-	case gatewayGroupScopeCharity:
-		return anyCharityCandidate(candidates)
-	case gatewayGroupScopeNormal:
-		return anyNormalCandidate(candidates)
-	case gatewayGroupScopeSelected:
-		return len(candidates) > 0
-	default:
-		return len(candidates) > 0
-	}
-}
-
-func filterCooldownFallbackCandidates(candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
-	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
-	for _, candidate := range candidates {
-		if temporaryCooldownFallbackCandidate(candidate) {
-			out = append(out, candidate)
-		}
-	}
-	return out
 }
 
 func filterCandidatesForClientFormat(keyFormat, responseMode string, candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {

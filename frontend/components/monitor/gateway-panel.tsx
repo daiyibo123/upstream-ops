@@ -753,11 +753,6 @@ function keyUsageStatusText(key: GatewayKey) {
   return "启用中"
 }
 
-function isOpenAIGatewayKey(key: GatewayKey) {
-  const format = normalizeClientFormat(key.client_format)
-  return format === "openai"
-}
-
 function KeyDraftFields({
   draft,
   groups,
@@ -851,9 +846,14 @@ function KeyDraftFields({
               <SelectValue placeholder="选择格式" />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="openai">OpenAI</SelectItem>
+              <SelectItem value="openai">OpenAI（Responses / Chat）</SelectItem>
+              <SelectItem value="claude">Claude（Messages）</SelectItem>
+              <SelectItem value="grok">Grok（Chat Completions）</SelectItem>
             </SelectContent>
           </Select>
+          <p className="text-[11px] leading-5 text-muted-foreground">
+            Key 只会调度同格式渠道；Grok 使用 OpenAI 兼容的 Chat Completions 请求。
+          </p>
         </div>
       </div>
 
@@ -1176,10 +1176,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [disableMessage, setDisableMessage] = useState("此调用 Key 已停用，请联系管理员。")
   const [disableOpen, setDisableOpen] = useState(false)
 
-  const displayKeys = useMemo(
-    () => keys.filter(isOpenAIGatewayKey),
-    [keys],
-  )
+  const displayKeys = keys
   const displayGroups = useMemo(() => {
     const channelByID = new Map(channels.map((channel) => [channel.id, channel]))
     return groups.map((group) => {
@@ -2178,7 +2175,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             <div className="mb-2 flex items-center justify-between gap-2">
               <div>
                 <p className="text-xs font-medium text-foreground">已有调用 Key</p>
-                <span className="text-[11px] text-muted-foreground">OpenAI Bearer Key · {filteredKeys.length}/{displayKeys.length} 个</span>
+                <span className="text-[11px] text-muted-foreground">OpenAI / Claude / Grok 调用 Key · {filteredKeys.length}/{displayKeys.length} 个</span>
               </div>
               <div className="flex gap-2">
                 <Button size="sm" variant="outline" className="h-8 gap-1.5 text-xs" disabled={!!busy} onClick={() => setDisableOpen(true)}>

@@ -73,6 +73,7 @@ function withConfigDefaults(cfg: SystemConfig): SystemConfig {
   const upstream = cfg.upstream as SystemConfig["upstream"] & {
     healthProbeModels?: string[];
     healthProbeMaxRatio?: number;
+    temporaryFailureCooldownSeconds?: number;
   };
   return {
     ...cfg,
@@ -100,6 +101,7 @@ function withConfigDefaults(cfg: SystemConfig): SystemConfig {
           ? upstream.healthProbeModels
           : ["gpt-5.4", "gpt-5.5"],
       healthProbeMaxRatio: upstream.healthProbeMaxRatio ?? 0.1,
+      temporaryFailureCooldownSeconds: upstream.temporaryFailureCooldownSeconds ?? 300,
     },
   };
 }
@@ -1407,6 +1409,33 @@ export default function SettingsPage() {
                                 ...prev.app.routeAffinity,
                                 promoteMinSavingsRatio: Number(e.target.value || 0),
                               },
+                            },
+                          }
+                        : prev,
+                    )
+                  }
+                />
+              </Field>
+            </div>
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <Field
+                label="临时不可调度时间（秒）"
+                description="上游返回 503、命中内容拦截或发生网络错误后，立即退出调度池的时间。默认 300 秒；冷却期间不会再用用户请求探测该渠道。上游明确返回 Retry-After 时优先遵循上游时间。"
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  max={86400}
+                  step={30}
+                  value={String(form.upstream.temporaryFailureCooldownSeconds ?? 300)}
+                  onChange={(e) =>
+                    setForm((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            upstream: {
+                              ...prev.upstream,
+                              temporaryFailureCooldownSeconds: Math.max(1, Number(e.target.value || 300)),
                             },
                           }
                         : prev,

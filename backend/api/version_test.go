@@ -73,8 +73,8 @@ func TestVersionEndpointFallsBackToRunningVersionOnGitHubError(t *testing.T) {
 	if resp.LatestVersion != global.VERSION || resp.UpdateAvailable {
 		t.Fatalf("github failure should show current version as latest, got %#v", resp)
 	}
-	if strings.TrimSpace(resp.UpdateError) != "" {
-		t.Fatalf("update_error = %q, want hidden fallback", resp.UpdateError)
+	if strings.TrimSpace(resp.UpdateError) == "" {
+		t.Fatal("update_error should explain that both version sources failed")
 	}
 	if resp.Version != global.VERSION {
 		t.Fatalf("version = %q, want %s", resp.Version, global.VERSION)
@@ -85,7 +85,7 @@ func TestVersionEndpointHidesGitHub403AsCurrentVersion(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	withGitHubReleaseServer(t, http.StatusForbidden, `{"message":"API rate limit exceeded"}`)
 	resp := requestVersion(t)
-	if resp.LatestVersion != global.VERSION || resp.UpdateAvailable || resp.UpdateError != "" {
+	if resp.LatestVersion != global.VERSION || resp.UpdateAvailable || strings.TrimSpace(resp.UpdateError) == "" {
 		t.Fatalf("403 fallback = %#v", resp)
 	}
 }
@@ -127,6 +127,36 @@ func TestVersionEndpointFallsBackToLatestTagWhenReleaseMissing(t *testing.T) {
 	}
 }
 
+func TestVersionEndpointUsesCDNFallbackWhenGitHubAPIUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/release", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	})
+	mux.HandleFunc("/version.go", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("package global\n\nvar VERSION = \"999.0.2\"\n"))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	oldReleaseURL := githubLatestReleaseURL
+	oldFallbackURL := versionFallbackURL
+	oldClient := githubReleaseClient
+	githubLatestReleaseURL = srv.URL + "/release"
+	versionFallbackURL = srv.URL + "/version.go"
+	githubReleaseClient = srv.Client()
+	t.Cleanup(func() {
+		githubLatestReleaseURL = oldReleaseURL
+		versionFallbackURL = oldFallbackURL
+		githubReleaseClient = oldClient
+	})
+
+	resp := requestVersion(t)
+	if !resp.UpdateAvailable || resp.LatestVersion != "v999.0.2" || !strings.HasSuffix(resp.ReleaseURL, "/v999.0.2") {
+		t.Fatalf("cdn fallback response = %#v", resp)
+	}
+}
+
 func TestVersionCheckClientRespectsVersionProxyToggle(t *testing.T) {
 	oldClient := githubReleaseClient
 	sentinel := &http.Client{}
@@ -157,11 +187,14 @@ func withGitHubReleaseServer(t *testing.T, status int, body string) {
 	t.Cleanup(srv.Close)
 
 	oldURL := githubLatestReleaseURL
+	oldFallbackURL := versionFallbackURL
 	oldClient := githubReleaseClient
 	githubLatestReleaseURL = srv.URL
+	versionFallbackURL = srv.URL
 	githubReleaseClient = srv.Client()
 	t.Cleanup(func() {
 		githubLatestReleaseURL = oldURL
+		versionFallbackURL = oldFallbackURL
 		githubReleaseClient = oldClient
 	})
 }

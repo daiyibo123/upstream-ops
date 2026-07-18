@@ -123,6 +123,18 @@ func TestUsageLogsStats(t *testing.T) {
 	if stats.AvgFirstTokenMS != 200 || stats.AvgDurationMS != 400 {
 		t.Fatalf("unexpected usage log averages: %#v", stats)
 	}
+	usageItems, usageTotal, err := logs.ListView(50, 0, "usage")
+	if err != nil || usageTotal != 2 || len(usageItems) != 2 {
+		t.Fatalf("usage view = total %d items %#v err %v", usageTotal, usageItems, err)
+	}
+	eventItems, eventTotal, err := logs.ListView(50, 0, "events")
+	if err != nil || eventTotal != 1 || len(eventItems) != 1 || eventItems[0].Status != "failed" {
+		t.Fatalf("events view = total %d items %#v err %v", eventTotal, eventItems, err)
+	}
+	usageStats, err := logs.StatsView("usage")
+	if err != nil || usageStats.TotalRequests != 2 || usageStats.SuccessRequests != 2 || usageStats.TotalTokens != 50 {
+		t.Fatalf("usage-only stats = %#v err %v", usageStats, err)
+	}
 }
 
 func TestIPPolicyUpsertUpdatesBlockedMessage(t *testing.T) {

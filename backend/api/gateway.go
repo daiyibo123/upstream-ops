@@ -385,12 +385,13 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 	gp.GET("/usage-logs", func(c *gin.Context) {
 		limit := atoiDefault(c.Query("limit"), 50)
 		offset := atoiDefault(c.Query("offset"), 0)
-		items, total, err := d.Gateway.ListUsageLogs(limit, offset)
+		view := strings.TrimSpace(c.DefaultQuery("view", "usage"))
+		items, total, err := d.Gateway.ListUsageLogs(limit, offset, view)
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		stats, err := d.Gateway.UsageLogStats()
+		stats, err := d.Gateway.UsageLogStats("usage")
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return

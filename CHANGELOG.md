@@ -8,6 +8,20 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.27.2 - 2026-07-18
+
+### Changed
+
+- Real upstream failures such as HTTP 503, intercepted response content, network errors, and rate limits now make a route temporarily unschedulable on the first failure. The default cooldown is five minutes, is configurable in system settings, and still honors an explicit upstream `Retry-After` value.
+- Cooling routes are never probed by user traffic. A successful failover remains sticky for the same client conversation while the failed route is cooling.
+- Usage history now separates successful usage details from dispatch/error events, matching the Sub2API-style usage and error views without changing the underlying retention model.
+- Gateway Keys can be created and displayed for OpenAI, Claude, and Grok client formats.
+
+### Fixed
+
+- Version checks fall back to the jsDelivr copy of the repository version file when the GitHub API is unavailable, and report a clear network error only when both sources fail.
+- Dispatch logging no longer creates one cooldown row for every skipped route; an exhausted request records a single summarized failure event instead.
+
 ## v0.27.1 - 2026-07-18
 
 ### Changed
