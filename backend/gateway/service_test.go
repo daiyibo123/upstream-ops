@@ -1705,6 +1705,41 @@ func TestSoftAffinityFallsBackWhenStickyCandidateUnhealthy(t *testing.T) {
 	}
 }
 
+// TestSoftAffinityKeepsStickyWhenSavingsBelowThreshold 锁定缓存粘性优先策略：
+// 开启后，同层（都是非公益、都健康）且新渠道只便宜一点点（省钱比例低于逃生阀阈值）时，
+// 必须保留原渠道以保住上游 prompt cache 前缀，不为省一点点钱而切走导致重喂上下文、降智。
+func TestSoftAffinityKeepsStickyWhenSavingsBelowThreshold(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("k", 32))
+	env.svc.UpdateAppConfig(config.AppConfig{RouteAffinity: config.RouteAffinityConfig{Enabled: true, PromoteMinSavingsRatio: 0.3}})
+	// 同价目：成本分只由 ratio 决定。sticky=0.1、cheaper=0.09，省钱 10% < 30% 阈值 → 保留 sticky。
+	cheaper := storage.UpstreamGroupKey{ID: 1, Status: "alive", Ratio: 0.09, InputPricePerMillion: 5, OutputPricePerMillion: 30}
+	sticky := storage.UpstreamGroupKey{ID: 2, Status: "alive", Ratio: 0.1, InputPricePerMillion: 5, OutputPricePerMillion: 30}
+	if err := env.affinities.Upsert(HashKey("chat:warm-cache"), sticky.ID, time.Now().Add(time.Hour), time.Now()); err != nil {
+		t.Fatalf("upsert soft affinity: %v", err)
+	}
+	ordered := env.svc.orderCandidatesForRequest([]storage.UpstreamGroupKey{cheaper, sticky}, normalizedRequest{AffinityKey: "chat:warm-cache"})
+	if len(ordered) == 0 || ordered[0].ID != sticky.ID {
+		t.Fatalf("cache stickiness must keep sticky when savings below threshold, got %#v", ordered)
+	}
+}
+
+// TestSoftAffinitySwitchesWhenSavingsAboveThreshold 锁定逃生阀：新渠道便宜得足够多
+// （省钱比例达到阈值）时，才值得放弃缓存去切换到更便宜的渠道。
+func TestSoftAffinitySwitchesWhenSavingsAboveThreshold(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("m", 32))
+	env.svc.UpdateAppConfig(config.AppConfig{RouteAffinity: config.RouteAffinityConfig{Enabled: true, PromoteMinSavingsRatio: 0.3}})
+	// sticky=0.1、cheaper=0.05，省钱 50% >= 30% 阈值 → 放弃粘性，切到更便宜的渠道。
+	cheaper := storage.UpstreamGroupKey{ID: 1, Status: "alive", Ratio: 0.05, InputPricePerMillion: 5, OutputPricePerMillion: 30}
+	sticky := storage.UpstreamGroupKey{ID: 2, Status: "alive", Ratio: 0.1, InputPricePerMillion: 5, OutputPricePerMillion: 30}
+	if err := env.affinities.Upsert(HashKey("chat:cheap-switch"), sticky.ID, time.Now().Add(time.Hour), time.Now()); err != nil {
+		t.Fatalf("upsert soft affinity: %v", err)
+	}
+	ordered := env.svc.orderCandidatesForRequest([]storage.UpstreamGroupKey{cheaper, sticky}, normalizedRequest{AffinityKey: "chat:cheap-switch"})
+	if len(ordered) == 0 || ordered[0].ID != cheaper.ID {
+		t.Fatalf("escape valve must switch to a much cheaper candidate, got %#v", ordered)
+	}
+}
+
 func TestOrderCandidatesDoesNotPromoteSameGroupAcrossRatioTier(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("e", 32))
 	candidates := []storage.UpstreamGroupKey{
@@ -1864,34 +1899,40 @@ func TestProxyFailurePolicyRequiresThreeTransientFailures(t *testing.T) {
 	}
 }
 
-func TestProxyFailurePolicyFastCoolsDownFirstOutputTimeouts(t *testing.T) {
+func TestProxyFailureDoesNotCoolDownSlowFirstOutput(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("bb", 16))
-	channel := &storage.Channel{Name: "fast-cooldown", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.invalid", MonitorEnabled: true}
+	channel := &storage.Channel{Name: "slow-first-output", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.invalid", MonitorEnabled: true}
 	if err := env.channels.Create(channel); err != nil {
 		t.Fatalf("create channel: %v", err)
 	}
-	keyCipher, err := env.cipher.Encrypt("sk-fast-cooldown")
+	keyCipher, err := env.cipher.Encrypt("sk-slow-first-output")
 	if err != nil {
 		t.Fatalf("encrypt key: %v", err)
 	}
 	if err := env.groupKeys.Upsert(&storage.UpstreamGroupKey{
 		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: storage.ChannelTypeSub2API,
-		GroupRef: "fast-cooldown", GroupName: "fast-cooldown", Ratio: 0.1, KeyCipher: keyCipher, Status: "alive",
+		GroupRef: "slow-first-output", GroupName: "slow-first-output", Ratio: 0.1, KeyCipher: keyCipher, Status: "alive",
 	}); err != nil {
 		t.Fatalf("insert group key: %v", err)
 	}
-	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "fast-cooldown")
+	group, err := env.groupKeys.FindByChannelGroup(channel.ID, "slow-first-output")
 	if err != nil {
 		t.Fatalf("load group key: %v", err)
 	}
 
-	env.svc.markProxyFailure(group.ID, "upstream did not produce first output within 4s")
+	// 慢首字节只是"这一次等太久"，推理模型的 reasoning 阶段本就可能很长。它绝不代表
+	// 渠道坏了：调用方 shouldMarkProxyFailure 已对它返回 false，即使误触 markProxyFailure，
+	// 也不能进入任何冷却、不累加失败计数、状态保持 alive，否则可用渠道会被逐个打进冷却。
+	if shouldMarkProxyFailure("upstream did not produce first output within 60s") {
+		t.Fatal("slow first output must not be marked as a proxy failure")
+	}
+	env.svc.markProxyFailure(group.ID, "upstream did not produce first output within 60s")
 	stored, err := env.groupKeys.FindByID(group.ID)
 	if err != nil {
-		t.Fatalf("load group after fast cooldown failure: %v", err)
+		t.Fatalf("load group after slow first output: %v", err)
 	}
-	if stored.FailureCount != 1 || stored.DisabledUntil == nil || !stored.Enabled || stored.Status != "alive" {
-		t.Fatalf("first output timeout should cool down immediately: %#v", stored)
+	if stored.DisabledUntil != nil || !stored.Enabled || stored.Status != "alive" {
+		t.Fatalf("slow first output must not cool down the candidate: %#v", stored)
 	}
 }
 
@@ -2762,14 +2803,42 @@ func TestOneClickHealthTestOptionsParallelizeDistinctUpstreams(t *testing.T) {
 	if opts.Serial || opts.BatchSize != defaultHealthProbeBatchSize {
 		t.Fatalf("one-click health options must use bounded parallel workers: %#v", opts)
 	}
-	if opts.MaxRatio != automaticHealthProbeMaxRatio {
-		t.Fatalf("max ratio = %v, want %v", opts.MaxRatio, automaticHealthProbeMaxRatio)
+	// 用户明确勾选了分组去测活，即使是高倍率渠道也应尊重其意图，不再套用倍率成本上限，
+	// 否则前端把它标成"排队中"、后端却因倍率超限静默跳过，表现为"点了测活没反应"。
+	if opts.MaxRatio != 0 {
+		t.Fatalf("explicit group selection must not apply a ratio cost cap: %v", opts.MaxRatio)
 	}
 	if opts.InterGroupDelay != 0 {
 		t.Fatalf("global inter-group delay = %s, want none", opts.InterGroupDelay)
 	}
 	if len(opts.GroupIDs) != 2 || opts.GroupIDs[0] != 3 || opts.GroupIDs[1] != 7 {
 		t.Fatalf("group IDs = %#v", opts.GroupIDs)
+	}
+}
+
+func TestOneClickHealthTestOptionsFullScanKeepsRatioCap(t *testing.T) {
+	// 未指定任何分组的一键测活/定时兜底扫描仍用倍率上限控制成本，只测低倍率/公益渠道。
+	opts := OneClickHealthTestOptions(nil)
+	if opts.MaxRatio != automaticHealthProbeMaxRatio {
+		t.Fatalf("full-scan max ratio = %v, want %v", opts.MaxRatio, automaticHealthProbeMaxRatio)
+	}
+	if len(opts.GroupIDs) != 0 {
+		t.Fatalf("full-scan group IDs = %#v, want none", opts.GroupIDs)
+	}
+}
+
+func TestServiceOneClickHealthTestOptionsUsesConfiguredRatioCap(t *testing.T) {
+	svc := &Service{}
+	svc.UpdateUpstreamConfig(config.UpstreamConfig{HealthProbeMaxRatio: 0.25})
+
+	fullScan := svc.OneClickHealthTestOptions(nil)
+	if fullScan.MaxRatio != 0.25 {
+		t.Fatalf("configured full-scan max ratio = %v, want 0.25", fullScan.MaxRatio)
+	}
+
+	selected := svc.OneClickHealthTestOptions([]uint{7})
+	if selected.MaxRatio != 0 {
+		t.Fatalf("explicit group selection max ratio = %v, want no cap", selected.MaxRatio)
 	}
 }
 
@@ -5165,6 +5234,17 @@ func TestResponseInterceptionHandlesPublicTokenRestAcrossDeltas(t *testing.T) {
 	if got := svc.interceptedResponseContent(key, "请求暂时无法完成: 公益token休息了"); got == "" {
 		t.Fatal("generic upstream failure prefix must be intercepted before a stream starts")
 	}
+	// 上游把"自己没有可用渠道"的软失败当正文/错误 body 返回时，也必须命中拦截，
+	// 以便在写首字节前切换到下一个候选，而不是把这句话直接透传给 Codex。
+	for _, content := range []string{
+		"stream disconnected before completion:当前没有可用上游，请稍后重试;如果持续出现，请检查上游渠道状态。",
+		`upstream returned HTTP 503: {"error":{"message":"auth_unavailable: no auth available (providers= codex, codex_gpt)"}}`,
+		"当前没有可用上游，请稍后重试",
+	} {
+		if got := svc.interceptedResponseContent(key, content); got == "" {
+			t.Fatalf("upstream soft-failure text must be intercepted for %q", content)
+		}
+	}
 }
 
 func TestProxyFailsOverWhenPublicRouteStreamsRestMessage(t *testing.T) {
@@ -6903,13 +6983,15 @@ func TestPreflightSSEStreamUsesOneTotalDeadlineAcrossLifecycleEvents(t *testing.
 }
 
 func TestStreamCandidatePreflightBudgetIncludesHeaderWait(t *testing.T) {
-	if got := streamCandidatePreflightBudget(time.Second); got != 2*time.Second {
-		t.Fatalf("fast headers budget = %s, want 2s", got)
+	// preflight 预算就是"首字节窗口 - 已消耗的响应头等待"，不再做秒级二次封顶。
+	const budget = 60 * time.Second
+	if got := streamCandidatePreflightBudget(budget, time.Second); got != budget-time.Second {
+		t.Fatalf("fast headers budget = %s, want %s", got, budget-time.Second)
 	}
-	if got := streamCandidatePreflightBudget(2 * time.Second); got != time.Second {
-		t.Fatalf("slow headers budget = %s, want 1s", got)
+	if got := streamCandidatePreflightBudget(budget, 10*time.Second); got != budget-10*time.Second {
+		t.Fatalf("slow headers budget = %s, want %s", got, budget-10*time.Second)
 	}
-	if got := streamCandidatePreflightBudget(streamFirstEventTimeout + time.Millisecond); got != 0 {
+	if got := streamCandidatePreflightBudget(budget, budget+time.Millisecond); got != 0 {
 		t.Fatalf("expired first-output budget = %s, want 0", got)
 	}
 }

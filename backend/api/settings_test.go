@@ -73,3 +73,52 @@ func TestSaveSettingsKeepsAppVersion(t *testing.T) {
 		t.Fatalf("upstream = %#v", got.Upstream)
 	}
 }
+
+// TestSaveSettingsAcceptsZeroValueSubConfigs 锁定"点保存没反应"的回归：子配置
+// 恰好全是零值（scheduler cron 全空、notifications 数值全 0、auth 未启用）时，
+// 请求不能因为 binding:"required" 被判成 400，而应正常写入并各自走默认兜底。
+func TestSaveSettingsAcceptsZeroValueSubConfigs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := config.Save(path, &config.Config{}); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	r := gin.New()
+	api := r.Group("/api")
+	registerSettings(api, &Deps{
+		Runtime: runtimeconfig.New(path, "", nil, nil, nil, nil, nil, nil, config.ProxyConfig{}, config.UpstreamConfig{}, nil),
+	})
+
+	body := `{
+		"app":{"title":"Zero","notificationPrefix":"","homepageCheapestEnabled":false},
+		"auth":{"enabled":false,"username":"","password":"","tokenSecret":"","sessionTTLHours":0},
+		"scheduler":{"balanceCron":"","rateCron":"","gatewayHealthCron":"","concurrency":0,"retention":{"cron":"","monitorLogsDays":0,"balanceSnapshotsDays":0,"notificationLogsDays":0,"announcementsDays":0,"usageLogsDays":0}},
+		"notifications":{"batchRateChanges":false,"minChangePct":0,"balanceLowCooldownMinutes":0,"subscriptionDailyRemainingThresholdPct":0,"subscriptionWeeklyRemainingThresholdPct":0,"subscriptionMonthlyRemainingThresholdPct":0,"subscriptionExpiryThresholdHours":0,"subscriptionAlertCooldownMinutes":0,"sendMaxAttempts":0},
+		"proxy":{},
+		"upstream":{}
+	}`
+	req := httptest.NewRequest(http.MethodPut, "/api/settings/config", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("zero-value sub-configs must still save: status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	got, err := config.LoadFile(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if got.App.Title != "Zero" {
+		t.Fatalf("title = %q", got.App.Title)
+	}
+	// 空的 upstream 子配置应被 WithDefaults() 兜底成放宽后的默认超时。
+	if got.Upstream.TimeoutSeconds != config.DefaultUpstreamTimeoutSeconds {
+		t.Fatalf("upstream timeout = %d, want default %d", got.Upstream.TimeoutSeconds, config.DefaultUpstreamTimeoutSeconds)
+	}
+	if got.Upstream.StreamFirstEventTimeoutSeconds != config.DefaultStreamFirstEventTimeoutSeconds {
+		t.Fatalf("stream first event timeout = %d, want default %d", got.Upstream.StreamFirstEventTimeoutSeconds, config.DefaultStreamFirstEventTimeoutSeconds)
+	}
+}

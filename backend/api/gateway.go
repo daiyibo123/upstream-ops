@@ -31,7 +31,7 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		item, err := d.Gateway.UpdateIPPolicy(in.IP, in.Blocked, in.PublicConcurrencyExempt, in.Note)
+		item, err := d.Gateway.UpdateIPPolicy(in.IP, in.Blocked, in.PublicConcurrencyExempt, in.Note, in.BlockedMessage)
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
@@ -315,12 +315,47 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": item})
 	})
+	// 同步上游 /v1/models 到该渠道的支持模型清单（软过滤用，命中清单的渠道排序靠前）。
+	gp.POST("/group-keys/:id/models/sync", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		models, err := d.Gateway.SyncGroupKeyModels(c.Request.Context(), id)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": models})
+	})
+	// 手动覆盖该渠道的支持模型清单（增删后保存）。传空清单表示清空、回到未同步状态。
+	gp.PUT("/group-keys/:id/models", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		var body struct {
+			Models []string `json:"models"`
+		}
+		if err := c.ShouldBindJSON(&body); err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		models, err := d.Gateway.SetGroupKeyModels(id, body.Models)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": models})
+	})
 	gp.POST("/group-keys/test", func(c *gin.Context) {
 		groupIDs := parseUintCSV(c.Query("ids"))
 		// A dashboard one-click check must never burst a shared upstream.  The
 		// service also enforces the OpenAI/effective-ratio policy server-side, so
 		// callers cannot accidentally test costly or non-OpenAI groups.
-		opts := gatewaySvc.OneClickHealthTestOptions(groupIDs)
+		opts := d.Gateway.OneClickHealthTestOptions(groupIDs)
 		if !wantsSSE(c) {
 			job, err := d.Gateway.StartOneClickHealthJob(groupIDs)
 			if err != nil {
@@ -355,12 +390,17 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
+		stats, err := d.Gateway.UsageLogStats()
+		if err != nil {
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
 		keys, err := d.Gateway.ListGatewayKeys()
 		if err != nil {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": items, "total": total, "keys": keys}})
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": items, "total": total, "stats": stats, "keys": keys}})
 	})
 	gp.DELETE("/usage-logs", func(c *gin.Context) {
 		deleted, err := d.Gateway.ClearUsageLogs()

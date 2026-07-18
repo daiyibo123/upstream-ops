@@ -125,6 +125,7 @@ interface IPPolicyDraft {
   blocked: boolean
   publicConcurrencyExempt: boolean
   note: string
+  blockedMessage: string
 }
 
 function createDefaultIPPolicyDraft(): IPPolicyDraft {
@@ -133,7 +134,35 @@ function createDefaultIPPolicyDraft(): IPPolicyDraft {
     blocked: false,
     publicConcurrencyExempt: true,
     note: "",
+    blockedMessage: "",
   }
+}
+
+function parseSupportedModels(value?: string | null): string[] {
+  const raw = String(value ?? "").trim()
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw)
+    if (Array.isArray(parsed)) {
+      return uniqueModelNames(parsed.map((item) => String(item)))
+    }
+  } catch {
+    // 兼容早期手工写入的换行/逗号文本，保存后会统一转成 JSON 数组。
+  }
+  return uniqueModelNames(raw.split(/[\n,]/))
+}
+
+function uniqueModelNames(models: string[]): string[] {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const item of models) {
+    const model = item.trim()
+    const key = model.toLowerCase()
+    if (!model || seen.has(key)) continue
+    seen.add(key)
+    result.push(model)
+  }
+  return result
 }
 
 function statusTone(status: string) {
@@ -1125,6 +1154,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [ratioScaleDrafts, setRatioScaleDrafts] = useState<Record<number, string>>({})
   const [ipPolicies, setIPPolicies] = useState<IPPolicy[]>([])
   const [ipPolicyDraft, setIPPolicyDraft] = useState<IPPolicyDraft>(() => createDefaultIPPolicyDraft())
+  const [ipPolicyEditorOpen, setIPPolicyEditorOpen] = useState(false)
+  const [editingIPPolicy, setEditingIPPolicy] = useState<IPPolicy | null>(null)
+  const [ipPolicyEditNote, setIPPolicyEditNote] = useState("")
+  const [ipPolicyEditBlockedMessage, setIPPolicyEditBlockedMessage] = useState("")
   const [healthResults, setHealthResults] = useState<Record<number, GatewayHealthResult["items"][number]>>({})
   const [healthProgress, setHealthProgress] = useState<HealthProgress | null>(null)
   const [groupFilterDraft, setGroupFilterDraft] = useState<GroupFilters>(() => createDefaultGroupFilters())
@@ -1133,6 +1166,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [groupPageSize, setGroupPageSize] = useState(10)
   const [keySearch, setKeySearch] = useState("")
   const [manualGroupDialogOpen, setManualGroupDialogOpen] = useState(false)
+  const [modelEditorOpen, setModelEditorOpen] = useState(false)
+  const [modelEditorGroup, setModelEditorGroup] = useState<UpstreamGroupKey | null>(null)
+  const [modelEditorDraft, setModelEditorDraft] = useState("")
   const [interceptionOpen, setInterceptionOpen] = useState(false)
   const [interceptionRules, setInterceptionRules] = useState<ResponseInterceptionRule[]>([])
   const [interceptionDraft, setInterceptionDraft] = useState<ResponseInterceptionRule>({ enabled: true, channelId: 0, content: "" })
@@ -1436,6 +1472,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           blocked: ipPolicyDraft.blocked,
           public_concurrency_exempt: ipPolicyDraft.publicConcurrencyExempt,
           note: ipPolicyDraft.note.trim(),
+          blocked_message: ipPolicyDraft.blockedMessage.trim(),
         }),
       })
       upsertIPPolicyState(saved)
@@ -1449,7 +1486,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
-  async function updateIPPolicy(policy: IPPolicy, patch: Partial<Pick<IPPolicy, "blocked" | "public_concurrency_exempt" | "note">>) {
+  async function updateIPPolicy(
+    policy: IPPolicy,
+    patch: Partial<Pick<IPPolicy, "blocked" | "public_concurrency_exempt" | "note" | "blocked_message">>,
+  ): Promise<IPPolicy | null> {
     setBusy(`ip-policy-${policy.id || policy.ip}`)
     try {
       const saved = await apiFetch<IPPolicy>("/gateway/ip-policies", {
@@ -1459,15 +1499,37 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           blocked: patch.blocked ?? policy.blocked,
           public_concurrency_exempt: patch.public_concurrency_exempt ?? policy.public_concurrency_exempt,
           note: patch.note ?? policy.note ?? "",
+          blocked_message: patch.blocked_message ?? policy.blocked_message ?? "",
         }),
       })
       upsertIPPolicyState(saved)
       toast.success("IP 规则已更新")
+      return saved
     } catch (e) {
       const err = e as Error
       toast.error(err.message || "更新 IP 规则失败")
+      return null
     } finally {
       setBusy(null)
+    }
+  }
+
+  function openIPPolicyEditor(policy: IPPolicy) {
+    setEditingIPPolicy(policy)
+    setIPPolicyEditNote(policy.note ?? "")
+    setIPPolicyEditBlockedMessage(policy.blocked_message ?? "")
+    setIPPolicyEditorOpen(true)
+  }
+
+  async function saveIPPolicyEditor() {
+    if (!editingIPPolicy) return
+    const saved = await updateIPPolicy(editingIPPolicy, {
+      note: ipPolicyEditNote.trim(),
+      blocked_message: ipPolicyEditBlockedMessage.trim(),
+    })
+    if (saved) {
+      setIPPolicyEditorOpen(false)
+      setEditingIPPolicy(null)
     }
   }
 
@@ -1735,6 +1797,61 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
+  function updateGroupSupportedModels(id: number, models: string[]) {
+    const supportedModels = models.length > 0 ? JSON.stringify(models) : ""
+    setGroups((prev) =>
+      prev.map((item) =>
+        item.id === id ? { ...item, supported_models: supportedModels } : item,
+      ),
+    )
+    setModelEditorGroup((prev) =>
+      prev?.id === id ? { ...prev, supported_models: supportedModels } : prev,
+    )
+    setModelEditorDraft(models.join("\n"))
+  }
+
+  function openGroupModelEditor(group: UpstreamGroupKey) {
+    setModelEditorGroup(group)
+    setModelEditorDraft(parseSupportedModels(group.supported_models).join("\n"))
+    setModelEditorOpen(true)
+  }
+
+  async function syncGroupModels(group: UpstreamGroupKey) {
+    setBusy(`sync-models-${group.id}`)
+    try {
+      const models = await apiFetch<string[]>(`/gateway/group-keys/${group.id}/models/sync`, {
+        method: "POST",
+      })
+      updateGroupSupportedModels(group.id, models)
+      toast.success(`已从上游同步 ${models.length} 个模型`)
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "同步上游模型失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function saveGroupModels() {
+    if (!modelEditorGroup) return
+    const models = uniqueModelNames(modelEditorDraft.split(/[\n,]/))
+    setBusy(`save-models-${modelEditorGroup.id}`)
+    try {
+      const saved = await apiFetch<string[]>(`/gateway/group-keys/${modelEditorGroup.id}/models`, {
+        method: "PUT",
+        body: JSON.stringify({ models }),
+      })
+      updateGroupSupportedModels(modelEditorGroup.id, saved)
+      setModelEditorOpen(false)
+      toast.success(saved.length > 0 ? `已保存 ${saved.length} 个支持模型` : "已清空模型清单，调度将按未知能力处理")
+    } catch (e) {
+      const err = e as Error
+      toast.error(err.message || "保存模型清单失败")
+    } finally {
+      setBusy(null)
+    }
+  }
+
   function renderGroupRow(group: UpstreamGroupKey) {
     const latestHealth = healthResults[group.id]
     const status = latestHealth?.status ?? effectiveStatus(group)
@@ -1743,6 +1860,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     const format = groupClientFormat(group)
     const requestMode = selectedRequestMode(group)
     const canTest = group.enabled !== false
+    const supportedModels = parseSupportedModels(group.supported_models)
     const oneClickHealthTarget = group.enabled !== false && isOneClickHealthTarget(group)
     const healthCheckLabel = latestHealth?.checked_at
       ? relativeTime(latestHealth.checked_at)
@@ -1786,6 +1904,16 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 测活 {group.health_probe_model}
               </Badge>
             ) : null}
+            <Badge
+              variant="outline"
+              className={cn(
+                "bg-background",
+                supportedModels.length > 0 ? "border-brand/20 text-brand" : "text-muted-foreground",
+              )}
+              title={supportedModels.length > 0 ? supportedModels.join(", ") : "尚未同步或手工维护支持模型"}
+            >
+              模型 {supportedModels.length > 0 ? supportedModels.length : "未知"}
+            </Badge>
             <Badge variant="outline" className="bg-background">{upstreamKeyLabel(group)}</Badge>
             <Badge variant="outline" className="bg-background">{formatTokens(group.total_tokens)} tok</Badge>
           </div>
@@ -1933,6 +2061,17 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               解冷
             </Button>
           ) : null}
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 gap-1 px-2 text-[11px]"
+            disabled={!!busy}
+            title="同步或手工编辑该渠道支持的模型清单"
+            onClick={() => openGroupModelEditor(group)}
+          >
+            <Pencil className="size-3" />
+            模型
+          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -2186,7 +2325,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               <div>
                 <p className="text-xs font-medium text-foreground">IP 黑名单 / 公网并发白名单</p>
                 <p className="mt-1 text-[11px] text-muted-foreground">
-                  黑名单会拒绝所有网关请求；白名单只豁免公益 Key 的单 IP 3 路并发限制。
+                  黑名单会拒绝所有网关请求；白名单只豁免公益 Key 在系统设置中配置的单 IP 并发限制。
                 </p>
               </div>
               <Badge variant="outline" className="border-border bg-background text-muted-foreground">
@@ -2234,9 +2373,23 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 保存 IP 规则
               </Button>
             </div>
+            <div className="mt-2 grid gap-2 lg:grid-cols-[1fr_auto] lg:items-start">
+              <Textarea
+                value={ipPolicyDraft.blockedMessage}
+                onChange={(event) =>
+                  setIPPolicyDraft((prev) => ({ ...prev, blockedMessage: event.target.value }))
+                }
+                placeholder="封禁回复文案，可选；留空时返回“IP已被封禁”"
+                className="min-h-20 resize-y text-xs"
+                aria-label="IP 封禁回复文案"
+              />
+              <p className="max-w-sm text-[11px] leading-5 text-muted-foreground">
+                仅在勾选“封禁”后生效。Responses 流式请求会以正常文本流返回该文案，避免客户端只看到生硬的断流错误。
+              </p>
+            </div>
             {sortedIPPolicies.length === 0 ? (
               <div className="mt-3 rounded-md border border-dashed border-border bg-background px-3 py-6 text-center text-xs text-muted-foreground">
-                暂无 IP 规则。公益 Key 默认对同一 IP 最多 3 路并发，超过会排队等待。
+                暂无 IP 规则。公益 Key 的单 IP 并发上限可在系统设置中调整，超过后会排队等待。
               </div>
             ) : (
               <div className="mt-3 overflow-x-auto rounded-md border border-border bg-background">
@@ -2268,14 +2421,32 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                               ) : null}
                             </div>
                           </TableCell>
-                          <TableCell className="max-w-80 truncate text-xs text-muted-foreground">
-                            {policy.note?.trim() || "—"}
+                          <TableCell className="max-w-80 text-xs text-muted-foreground">
+                            <p className="truncate" title={policy.note || ""}>{policy.note?.trim() || "—"}</p>
+                            {policy.blocked ? (
+                              <p
+                                className="mt-1 truncate text-[10px] text-danger"
+                                title={policy.blocked_message || "IP已被封禁"}
+                              >
+                                回复：{policy.blocked_message?.trim() || "IP已被封禁"}
+                              </p>
+                            ) : null}
                           </TableCell>
                           <TableCell className="hidden text-xs text-muted-foreground md:table-cell">
                             {policy.updated_at ? relativeTime(policy.updated_at) : "—"}
                           </TableCell>
                           <TableCell>
                             <div className="flex justify-end gap-1">
+                              <Button
+                                variant="ghost"
+                                size="icon-sm"
+                                className="size-7"
+                                disabled={!!busy}
+                                title="编辑备注和封禁文案"
+                                onClick={() => openIPPolicyEditor(policy)}
+                              >
+                                <Pencil className="size-3.5" />
+                              </Button>
                               <Button
                                 variant="outline"
                                 size="sm"
@@ -2529,6 +2700,145 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           </>
         ) : null}
       </CardContent>
+
+      <Dialog
+        open={ipPolicyEditorOpen}
+        onOpenChange={(open) => {
+          setIPPolicyEditorOpen(open)
+          if (!open) {
+            setEditingIPPolicy(null)
+            setIPPolicyEditNote("")
+            setIPPolicyEditBlockedMessage("")
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>编辑 IP 规则</DialogTitle>
+            <DialogDescription>
+              {editingIPPolicy
+                ? `修改 ${editingIPPolicy.ip} 的运维备注和封禁时返回给客户端的文案。`
+                : "修改 IP 规则。"}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="ip-policy-note">备注</Label>
+              <Input
+                id="ip-policy-note"
+                value={ipPolicyEditNote}
+                onChange={(event) => setIPPolicyEditNote(event.target.value)}
+                placeholder="例如：异常高频请求"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="ip-policy-blocked-message">封禁回复文案</Label>
+              <Textarea
+                id="ip-policy-blocked-message"
+                className="min-h-28"
+                value={ipPolicyEditBlockedMessage}
+                onChange={(event) => setIPPolicyEditBlockedMessage(event.target.value)}
+                placeholder="留空时返回：IP已被封禁"
+              />
+              <p className="text-[11px] leading-5 text-muted-foreground">
+                只有规则处于黑名单状态时才使用该文案；解除封禁不会删除已保存的文案，重新封禁时可继续使用。
+              </p>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" disabled={!!busy} onClick={() => setIPPolicyEditorOpen(false)}>
+              取消
+            </Button>
+            <Button disabled={!editingIPPolicy || !!busy} onClick={() => void saveIPPolicyEditor()}>
+              {editingIPPolicy && busy === `ip-policy-${editingIPPolicy.id || editingIPPolicy.ip}` ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : null}
+              保存规则
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={modelEditorOpen}
+        onOpenChange={(open) => {
+          setModelEditorOpen(open)
+          if (!open) {
+            setModelEditorGroup(null)
+            setModelEditorDraft("")
+          }
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>渠道支持模型</DialogTitle>
+            <DialogDescription>
+              {modelEditorGroup
+                ? `${modelEditorGroup.channel_name || "上游"} / ${modelEditorGroup.group_name}。每行一个模型；命中清单的渠道会在对应模型请求中优先调度，未命中仍按“未知”参与，不会被硬排除。`
+                : "同步或手工维护渠道支持的模型清单。"}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+              <span className="text-muted-foreground">
+                当前 {uniqueModelNames(modelEditorDraft.split(/[\n,]/)).length} 个模型
+              </span>
+              <Badge variant="outline" className="bg-background">
+                {modelEditorGroup ? clientFormatLabel(groupClientFormat(modelEditorGroup)) : "—"}
+              </Badge>
+            </div>
+            <Textarea
+              className="min-h-64 font-mono text-xs leading-6"
+              value={modelEditorDraft}
+              onChange={(event) => setModelEditorDraft(event.target.value)}
+              placeholder={"gpt-5.6\ngpt-5.5\ngpt-5.4"}
+            />
+            <p className="text-[11px] leading-5 text-muted-foreground">
+              “从上游同步”会调用该渠道的 /v1/models 并覆盖当前清单；仅 OpenAI 格式渠道支持自动同步。清空后保存会回到“能力未知”，不会停止调度。
+            </p>
+          </div>
+          <DialogFooter className="gap-2 sm:justify-between">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={
+                  !modelEditorGroup ||
+                  !!busy ||
+                  groupClientFormat(modelEditorGroup) !== "openai"
+                }
+                onClick={() => modelEditorGroup && void syncGroupModels(modelEditorGroup)}
+              >
+                {modelEditorGroup && busy === `sync-models-${modelEditorGroup.id}` ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="size-3.5" />
+                )}
+                从上游同步
+              </Button>
+              <Button
+                type="button"
+                variant="ghost"
+                disabled={!!busy || !modelEditorDraft.trim()}
+                onClick={() => setModelEditorDraft("")}
+              >
+                清空清单
+              </Button>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" disabled={!!busy} onClick={() => setModelEditorOpen(false)}>
+                取消
+              </Button>
+              <Button disabled={!modelEditorGroup || !!busy} onClick={() => void saveGroupModels()}>
+                {modelEditorGroup && busy === `save-models-${modelEditorGroup.id}` ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : null}
+                保存模型清单
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={interceptionOpen} onOpenChange={setInterceptionOpen}>
         <DialogContent className="sm:max-w-2xl">

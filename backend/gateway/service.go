@@ -55,11 +55,17 @@ const (
 	streamFirstEventTimeout = 3 * time.Second
 	// streamIdleTimeout 是正式转发阶段"两个事件之间"的最长间隔。推理模型两次事件
 	// 之间可能有较长停顿；超过后才认为上游卡死，并由 Responses 兜底逻辑补终态/[DONE]。
-	streamIdleTimeout              = 5 * time.Minute
-	streamHeartbeatInterval        = 15 * time.Second
-	streamPreflightTimeout         = 3 * time.Second
-	streamPreflightMaxEvents       = 16
-	streamPreflightMaxBytes        = 64 << 10
+	streamIdleTimeout       = 5 * time.Minute
+	streamHeartbeatInterval = 15 * time.Second
+	streamPreflightTimeout  = 3 * time.Second
+	// streamPreflightMaxEvents / streamPreflightMaxBytes 是首字节落地前的缓冲上限。
+	// 正常流一旦确认出现了可见输出且不命中拦截词就立即放行，不会等满上限，因此调大
+	// 上限不增加正常请求的首字节延迟；它只对"疑似拦截、持续 hold"的流生效。适度放宽到
+	// 24 事件 / 96KB，覆盖拦截文案出现在稍靠后位置（前面先吐了少量 reasoning/占位）
+	// 的情况，让"公益token休息了 / 当前没有可用上游"等软失败仍能在写首字节前被拦下并
+	// 丝滑切换到下一个候选，而不是把这句话直接透传给 Codex 造成断流。
+	streamPreflightMaxEvents       = 24
+	streamPreflightMaxBytes        = 96 << 10
 	proxyTransientFailureThreshold = 3
 	proxyFastFailoverCooldown      = 20 * time.Second
 	proxyTransientFailureCooldown  = 45 * time.Second
@@ -153,6 +159,9 @@ type IPPolicyInput struct {
 	Blocked                 bool   `json:"blocked"`
 	PublicConcurrencyExempt bool   `json:"public_concurrency_exempt"`
 	Note                    string `json:"note"`
+	// BlockedMessage 是命中封禁时回给客户端的自定义文案。留空时用兜底
+	// gatewayIPBannedMessage（"IP已被封禁"），参考 GatewayKey.DisabledMessage 的做法。
+	BlockedMessage string `json:"blocked_message"`
 }
 
 type GatewayKeyOutput struct {
@@ -384,11 +393,29 @@ func (o healthJobObserver) Emit(event progress.Event) {
 // one-click check. Different API base URLs run in parallel, while the
 // service-scoped upstream slots keep keys at the same API base serialized.
 func OneClickHealthTestOptions(groupIDs []uint) HealthTestOptions {
-	return HealthTestOptions{
+	opts := HealthTestOptions{
 		BatchSize: defaultHealthProbeBatchSize,
 		GroupIDs:  groupIDs,
-		MaxRatio:  automaticHealthProbeMaxRatio,
 	}
+	// MaxRatio 是"全量兜底扫描"时用来控制成本的上限（只测低倍率/公益渠道），
+	// 定时任务与"不指定任何分组"的一键测活会走这里。但当调用方明确传入 groupIDs
+	// 时，说明用户在前端主动勾选了要测的分组——哪怕是高倍率渠道也应当尊重其意图，
+	// 否则前端把它标成"排队中"、后端却因倍率超限静默跳过，表现为"点了测活没反应"。
+	if len(groupIDs) == 0 {
+		opts.MaxRatio = automaticHealthProbeMaxRatio
+	}
+	return opts
+}
+
+// OneClickHealthTestOptions returns the dashboard policy with the service's
+// currently applied full-scan ratio cap. Explicitly selected groups remain
+// uncapped, matching the background-job and SSE execution paths.
+func (s *Service) OneClickHealthTestOptions(groupIDs []uint) HealthTestOptions {
+	opts := OneClickHealthTestOptions(groupIDs)
+	if len(groupIDs) == 0 {
+		opts.MaxRatio = s.healthProbeMaxRatio()
+	}
+	return opts
 }
 
 // StartOneClickHealthJob starts the low-cost OpenAI probe
@@ -427,7 +454,7 @@ func (s *Service) StartOneClickHealthJob(groupIDs []uint) (*HealthJobOutput, err
 	job := &healthJob{out: HealthJobOutput{ID: jobID, Status: "running", Message: "后台测活任务已启动", StartedAt: now}}
 	s.healthJobs.Store(jobID, job)
 	s.pruneHealthJobs(now)
-	opts := OneClickHealthTestOptions(groupIDs)
+	opts := s.OneClickHealthTestOptions(groupIDs)
 	go func() {
 		ctx := progress.WithObserver(context.Background(), healthJobObserver{job: job})
 		result, runErr := s.TestGroupKeys(ctx, opts)
@@ -696,7 +723,9 @@ func (e *GatewayError) Error() string {
 const (
 	gatewayQuotaExhaustedMessage = "额度已经消耗光"
 	gatewayIPBannedMessage       = "IP已被封禁"
-	publicIPConcurrencyLimit     = 3
+	// defaultPublicIPConcurrencyLimit 仅作兜底默认值。实际生效值从 app.publicKey.ipConcurrencyLimit
+	// 配置读取（见 publicIPConcurrencyBudget），可在系统设置的公益 Key 配置里调整。
+	defaultPublicIPConcurrencyLimit = config.DefaultPublicIPConcurrencyLimit
 )
 
 func NewService(
@@ -736,7 +765,7 @@ func (s *Service) ListIPPolicies() ([]storage.IPPolicy, error) {
 	return s.ipPolicies.List()
 }
 
-func (s *Service) UpdateIPPolicy(ip string, blocked, publicConcurrencyExempt bool, note string) (*storage.IPPolicy, error) {
+func (s *Service) UpdateIPPolicy(ip string, blocked, publicConcurrencyExempt bool, note, blockedMessage string) (*storage.IPPolicy, error) {
 	ip = strings.TrimSpace(ip)
 	if net.ParseIP(ip) == nil {
 		return nil, errors.New("invalid IP address")
@@ -744,11 +773,20 @@ func (s *Service) UpdateIPPolicy(ip string, blocked, publicConcurrencyExempt boo
 	if s.ipPolicies == nil {
 		return nil, errors.New("IP policy store is unavailable")
 	}
-	item := &storage.IPPolicy{IP: ip, Blocked: blocked, PublicConcurrencyExempt: publicConcurrencyExempt, Note: strings.TrimSpace(note)}
+	item := &storage.IPPolicy{IP: ip, Blocked: blocked, PublicConcurrencyExempt: publicConcurrencyExempt, Note: strings.TrimSpace(note), BlockedMessage: strings.TrimSpace(blockedMessage)}
 	if err := s.ipPolicies.Upsert(item); err != nil {
 		return nil, err
 	}
 	return s.ipPolicies.Find(ip)
+}
+
+func ipBlockedMessage(policy *storage.IPPolicy) string {
+	if policy != nil {
+		if message := strings.TrimSpace(policy.BlockedMessage); message != "" {
+			return message
+		}
+	}
+	return gatewayIPBannedMessage
 }
 
 func (s *Service) DeleteIPPolicy(ip string) error {
@@ -873,6 +911,14 @@ func (s *Service) ListUsageLogs(limit, offset int) ([]storage.UsageLog, int64, e
 		}
 	}
 	return items, total, nil
+}
+
+// UsageLogStats 返回当前保留使用明细的聚合指标。
+func (s *Service) UsageLogStats() (storage.UsageLogStats, error) {
+	if s.usageLogs == nil {
+		return storage.UsageLogStats{}, nil
+	}
+	return s.usageLogs.Stats()
 }
 
 func usageLogGroupIdentity(channelID uint, groupName string) string {
@@ -1121,6 +1167,60 @@ func (s *Service) upstreamConfig() config.UpstreamConfig {
 	cfg := s.upstream
 	s.configMu.RUnlock()
 	return cfg.WithDefaults()
+}
+
+// streamFirstEventBudget 是"等上游吐出第一个可见生成事件"的窗口，可配置。
+// 推理模型出字前的 reasoning 阶段常需 5-30s，秒级窗口会把可用渠道误判成卡死。
+// 常量 streamFirstEventTimeout 仅作兜底默认值。
+func (s *Service) streamFirstEventBudget() time.Duration {
+	if secs := s.upstreamConfig().StreamFirstEventTimeoutSeconds; secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return streamFirstEventTimeout
+}
+
+// healthProbeBudget 是单次测活"等一个可见生成事件"的窗口，可配置。
+func (s *Service) healthProbeBudget() time.Duration {
+	if secs := s.upstreamConfig().HealthProbeTimeoutSeconds; secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return healthProbeTimeout
+}
+
+// healthRunBudget 是单个渠道整轮测活的外层信封。测活内部可能按配置清单先后探测
+// 多个模型（各自最多 healthProbeBudget），因此外层要按清单长度留出足够余量，
+// 否则放宽后的单次窗口会被外层提前掐断。清单越长，外层信封越大。
+func (s *Service) healthRunBudget() time.Duration {
+	// 至少按 2 个模型算，避免清单只配 1 个时外层过紧、连接抖动就被掐断。
+	probes := len(s.healthProbeModels())
+	if probes < 2 {
+		probes = 2
+	}
+	budget := s.healthProbeBudget()*time.Duration(probes) + 10*time.Second
+	if budget < healthProbeRunTimeout {
+		return healthProbeRunTimeout
+	}
+	return budget
+}
+
+// healthProbeModels 返回一键/定时测活对 OpenAI 渠道按顺序尝试的模型清单，可在
+// 系统设置里配置（app 通过 UpdateUpstreamConfig 热更新，无需重启）。WithDefaults
+// 已保证清单非空（留空回退内置 gpt-5.4 → gpt-5.5），这里再兜底一次以防万一。
+func (s *Service) healthProbeModels() []string {
+	models := s.upstreamConfig().HealthProbeModels
+	if len(models) == 0 {
+		return append([]string(nil), config.DefaultOpenAIHealthProbeModels...)
+	}
+	return models
+}
+
+// healthProbeMaxRatio 返回"全量兜底扫描"的倍率成本上限，可在系统设置里配置。
+// <=0 时回退默认值。明确勾选分组的一键测活不受此限制（见调用方对 GroupIDs 的判断）。
+func (s *Service) healthProbeMaxRatio() float64 {
+	if r := s.upstreamConfig().HealthProbeMaxRatio; r > 0 {
+		return r
+	}
+	return config.DefaultHealthProbeMaxRatio
 }
 
 func HashKey(key string) string {
@@ -2241,7 +2341,8 @@ func (s *Service) TestAllGroupKeys(ctx context.Context, batchSizes ...int) (*Hea
 	if len(batchSizes) > 0 {
 		batchSize = batchSizes[0]
 	}
-	return s.TestGroupKeys(ctx, HealthTestOptions{BatchSize: batchSize, MaxRatio: automaticHealthProbeMaxRatio})
+	// 定时兜底扫描同样只测低倍率/公益渠道，倍率上限取系统设置里的可配值。
+	return s.TestGroupKeys(ctx, HealthTestOptions{BatchSize: batchSize, MaxRatio: s.healthProbeMaxRatio()})
 }
 
 func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*HealthResult, error) {
@@ -2352,7 +2453,7 @@ func (s *Service) TestGroupKeys(ctx context.Context, opts HealthTestOptions) (*H
 				// Use the same independent deadline as the single-group action.
 				// The timeout begins after this job owns the upstream slot, so batch
 				// scheduling cannot change the meaning of a health result.
-				itemCtx, cancel := context.WithTimeout(probeCtx, healthProbeRunTimeout)
+				itemCtx, cancel := context.WithTimeout(probeCtx, s.healthRunBudget())
 				item := s.testGroupKeyWithUpstreamSlot(itemCtx, &list[idx])
 				releaseChannelSlot()
 				cancel()
@@ -2656,7 +2757,7 @@ func (s *Service) TestGroupKey(id uint) (*HealthResultItem, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), healthProbeRunTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), s.healthRunBudget())
 	defer cancel()
 	result := s.testGroupKey(ctx, key)
 	return &result, nil
@@ -2723,10 +2824,11 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		return failGatewayRequest(http.StatusInternalServerError, "gateway_error", err.Error())
 	}
 	if policy != nil && policy.Blocked {
+		bannedMessage := ipBlockedMessage(policy)
 		if shouldWriteResponsesTerminalForGatewayFailure(normalized) {
-			return writeResponsesGatewayTextStream(w, normalized.RequestModel, gatewayIPBannedMessage)
+			return writeResponsesGatewayTextStream(w, normalized.RequestModel, bannedMessage)
 		}
-		return failGatewayRequest(http.StatusForbidden, "gateway_forbidden", gatewayIPBannedMessage)
+		return failGatewayRequest(http.StatusForbidden, "gateway_forbidden", bannedMessage)
 	}
 	rawKey := extractGatewayKey(r.Header)
 	gatewayKey, err := s.Authenticate(rawKey, requestIP)
@@ -3615,13 +3717,14 @@ func isSlowFirstOutputFailure(message string) bool {
 	return false
 }
 
-func streamCandidatePreflightBudget(elapsed time.Duration) time.Duration {
-	remaining := streamFirstEventTimeout - elapsed
+// streamCandidatePreflightBudget 返回 preflight（首字节落地前的不可见缓冲阶段）
+// 还能等多久。它就是"首字节窗口减去已消耗的响应头等待时间"，不再做秒级二次封顶：
+// 早期的 streamPreflightTimeout=3s 封顶会在首字节窗口放宽后仍把 preflight 砍到 3s，
+// 从而继续误杀 reasoning 阶段较长的推理模型。firstOutputBudget 由调用方按配置传入。
+func streamCandidatePreflightBudget(firstOutputBudget, elapsed time.Duration) time.Duration {
+	remaining := firstOutputBudget - elapsed
 	if remaining <= 0 {
 		return 0
-	}
-	if streamPreflightTimeout > 0 && streamPreflightTimeout < remaining {
-		return streamPreflightTimeout
 	}
 	return remaining
 }
@@ -3798,7 +3901,8 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 	if err != nil {
 		return true, usageTokens{}, err
 	}
-	requestCtx, firstOutput := newFirstOutputGuard(ctx, streamFirstEventTimeout)
+	firstEventBudget := s.streamFirstEventBudget()
+	requestCtx, firstOutput := newFirstOutputGuard(ctx, firstEventBudget)
 	defer firstOutput.Close()
 	firstOutputStartedAt := time.Now()
 	req, err := http.NewRequestWithContext(requestCtx, request.Method, upstreamURL, bytes.NewReader(request.Body))
@@ -3856,7 +3960,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		// heartbeat before proving this upstream can produce a valid event, the
 		// request is pinned to this candidate and we can no longer fail over to a
 		// healthier charity/low-ratio key without corrupting the Codex stream.
-		preflightBudget := streamCandidatePreflightBudget(time.Since(firstOutputStartedAt))
+		preflightBudget := streamCandidatePreflightBudget(firstEventBudget, time.Since(firstOutputStartedAt))
 		if preflightBudget <= 0 {
 			return true, usageTokens{}, firstOutput.timeoutError()
 		}
@@ -3963,6 +4067,14 @@ func (s *Service) responseInterceptionNeedles(key *storage.UpstreamGroupKey) []s
 		"公益 token 休息了",
 		"gpt休息了",
 		"gpt 休息了",
+		// 上游（尤其是另一个网关/中转）把"自己没有可用渠道"的软失败当作正文或
+		// 错误 body 返回时的特征串。命中即在写首字节前切换到下一个候选，避免把
+		// 一句"当前没有可用上游，请稍后重试"直接透传给 Codex 造成断流。
+		// 这些串都足够有特征，不会误伤正常生成内容（不加宽泛的"请稍后重试"单词）。
+		"stream disconnected before completion",
+		"当前没有可用上游",
+		"auth_unavailable",
+		"no auth available",
 	}
 	for _, rule := range s.appConfig().ResponseInterceptionRules {
 		needle := strings.TrimSpace(rule.Content)
@@ -4366,16 +4478,29 @@ func (s *Service) healthProbeCandidateWithModel(ctx context.Context, key *storag
 		return status, body, latencyMS, defaultHealthProbeModel(key.ClientFormat), err
 	}
 	start := time.Now()
-	// The one-click check is intentionally OpenAI-only. Use one stable model
-	// instead of /v1/models discovery: model lists are often filtered or stale,
-	// which used to make a healthy channel look dead before the real probe ran.
-	status, body, usedModel, err := s.healthProbeOpenAIModel(ctx, key, openAIHealthProbePrimaryModel, true)
-	if shouldTryHealthFallbackModel(status, body, err) {
-		status, body, usedModel, err = s.healthProbeOpenAIModel(ctx, key, openAIHealthProbeFallbackModel, false)
+	// The one-click check is intentionally OpenAI-only. Use a configured, stable
+	// model list instead of /v1/models discovery: model lists are often filtered
+	// or stale, which used to make a healthy channel look dead before the real
+	// probe ran. The list is configurable (system settings) so new upstream models
+	// can be adopted without a code change; it is tried in order until one works.
+	probeModels := s.healthProbeModels()
+	var (
+		status    int
+		body      []byte
+		usedModel string
+		err       error
+	)
+	for i, model := range probeModels {
+		// allowCompatibleModelRetry 仅对清单首个模型开启，与历史行为一致：首个模型
+		// 命中"协议兼容重试"时记住能力后立即返回，避免逐个模型重复探测浪费额度。
+		status, body, usedModel, err = s.healthProbeOpenAIModel(ctx, key, model, i == 0)
+		if !shouldTryHealthFallbackModel(status, body, err) {
+			break
+		}
 	}
 	if shouldFallbackHealthModelDiscovery(status, body, err) {
 		if model, _, _, discoverErr := s.discoverHealthProbeModel(ctx, key); discoverErr == nil &&
-			!healthProbeModelIsOneOf(model, openAIHealthProbePrimaryModel, openAIHealthProbeFallbackModel) {
+			!healthProbeModelIsOneOf(model, probeModels...) {
 			status, body, usedModel, err = s.healthProbeOpenAIModel(ctx, key, model, false)
 		}
 	}
@@ -4402,14 +4527,14 @@ func shouldTryHealthFallbackModel(status int, body []byte, err error) bool {
 func (s *Service) healthProbeOpenAIModel(ctx context.Context, key *storage.UpstreamGroupKey, model string, allowCompatibleModelRetry bool) (int, []byte, string, error) {
 	req := healthGenerationProbeRequest(model)
 	req = requestForCandidate(req, key)
-	status, _, body, err := s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
+	status, _, body, err := s.requestHealthProbeCandidate(ctx, req, key, s.healthProbeBudget())
 	if allowCompatibleModelRetry && shouldRetryHealthWithCompatibleModel(body, err) {
 		return status, body, model, err
 	}
 	if !strings.EqualFold(strings.TrimSpace(key.RequestModeSource), "manual") {
 		if fallback, _, ok := healthProbeFallbackRequest(req, status, body, err); ok {
 			originalStatus, originalBody, originalErr := status, body, err
-			fallbackStatus, _, fallbackBody, fallbackErr := s.requestHealthProbeCandidate(ctx, fallback, key, healthProbeTimeout)
+			fallbackStatus, _, fallbackBody, fallbackErr := s.requestHealthProbeCandidate(ctx, fallback, key, s.healthProbeBudget())
 			if fallbackErr == nil && healthProbeSucceeded(fallbackStatus, fallbackBody, nil) {
 				// The health request is a real streamed generation probe. If its
 				// alternate protocol succeeds, remember that capability immediately
@@ -4458,7 +4583,7 @@ func (s *Service) healthProbeGrok(ctx context.Context, key *storage.UpstreamGrou
 	header := http.Header{}
 	header.Set("Content-Type", "application/json")
 	req := normalizedRequest{Method: http.MethodPost, Path: "/v1/chat/completions", Header: header, Body: body, ResponseMode: "raw", Stream: true}
-	status, _, respBody, err := s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
+	status, _, respBody, err := s.requestHealthProbeCandidate(ctx, req, key, s.healthProbeBudget())
 	latencyMS := time.Since(start).Milliseconds()
 	if err != nil {
 		return status, respBody, latencyMS, err
@@ -4543,7 +4668,7 @@ func (s *Service) healthProbeClaude(ctx context.Context, key *storage.UpstreamGr
 		ResponseMode: "raw",
 		Stream:       true,
 	}
-	status, _, respBody, err := s.requestHealthProbeCandidate(ctx, req, key, healthProbeTimeout)
+	status, _, respBody, err := s.requestHealthProbeCandidate(ctx, req, key, s.healthProbeBudget())
 	latencyMS := time.Since(start).Milliseconds()
 	if err != nil {
 		return status, respBody, latencyMS, err
@@ -4593,7 +4718,7 @@ func (s *Service) discoverHealthProbeModel(ctx context.Context, key *storage.Ups
 		Path:   healthPath,
 		Header: http.Header{},
 	}
-	status, _, body, err := s.requestCandidate(ctx, req, key, healthProbeTimeout)
+	status, _, body, err := s.requestCandidate(ctx, req, key, s.healthProbeBudget())
 	if err != nil {
 		return "", status, body, fmt.Errorf("model discovery failed: %w", err)
 	}
@@ -4624,6 +4749,73 @@ func (s *Service) rememberDiscoveredModelCapabilities(key *storage.UpstreamGroup
 			return
 		}
 	}
+}
+
+// SyncGroupKeyModels 拉取该渠道上游 /v1/models 的模型清单并写入 SupportedModels。
+// 只对 openai 系渠道有意义（claude/grok 不暴露 OpenAI 风格的 /v1/models）。
+// 同步是"覆盖式"：用上游返回的清单整体替换本地，若上游返回空则不动本地已有清单，
+// 避免一次抖动把手工维护的清单清空。返回写入后的模型清单。
+func (s *Service) SyncGroupKeyModels(ctx context.Context, id uint) ([]string, error) {
+	if s == nil || s.groupKeys == nil {
+		return nil, errors.New("gateway group key store is unavailable")
+	}
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+	if key == nil {
+		return nil, errors.New("upstream group key not found")
+	}
+	req := normalizedRequest{
+		Method: http.MethodGet,
+		Path:   healthPath,
+		Header: http.Header{},
+	}
+	status, _, body, err := s.requestCandidate(ctx, req, key, s.healthProbeBudget())
+	if err != nil {
+		return nil, fmt.Errorf("fetch upstream models failed: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("fetch upstream models failed: %w", healthProbeError(status, body, nil))
+	}
+	if isUpstreamErrorBody(body) {
+		return nil, fmt.Errorf("fetch upstream models returned error payload: %s", truncateBody(body, 240))
+	}
+	models := uniqueStrings(extractHealthProbeModels(body))
+	if len(models) == 0 {
+		return nil, errors.New("upstream returned no models")
+	}
+	if err := s.persistGroupKeyModels(id, models); err != nil {
+		return nil, err
+	}
+	return models, nil
+}
+
+// SetGroupKeyModels 用管理员手动编辑的清单覆盖渠道的支持模型（增删后保存）。
+// 传空清单表示"清空并回到未同步状态"（视为未知，正常参与调度，不再享受清单加分）。
+func (s *Service) SetGroupKeyModels(id uint, models []string) ([]string, error) {
+	if s == nil || s.groupKeys == nil {
+		return nil, errors.New("gateway group key store is unavailable")
+	}
+	cleaned := uniqueStrings(models)
+	if err := s.persistGroupKeyModels(id, cleaned); err != nil {
+		return nil, err
+	}
+	return cleaned, nil
+}
+
+// persistGroupKeyModels 把模型清单序列化成 JSON 数组文本写入 SupportedModels。
+// 空清单写入空字符串（而非 "[]"），与 supportedModelsContain 的"空即未同步"语义一致。
+func (s *Service) persistGroupKeyModels(id uint, models []string) error {
+	payload := ""
+	if len(models) > 0 {
+		encoded, err := json.Marshal(models)
+		if err != nil {
+			return fmt.Errorf("encode supported models: %w", err)
+		}
+		payload = string(encoded)
+	}
+	return s.groupKeys.UpdateSupportedModels(id, payload)
 }
 
 func shouldFallbackHealthModelDiscovery(status int, body []byte, err error) bool {
@@ -5466,8 +5658,14 @@ func isTemporaryProxyFailureStatus(status string) bool {
 // A requested model can be unavailable on one otherwise healthy upstream.
 // It should trigger same-request failover, but must not turn the whole group
 // red or put its key into cooldown: the next request may use a supported model.
+//
+// 慢首字节（reasoning 阶段较长的推理模型）同理：它只是"这一次等太久"，绝不代表
+// 渠道坏了。首字节窗口放宽后仍偶发超时的，只做当次 fail-over，既不冷却也不累加
+// 失败计数、状态保持 alive，避免可用渠道被逐个打进冷却导致候选池枯竭。
 func shouldMarkProxyFailure(msg string) bool {
-	return !looksLikeUnsupportedModelError(msg) && !looksLikeClientRequestError(msg)
+	return !looksLikeUnsupportedModelError(msg) &&
+		!looksLikeClientRequestError(msg) &&
+		!isSlowFirstOutputFailure(msg)
 }
 
 func shouldDelaySameDispatchGroupAfterFailure(msg string) bool {
@@ -5483,9 +5681,8 @@ func shouldFastCooldownProxyFailure(msg string) bool {
 	if lower == "" {
 		return false
 	}
-	if isSlowFirstOutputFailure(lower) {
-		return true
-	}
+	// 慢首字节不再进入任何冷却：调用方 shouldMarkProxyFailure 已对它返回 false，
+	// 这里同样不把它当作"该快速冷却"的失败，保持纵深一致，避免推理模型被误伤。
 	for _, marker := range []string{
 		"response content intercepted",
 		"completed before generating usable output",
@@ -6681,8 +6878,46 @@ func (s *Service) softAffinityCanPromote(ordered []storage.UpstreamGroupKey, sti
 	if len(ordered) == 0 || ordered[0].ID == sticky.ID {
 		return true
 	}
-	return sameDispatchOrderTier(ordered[0], sticky) &&
-		s.candidateEffectiveModelCapabilityRank(ordered[0], model) == s.candidateEffectiveModelCapabilityRank(sticky, model)
+	best := ordered[0]
+	// 粘住的渠道不能服务这个模型（已知不支持）时，不能强行保留——那会必然失败。
+	// 只要能力不低于当前最优即可，允许"未知/已支持"的原渠道继续用。
+	if s.candidateEffectiveModelCapabilityRank(sticky, model) > s.candidateEffectiveModelCapabilityRank(best, model) {
+		return false
+	}
+	// 缓存粘性优先策略：切上游 = 换 provider 账户 = 上游 prompt cache 前缀失效，
+	// 重喂整段上下文既慢又降智。因此只要原渠道仍健康可调度，就默认继续用它，不为了
+	// 省一点点倍率差而跳走；仅当出现的更优候选便宜得足够多（成本下降比例达到
+	// promoteMinSavingsRatio 逃生阀）时，才放弃缓存去切换。
+	if aff := s.appConfig().RouteAffinity; aff.Enabled {
+		// 更优候选处在更高的调度层（例如可用公益 vs 非公益）时，尊重公益优先，放弃粘性。
+		// 公益额度是共享稀缺资源，不能为了单个会话的缓存把它一直占着不回落。
+		if candidateDispatchLayer(best) < candidateDispatchLayer(sticky) {
+			return false
+		}
+		stickyCost := candidateDispatchCostScore(sticky, model)
+		bestCost := candidateDispatchCostScore(best, model)
+		// 原渠道本身免费/最便宜（成本<=最优候选）时，没有任何省钱理由，直接保留。
+		if stickyCost <= bestCost {
+			return true
+		}
+		// 逃生阀：新渠道相对原渠道的成本下降比例达到阈值才值得牺牲一次缓存命中。
+		savings := (stickyCost - bestCost) / stickyCost
+		threshold := s.routeAffinityPromoteMinSavingsRatio()
+		return savings < threshold
+	}
+	// 未开启缓存粘性：退回历史行为——只在同 tier、同能力时才保留原渠道。
+	return sameDispatchOrderTier(best, sticky) &&
+		s.candidateEffectiveModelCapabilityRank(best, model) == s.candidateEffectiveModelCapabilityRank(sticky, model)
+}
+
+// routeAffinityPromoteMinSavingsRatio 返回缓存粘性"逃生阀"阈值，可在系统设置里调整。
+// <=0 或 >=1 时回退默认值，避免 0 阈值让任何微小差价都触发切换、或 >=1 锁死切换。
+func (s *Service) routeAffinityPromoteMinSavingsRatio() float64 {
+	r := s.appConfig().RouteAffinity.PromoteMinSavingsRatio
+	if r <= 0 || r >= 1 {
+		return config.DefaultRouteAffinityPromoteMinSavingsRatio
+	}
+	return r
 }
 
 func (s *Service) preferSameGroupSchedulableCandidates(candidates []storage.UpstreamGroupKey, model string) []storage.UpstreamGroupKey {
@@ -6840,7 +7075,35 @@ func (s *Service) candidateEffectiveModelCapabilityRank(candidate storage.Upstre
 	if rank != 1 {
 		return rank
 	}
-	return healthProbeModelCapabilityRank(candidate.HealthProbeModel, model)
+	if probeRank := healthProbeModelCapabilityRank(candidate.HealthProbeModel, model); probeRank != 1 {
+		return probeRank
+	}
+	// 软过滤：渠道声明/同步的支持模型清单只提供"正向加分"，命中即视为"支持(0)"。
+	// 不命中绝不降级为"不支持(2)"——清单常不全（上游 /v1/models 会过滤/过时），
+	// 降级会把可用渠道误排除，反而制造"有渠道却不可用"。清单为空则完全不参与。
+	if supportedModelsContain(candidate.SupportedModels, model) {
+		return 0
+	}
+	return 1
+}
+
+// supportedModelsContain 判断请求模型是否命中渠道声明的支持模型清单（JSON 数组文本）。
+// 清单为空 / 解析失败 / 未命中都返回 false（调用方据此保持"未知"，不做任何排除）。
+func supportedModelsContain(supportedModelsJSON, model string) bool {
+	model = normalizeModelCapabilityKey(model)
+	if strings.TrimSpace(supportedModelsJSON) == "" || model == "" {
+		return false
+	}
+	var models []string
+	if err := json.Unmarshal([]byte(supportedModelsJSON), &models); err != nil {
+		return false
+	}
+	for _, m := range models {
+		if normalizeModelCapabilityKey(m) == model {
+			return true
+		}
+	}
+	return false
 }
 
 func healthProbeModelCapabilityRank(probeModel, requestModel string) int {
@@ -7105,14 +7368,25 @@ func (s *Service) lookupRequestIPPolicy(r *http.Request, canonicalIP string) (*s
 	return s.lookupIPPolicy(canonicalIP)
 }
 
+// publicIPConcurrencyBudget 返回公益 Key 单 IP 并发上限，可在系统设置的公益 Key
+// 配置里调整（存 config.yaml 的 app.publicKey.ipConcurrencyLimit）。<=0 时回退默认值，
+// 保持历史行为。app 配置通过 UpdateAppConfig 热更新到网关，无需重启即可生效。
+func (s *Service) publicIPConcurrencyBudget() int {
+	if limit := s.appConfig().PublicKey.IPConcurrencyLimit; limit > 0 {
+		return limit
+	}
+	return defaultPublicIPConcurrencyLimit
+}
+
 func (s *Service) acquirePublicIPSlot(ctx context.Context, key *storage.GatewayKey, ip string, policy *storage.IPPolicy) (func(), error) {
 	if key == nil || !key.IsPublic || strings.TrimSpace(ip) == "" || (policy != nil && policy.PublicConcurrencyExempt) {
 		return func() {}, nil
 	}
+	limit := s.publicIPConcurrencyBudget()
 	stateAny, _ := s.ipRuntime.LoadOrStore(ip, &keyRuntimeState{})
 	state := stateAny.(*keyRuntimeState)
 	state.mu.Lock()
-	if state.inFlight < publicIPConcurrencyLimit && len(state.queue) == 0 {
+	if state.inFlight < limit && len(state.queue) == 0 {
 		state.inFlight++
 		state.lastObservedAt = time.Now()
 		state.mu.Unlock()

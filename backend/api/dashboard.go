@@ -222,7 +222,10 @@ func publicKeySummary(d *Deps) publicKeyStat {
 		return stat
 	}
 	if key.ExpiresAt != nil {
-		stat.ExpiresAt = key.ExpiresAt.Format("2006-01-02")
+		// 用完整 RFC3339 时间戳（含时区），而不是截断成纯日期。前端 new Date()
+		// 解析纯日期会按 UTC 零点处理，在东八区就渲染成"次日早八点"，与后端实际的
+		// 精确 24 小时过期时刻不符。返回带时区的完整时间戳即可显示真实过期时刻。
+		stat.ExpiresAt = key.ExpiresAt.Format(time.RFC3339)
 	}
 	stat.Status = "available"
 	return stat

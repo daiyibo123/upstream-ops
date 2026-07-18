@@ -99,6 +99,52 @@ func TestUsageLogsClearPreservesGatewayKeyUsage(t *testing.T) {
 	}
 }
 
+func TestUsageLogsStats(t *testing.T) {
+	db := openTestDB(t)
+	logs := NewUsageLogs(db)
+	entries := []UsageLog{
+		{Status: "success", TotalTokens: 30, FirstTokenMS: 100, DurationMS: 400},
+		{Status: "failed", TotalTokens: 0, FirstTokenMS: 0, DurationMS: 200},
+		{Status: "estimated", TotalTokens: 20, FirstTokenMS: 300, DurationMS: 600},
+	}
+	for i := range entries {
+		if err := logs.Add(&entries[i]); err != nil {
+			t.Fatalf("add usage log %d: %v", i, err)
+		}
+	}
+
+	stats, err := logs.Stats()
+	if err != nil {
+		t.Fatalf("usage log stats: %v", err)
+	}
+	if stats.TotalRequests != 3 || stats.SuccessRequests != 2 || stats.TotalTokens != 50 {
+		t.Fatalf("unexpected usage log stats: %#v", stats)
+	}
+	if stats.AvgFirstTokenMS != 200 || stats.AvgDurationMS != 400 {
+		t.Fatalf("unexpected usage log averages: %#v", stats)
+	}
+}
+
+func TestIPPolicyUpsertUpdatesBlockedMessage(t *testing.T) {
+	db := openTestDB(t)
+	policies := NewIPPolicies(db)
+	item := &IPPolicy{IP: "203.0.113.8", Blocked: true, BlockedMessage: "首次封禁提示"}
+	if err := policies.Upsert(item); err != nil {
+		t.Fatalf("create IP policy: %v", err)
+	}
+	item.BlockedMessage = "更新后的封禁提示"
+	if err := policies.Upsert(item); err != nil {
+		t.Fatalf("update IP policy: %v", err)
+	}
+	stored, err := policies.Find(item.IP)
+	if err != nil {
+		t.Fatalf("find IP policy: %v", err)
+	}
+	if stored == nil || stored.BlockedMessage != item.BlockedMessage {
+		t.Fatalf("blocked message was not updated: %#v", stored)
+	}
+}
+
 func TestAutoMigrateNormalizesLegacyUnprobedGroupStatuses(t *testing.T) {
 	db := openTestDB(t)
 	for index, status := range []string{"unknown", "unchecked", "untested", ""} {

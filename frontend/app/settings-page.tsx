@@ -67,6 +67,13 @@ function withConfigDefaults(cfg: SystemConfig): SystemConfig {
   const publicKey = (app.publicKey ?? {}) as Partial<
     SystemConfig["app"]["publicKey"]
   >;
+  const routeAffinity = (app.routeAffinity ?? {}) as Partial<
+    NonNullable<SystemConfig["app"]["routeAffinity"]>
+  >;
+  const upstream = cfg.upstream as SystemConfig["upstream"] & {
+    healthProbeModels?: string[];
+    healthProbeMaxRatio?: number;
+  };
   return {
     ...cfg,
     app: {
@@ -79,7 +86,20 @@ function withConfigDefaults(cfg: SystemConfig): SystemConfig {
         password: publicKey.password ?? "",
         passwordHint: publicKey.passwordHint ?? "",
         expiresAt: publicKey.expiresAt ?? "",
+        ipConcurrencyLimit: publicKey.ipConcurrencyLimit ?? 3,
       },
+      routeAffinity: {
+        enabled: routeAffinity.enabled ?? true,
+        promoteMinSavingsRatio: routeAffinity.promoteMinSavingsRatio ?? 0.3,
+      },
+    },
+    upstream: {
+      ...upstream,
+      healthProbeModels:
+        Array.isArray(upstream.healthProbeModels) && upstream.healthProbeModels.length > 0
+          ? upstream.healthProbeModels
+          : ["gpt-5.4", "gpt-5.5"],
+      healthProbeMaxRatio: upstream.healthProbeMaxRatio ?? 0.1,
     },
   };
 }
@@ -104,6 +124,7 @@ export default function SettingsPage() {
   const [form, setForm] = useState<SystemConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [healthProbeModelDraft, setHealthProbeModelDraft] = useState("");
   const [configSavedPendingApply, setConfigSavedPendingApply] = useState(false);
   const [testingProxy, setTestingProxy] = useState(false);
   const [checkingVersion, setCheckingVersion] = useState(false);
@@ -162,6 +183,45 @@ export default function SettingsPage() {
   const recentLogs = notificationLogs.data?.items ?? [];
   const lastSent = recentLogs[0]?.sent_at ?? null;
   const recentFailed = recentLogs.filter((item) => !item.success).length;
+
+  function addHealthProbeModel() {
+    if (!form) return;
+    const model = healthProbeModelDraft.trim();
+    if (!model) return;
+    const current = form.upstream.healthProbeModels ?? [];
+    if (current.some((item) => item.toLowerCase() === model.toLowerCase())) {
+      toast.info("该测活模型已在清单中");
+      return;
+    }
+    setForm((prev) =>
+      prev
+        ? {
+            ...prev,
+            upstream: {
+              ...prev.upstream,
+              healthProbeModels: [...(prev.upstream.healthProbeModels ?? []), model],
+            },
+          }
+        : prev,
+    );
+    setHealthProbeModelDraft("");
+  }
+
+  function removeHealthProbeModel(model: string) {
+    setForm((prev) =>
+      prev
+        ? {
+            ...prev,
+            upstream: {
+              ...prev.upstream,
+              healthProbeModels: (prev.upstream.healthProbeModels ?? []).filter(
+                (item) => item !== model,
+              ),
+            },
+          }
+        : prev,
+    );
+  }
 
   async function handleDeleteNotification(channel: NotificationChannel) {
     const ok = await confirm({
@@ -559,6 +619,34 @@ export default function SettingsPage() {
               >
                 <div className="rounded-2xl border border-border bg-background/90 px-4 py-3 text-sm text-muted-foreground">
                   公益 Key 使用数据库中的调用 Key 配置，首页会读取这里选择的 Key；不会再读取旧的 config.yaml app.publicKey 字段，避免配置入口不一致。
+                </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-2">
+                  <Field
+                    label="单 IP 并发数"
+                    description="限制公益 Key 对同一个客户端 IP 的并发路数，防止单个 IP 占满公益额度导致他人排队。命中公网并发白名单的 IP 不受此限制。小于等于 0 时使用默认 3 路。"
+                  >
+                    <Input
+                      type="number"
+                      min={0}
+                      value={String(form.app.publicKey.ipConcurrencyLimit ?? 0)}
+                      onChange={(e) =>
+                        setForm((prev) =>
+                          prev
+                            ? {
+                                ...prev,
+                                app: {
+                                  ...prev.app,
+                                  publicKey: {
+                                    ...prev.app.publicKey,
+                                    ipConcurrencyLimit: num(e.target.value),
+                                  },
+                                },
+                              }
+                            : prev,
+                        )
+                      }
+                    />
+                  </Field>
                 </div>
               </SectionCard>
 
@@ -1143,6 +1231,182 @@ export default function SettingsPage() {
                             upstream: {
                               ...prev.upstream,
                               userAgent: e.target.value,
+                            },
+                          }
+                        : prev,
+                    )
+                  }
+                />
+              </Field>
+              <Field
+                label="首字节等待窗口（秒）"
+                description="等上游吐出第一个可见输出的最长时间。推理模型出字前有较长思考阶段，过短会把可用渠道误判成卡死。小于等于 0 时使用默认 45 秒。"
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  value={String(form.upstream.streamFirstEventTimeoutSeconds ?? 0)}
+                  onChange={(e) =>
+                    setForm((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            upstream: {
+                              ...prev.upstream,
+                              streamFirstEventTimeoutSeconds: num(e.target.value),
+                            },
+                          }
+                        : prev,
+                    )
+                  }
+                />
+              </Field>
+              <Field
+                label="测活等待窗口（秒）"
+                description="单次测活等一个可见输出的最长时间。小于等于 0 时使用默认 30 秒。"
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  value={String(form.upstream.healthProbeTimeoutSeconds ?? 0)}
+                  onChange={(e) =>
+                    setForm((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            upstream: {
+                              ...prev.upstream,
+                              healthProbeTimeoutSeconds: num(e.target.value),
+                            },
+                          }
+                        : prev,
+                    )
+                  }
+                />
+              </Field>
+              <Field
+                label="全量测活倍率上限"
+                description="定时测活或未指定分组的一键测活，只扫描真实倍率不高于该值的低成本渠道。明确选择分组时不受限制。小于等于 0 时使用默认 0.1。"
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  step={0.01}
+                  value={String(form.upstream.healthProbeMaxRatio ?? 0.1)}
+                  onChange={(e) =>
+                    setForm((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            upstream: {
+                              ...prev.upstream,
+                              healthProbeMaxRatio: Number(e.target.value || 0),
+                            },
+                          }
+                        : prev,
+                    )
+                  }
+                />
+              </Field>
+              <div className="space-y-2 md:col-span-2">
+                <div className="space-y-1">
+                  <Label className="text-xs font-medium text-foreground">OpenAI 测活模型顺序</Label>
+                  <p className="text-[11px] leading-5 text-muted-foreground">
+                    测活会按从左到右的顺序尝试，前一个模型不支持或未生成内容时再尝试下一个。至少保留一个常用模型；清空后后端会恢复默认 gpt-5.4 → gpt-5.5。
+                  </p>
+                </div>
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <Input
+                    value={healthProbeModelDraft}
+                    placeholder="例如 gpt-5.6"
+                    onChange={(e) => setHealthProbeModelDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        addHealthProbeModel();
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="shrink-0"
+                    disabled={!healthProbeModelDraft.trim()}
+                    onClick={addHealthProbeModel}
+                  >
+                    <Plus className="size-3.5" />
+                    添加模型
+                  </Button>
+                </div>
+                <div className="flex min-h-11 flex-wrap gap-2 rounded-xl border border-border bg-background/80 p-2.5">
+                  {(form.upstream.healthProbeModels ?? []).length === 0 ? (
+                    <span className="self-center text-xs text-muted-foreground">保存时将使用后端默认模型清单</span>
+                  ) : (
+                    (form.upstream.healthProbeModels ?? []).map((model, index) => (
+                      <Badge
+                        key={`${model}-${index}`}
+                        variant="outline"
+                        className="gap-1.5 border-brand/20 bg-brand/5 py-1 pl-2.5 pr-1 text-foreground"
+                      >
+                        <span className="font-mono text-[11px]">{index + 1}. {model}</span>
+                        <button
+                          type="button"
+                          className="rounded-md p-1 text-muted-foreground transition hover:bg-destructive/10 hover:text-destructive"
+                          aria-label={`删除测活模型 ${model}`}
+                          onClick={() => removeHealthProbeModel(model)}
+                        >
+                          <Trash2 className="size-3" />
+                        </button>
+                      </Badge>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+            <div className="mt-4 grid gap-4 md:grid-cols-2">
+              <InlineSwitch
+                id="route-affinity-enabled"
+                label="缓存粘性优先"
+                description="同一对话尽量固定用同一个上游，保住上游的 prompt 缓存前缀，避免每次换上游都重喂上下文导致变慢、降智。仅当出现明显更便宜的上游时才切换。"
+                checked={form.app.routeAffinity?.enabled ?? true}
+                onCheckedChange={(checked) =>
+                  setForm((prev) =>
+                    prev
+                      ? {
+                          ...prev,
+                          app: {
+                            ...prev.app,
+                            routeAffinity: {
+                              ...prev.app.routeAffinity,
+                              enabled: checked,
+                            },
+                          },
+                        }
+                      : prev,
+                  )
+                }
+              />
+              <Field
+                label="切换省钱阈值"
+                description="缓存粘性开启时的“逃生阀”：只有新上游比当前上游便宜达到该比例才切换。0.3 表示至少便宜 30% 才切。取值 0~1，超出范围时使用默认 0.3。"
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={String(form.app.routeAffinity?.promoteMinSavingsRatio ?? 0.3)}
+                  onChange={(e) =>
+                    setForm((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            app: {
+                              ...prev.app,
+                              routeAffinity: {
+                                ...prev.app.routeAffinity,
+                                promoteMinSavingsRatio: Number(e.target.value || 0),
+                              },
                             },
                           }
                         : prev,

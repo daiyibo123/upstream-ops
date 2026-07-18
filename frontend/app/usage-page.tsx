@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { ChevronLeft, ChevronRight, HeartHandshake, KeyRound, Loader2, RefreshCw, ScrollText, Trash2 } from "lucide-react"
+import { Activity, ChevronLeft, ChevronRight, CircleCheckBig, Gauge, HeartHandshake, KeyRound, Loader2, RefreshCw, ScrollText, Trash2, Zap } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -89,6 +89,10 @@ export default function UsagePage() {
   const items = data?.items ?? []
   const keys = data?.keys ?? []
   const total = data?.total ?? 0
+  const stats = data?.stats
+  const successRate = stats && stats.total_requests > 0
+    ? stats.success_requests / stats.total_requests
+    : 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const rangeStart = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1
   const rangeEnd = Math.min(page * PAGE_SIZE, total)
@@ -127,7 +131,18 @@ export default function UsagePage() {
     setClearing(true)
     try {
       const res = await apiFetch<{ deleted: number }>("/gateway/usage-logs", { method: "DELETE" })
-      setData((prev) => (prev ? { ...prev, items: [], total: 0 } : prev))
+      setData((prev) => (prev ? {
+        ...prev,
+        items: [],
+        total: 0,
+        stats: {
+          total_requests: 0,
+          success_requests: 0,
+          total_tokens: 0,
+          avg_first_token_ms: 0,
+          avg_duration_ms: 0,
+        },
+      } : prev))
       setPage(1)
       toast.success(`已清空 ${res.deleted ?? total} 条明细，Key 汇总未受影响`)
     } catch (err) {
@@ -148,6 +163,52 @@ export default function UsagePage() {
           </p>
         </div>
       </header>
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {[
+          {
+            label: "明细请求",
+            value: (stats?.total_requests ?? total).toLocaleString("zh-CN"),
+            detail: "当前保留的调用记录",
+            icon: Activity,
+            tone: "border-brand/20 bg-brand/5 text-brand",
+          },
+          {
+            label: "完成率",
+            value: stats?.total_requests ? formatPercent(successRate) : "—",
+            detail: `${stats?.success_requests ?? 0} 次完成`,
+            icon: CircleCheckBig,
+            tone: "border-success/20 bg-success/5 text-success",
+          },
+          {
+            label: "明细 Token",
+            value: formatTokens(stats?.total_tokens),
+            detail: "随明细清理，不影响 Key 累计",
+            icon: Zap,
+            tone: "border-warning/20 bg-warning/5 text-warning",
+          },
+          {
+            label: "平均首字",
+            value: durationLabel(stats?.avg_first_token_ms),
+            detail: `平均总耗时 ${durationLabel(stats?.avg_duration_ms)}`,
+            icon: Gauge,
+            tone: "border-border bg-muted/20 text-foreground",
+          },
+        ].map(({ label, value, detail, icon: Icon, tone }) => (
+          <Card key={label} className="border border-border shadow-none">
+            <CardContent className="flex items-center justify-between gap-3 p-4">
+              <div className="min-w-0">
+                <p className="text-xs text-muted-foreground">{label}</p>
+                <p className="mt-1 truncate text-2xl font-semibold tracking-tight text-foreground">{value}</p>
+                <p className="mt-1 truncate text-[11px] text-muted-foreground" title={detail}>{detail}</p>
+              </div>
+              <span className={`flex size-10 shrink-0 items-center justify-center rounded-xl border ${tone}`}>
+                <Icon className="size-4" />
+              </span>
+            </CardContent>
+          </Card>
+        ))}
+      </div>
 
       <Card className="border border-border shadow-none">
         <CardHeader className="flex flex-row items-center justify-between pb-3">

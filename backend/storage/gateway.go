@@ -531,6 +531,15 @@ func (r *UpstreamGroupKeys) UpdateRequestMode(id uint, mode string) error {
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("request_mode", mode).Error
 }
 
+// UpdateSupportedModels 写回渠道的支持模型清单（JSON 数组文本）。传入已规整好的
+// JSON 字符串；空清单存 "" 表示"未同步/未知"，调度按软过滤视其正常参与。
+func (r *UpstreamGroupKeys) UpdateSupportedModels(id uint, modelsJSON string) error {
+	if id == 0 {
+		return nil
+	}
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("supported_models", modelsJSON).Error
+}
+
 func (r *UpstreamGroupKeys) UpdateRequestModeConfig(id uint, mode, source string) error {
 	if strings.TrimSpace(mode) == "" {
 		mode = "responses"
@@ -714,7 +723,7 @@ func (r *IPPolicies) Upsert(item *IPPolicy) error {
 	item.IP = strings.TrimSpace(item.IP)
 	return r.db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "ip"}},
-		DoUpdates: clause.AssignmentColumns([]string{"blocked", "public_concurrency_exempt", "note", "updated_at"}),
+		DoUpdates: clause.AssignmentColumns([]string{"blocked", "public_concurrency_exempt", "note", "blocked_message", "updated_at"}),
 	}).Create(item).Error
 }
 
@@ -752,6 +761,20 @@ func (r *UsageLogs) List(limit, offset int) ([]UsageLog, int64, error) {
 		return nil, 0, err
 	}
 	return list, total, nil
+}
+
+// Stats 汇总当前保留的全部使用明细。平均耗时忽略尚未产生有效耗时的零值记录，
+// 避免正在调度中的请求把延迟指标人为拉低。
+func (r *UsageLogs) Stats() (UsageLogStats, error) {
+	var stats UsageLogStats
+	err := r.db.Model(&UsageLog{}).Select(`
+		COUNT(*) AS total_requests,
+		COALESCE(SUM(CASE WHEN status IN ('success', 'estimated') THEN 1 ELSE 0 END), 0) AS success_requests,
+		COALESCE(SUM(total_tokens), 0) AS total_tokens,
+		COALESCE(AVG(CASE WHEN first_token_ms > 0 THEN first_token_ms END), 0) AS avg_first_token_ms,
+		COALESCE(AVG(CASE WHEN duration_ms > 0 THEN duration_ms END), 0) AS avg_duration_ms
+	`).Scan(&stats).Error
+	return stats, err
 }
 
 // DeleteOlderThan 清理指定时间点之前的记录，返回删除条数。

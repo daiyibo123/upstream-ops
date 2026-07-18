@@ -17,11 +17,16 @@ type settingsConfigView struct {
 	Upstream      config.UpstreamConfig      `json:"upstream"`
 }
 
+// settingsConfigInput 不再对子配置加 binding:"required"。gin 的 required 对结构体
+// 值类型的语义是"整个结构体不能是零值"，一旦前端某个子配置（例如 notifications 的
+// 数值全为 0、scheduler 的 cron 全为空）恰好落在零值，ShouldBindJSON 就会直接 400，
+// 表现为"点保存没反应"。保存逻辑本身已经在已有配置文件基础上逐字段覆盖并用
+// WithDefaults() 兜底，因此这里接受零值即可，缺失字段走各自默认。
 type settingsConfigInput struct {
-	App           config.AppConfig           `json:"app" binding:"required"`
-	Auth          config.AuthConfig          `json:"auth" binding:"required"`
-	Scheduler     config.SchedulerConfig     `json:"scheduler" binding:"required"`
-	Notifications config.NotificationsConfig `json:"notifications" binding:"required"`
+	App           config.AppConfig           `json:"app"`
+	Auth          config.AuthConfig          `json:"auth"`
+	Scheduler     config.SchedulerConfig     `json:"scheduler"`
+	Notifications config.NotificationsConfig `json:"notifications"`
 	Proxy         config.ProxyConfig         `json:"proxy"`
 	Upstream      config.UpstreamConfig      `json:"upstream"`
 }
@@ -112,6 +117,13 @@ func saveSettingsConfig(c *gin.Context, d *Deps) {
 	// here instead of silently restoring the previous value on every save.
 	cfg.App.HomepageCheapestEnabled = in.App.HomepageCheapestEnabled
 	cfg.App.ResponseInterceptionRules = in.App.ResponseInterceptionRules
+	// 公益 Key 的展示业务数据（name/password 等）走独立的 /gateway/public-key 路径，
+	// config.yaml 的 app.publicKey 已废弃。但单 IP 并发上限是运维配置，存 config.yaml
+	// 并只同步这一个字段，避免误触公益 Key 的业务数据。
+	cfg.App.PublicKey.IPConcurrencyLimit = in.App.PublicKey.IPConcurrencyLimit
+	// 路由缓存粘性是运维配置，存 config.yaml。WithDefaults 兜底数值阈值，避免前端
+	// 传入 0 / 不可达阈值让粘性逻辑退化。
+	cfg.App.RouteAffinity = in.App.RouteAffinity.WithDefaults()
 	cfg.Auth = in.Auth
 	cfg.Scheduler = in.Scheduler
 	cfg.Notifications = in.Notifications

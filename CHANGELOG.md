@@ -8,6 +8,31 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.27.0 - 2026-07-18
+
+### Added
+
+- System settings now expose the streamed first-output timeout, health-probe timeout, ordered OpenAI probe-model list, and the effective-ratio ceiling used by unattended full scans. The same applied ceiling is used by scheduled checks, background jobs, and SSE full-scan requests.
+- Public Gateway Keys have a configurable per-client-IP concurrency budget, while existing IP exemptions continue to bypass only the public concurrency guard.
+- Route affinity can keep a conversation on its current upstream to preserve prompt-cache context, with a configurable savings threshold that still allows a materially cheaper route to take over.
+- Upstream groups can synchronize `/v1/models`, manually edit or clear their supported-model list, and surface that capability in scheduling as a soft preference rather than a hard exclusion.
+- IP blacklist rules can return an operator-defined client-facing message, including a readable Responses stream, and the control panel can create and edit that message.
+- Usage history now includes retained-log overview cards for request count, completion rate, tokens, average first-token time, and average total duration.
+
+### Changed
+
+- The default first visible-output window is 45 seconds and health probes wait up to 30 seconds, reducing false failures for reasoning-heavy models. Slow first output no longer marks an otherwise usable route unhealthy or repeatedly extends its cooldown.
+- Stream interception buffers up to 24 events or 96 KiB before committing the first client-visible bytes, improving failover for wrapped or delayed soft-error messages without delaying normal generated output.
+- Health probing tries the configured model order, stops on the first valid generation, and limits unattended scans by effective ratio while still honoring explicitly selected high-ratio groups.
+- Gateway routing remains charity-first and low-effective-ratio-first, while soft route affinity and declared model capability reduce unnecessary provider switches and prompt-cache loss.
+
+### Fixed
+
+- Settings saves no longer reject valid zero-valued scheduler or notification sections through Gin's structure-level `required` validation.
+- Public Key expiry on the dashboard now returns a full RFC3339 timestamp instead of a date-only value that appeared as a fixed 08:00 expiry in UTC+8.
+- IP blacklist custom messages are persisted on upsert, and the model-list API uses the shared validated unsigned-ID parser.
+- Usage aggregation, configuration defaults, scheduling behavior, health-probe policy, and the new UI flows have regression coverage; the complete backend test suite and frontend type/build checks pass for this release.
+
 ## v0.26.3 - 2026-07-17
 
 ### Fixed

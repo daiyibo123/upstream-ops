@@ -29,7 +29,44 @@ type AppConfig struct {
 	NotificationPrefix        string                     `mapstructure:"notificationPrefix" yaml:"notificationPrefix" json:"notificationPrefix"`
 	HomepageCheapestEnabled   bool                       `mapstructure:"homepageCheapestEnabled" yaml:"homepageCheapestEnabled" json:"homepageCheapestEnabled"`
 	PublicKey                 PublicKeyConfig            `mapstructure:"publicKey" yaml:"publicKey" json:"publicKey"`
+	RouteAffinity             RouteAffinityConfig        `mapstructure:"routeAffinity" yaml:"routeAffinity" json:"routeAffinity"`
 	ResponseInterceptionRules []ResponseInterceptionRule `mapstructure:"responseInterceptionRules" yaml:"responseInterceptionRules" json:"responseInterceptionRules"`
+}
+
+// RouteAffinityConfig 控制"无状态普通对话"的路由缓存粘性（软亲和）。
+//
+// 背景：切换上游 = 换 provider 账户 = 上游 prompt cache 前缀必然失效，网关要把
+// 整段上下文重新喂给新上游，既慢（首字节变长）又"降智"（模型丢失已缓存的推理上下文）。
+// 这个代价通常远大于切到便宜一点点渠道省下的倍率差，因此默认策略是"缓存粘性优先"：
+// 只要原渠道仍健康可调度，就继续用它，不为了省一点钱而跳走；只有当出现的更优候选
+// 便宜得足够多（省钱收益超过 PromoteMinSavingsRatio）时，才允许放弃缓存去切换。
+//
+//   - Enabled=false 时退回历史行为（只在同 tier 才保留原渠道，一有更优就切走）。
+//
+// 失败重调度时"优先回到同 provider 的其它 key"这一保缓存行为不需要单独开关：
+// 软亲和把原渠道顶到最前后，preferSameGroupSchedulableCandidates 会把同 provider
+// 的兄弟 key 紧随其后聚拢，因此原渠道失败时自然优先落到同 provider（缓存前缀可复用）。
+type RouteAffinityConfig struct {
+	// Enabled 打开缓存粘性优先策略。默认开启（见 setDefaults）。
+	Enabled bool `mapstructure:"enabled" yaml:"enabled" json:"enabled"`
+	// PromoteMinSavingsRatio 是"逃生阀"：仅当更优候选相对原渠道的成本下降比例
+	// 达到该阈值时，才允许为省钱放弃缓存切换。取值 [0,1)，例如 0.3 表示"新渠道
+	// 至少便宜 30% 才切"。<=0 或 >=1 时取默认值 DefaultRouteAffinityPromoteMinSavingsRatio。
+	PromoteMinSavingsRatio float64 `mapstructure:"promoteMinSavingsRatio" yaml:"promoteMinSavingsRatio" json:"promoteMinSavingsRatio"`
+}
+
+// DefaultRouteAffinityPromoteMinSavingsRatio 是缓存粘性"逃生阀"的默认阈值：
+// 新渠道要比当前粘住的渠道便宜 30% 以上，才值得为省钱牺牲一次缓存命中。
+const DefaultRouteAffinityPromoteMinSavingsRatio = 0.3
+
+// WithDefaults 兜底路由缓存粘性配置。注意：Enabled 是 bool，无法从"零值"区分
+// "用户显式关"和"未设置"，因此它的默认值只在 setDefaults(viper) 层设置；这里仅
+// 兜底数值阈值，避免 0 阈值让任何微小差价都触发切换、或 >=1 的不可达阈值锁死切换。
+func (r RouteAffinityConfig) WithDefaults() RouteAffinityConfig {
+	if r.PromoteMinSavingsRatio <= 0 || r.PromoteMinSavingsRatio >= 1 {
+		r.PromoteMinSavingsRatio = DefaultRouteAffinityPromoteMinSavingsRatio
+	}
+	return r
 }
 
 type ResponseInterceptionRule struct {
@@ -45,6 +82,21 @@ type PublicKeyConfig struct {
 	Password     string `mapstructure:"password" yaml:"password" json:"password"`
 	PasswordHint string `mapstructure:"passwordHint" yaml:"passwordHint" json:"passwordHint"`
 	ExpiresAt    string `mapstructure:"expiresAt" yaml:"expiresAt" json:"expiresAt"`
+	// IPConcurrencyLimit 限制公益 Key 对"同一个客户端 IP"的并发路数，防止单个 IP
+	// 把公益额度占满导致其他人排队。<=0 时取默认值 DefaultPublicIPConcurrencyLimit。
+	// 命中 IP 白名单（public_concurrency_exempt）的地址不受此限制。
+	IPConcurrencyLimit int `mapstructure:"ipConcurrencyLimit" yaml:"ipConcurrencyLimit" json:"ipConcurrencyLimit"`
+}
+
+// DefaultPublicIPConcurrencyLimit 是公益 Key 单 IP 并发的默认值，保持历史行为（3 路）。
+const DefaultPublicIPConcurrencyLimit = 3
+
+// WithDefaults 兜底公益 Key 配置：单 IP 并发未设置（<=0）时回退到默认值。
+func (p PublicKeyConfig) WithDefaults() PublicKeyConfig {
+	if p.IPConcurrencyLimit <= 0 {
+		p.IPConcurrencyLimit = DefaultPublicIPConcurrencyLimit
+	}
+	return p
 }
 
 type ServerConfig struct {
@@ -155,17 +207,49 @@ type ProxyConfig struct {
 }
 
 const (
-	DefaultUpstreamTimeoutSeconds  = 30
-	DefaultCodexOriginator         = "codex_cli_rs"
-	DefaultCodexVersion            = "0.144.1"
-	DefaultUpstreamUserAgent       = DefaultCodexOriginator + "/" + DefaultCodexVersion + " (Ubuntu 22.4.0; x86_64) xterm-256color"
+	DefaultUpstreamTimeoutSeconds = 30
+	DefaultCodexOriginator        = "codex_cli_rs"
+	DefaultCodexVersion           = "0.144.1"
+	DefaultUpstreamUserAgent      = DefaultCodexOriginator + "/" + DefaultCodexVersion + " (Ubuntu 22.4.0; x86_64) xterm-256color"
 	legacyDefaultUpstreamUserAgent = "upstream-ops/0.1"
+	// DefaultStreamFirstEventTimeoutSeconds 是"等上游吐出第一个可见生成事件"的窗口。
+	// 推理模型（gpt-5.5/5.6 等）在真正出字前会先经历 reasoning 阶段，常需 5-30s，
+	// 秒级窗口会把完全可用的渠道误判成卡死并送去冷却。放宽到 45s 与成熟网关对齐
+	// （new-api StreamingTimeout 默认 300s、sub2api 默认禁用本地首字节截断），
+	// 45s 已足够覆盖推理模型的 reasoning 阶段，同时把"真卡死渠道"的最坏切换延迟
+	// 控制在一个更稳的时间点。等待期间仍按心跳间隔向客户端发 SSE 心跳，避免被下游断连。
+	DefaultStreamFirstEventTimeoutSeconds = 45
+	// DefaultHealthProbeTimeoutSeconds 是单次测活"等一个可见生成事件"的窗口。
+	// 推理模型 6s 内产不出 1+1= 的可见答案就会被判死，同样需要放宽。
+	DefaultHealthProbeTimeoutSeconds = 30
+	// DefaultHealthProbeMaxRatio 是一键/定时"全量兜底扫描"时的倍率成本上限：
+	// 只测 <=0.1 倍率的低倍率/公益渠道，避免全量测活把高倍率渠道也烧一遍。
+	// 明确勾选分组测活时不套用此上限（见 gateway.OneClickHealthTestOptions）。
+	DefaultHealthProbeMaxRatio = 0.1
 )
 
+// DefaultOpenAIHealthProbeModels 是 OpenAI 渠道一键测活默认依次尝试的模型：
+// 先用主模型，失败再退到次模型。保持历史行为（gpt-5.4 → gpt-5.5）。
+// 可在系统设置里覆盖，方便后续上游上线新模型时无需改代码即可纳入测活。
+var DefaultOpenAIHealthProbeModels = []string{"gpt-5.4", "gpt-5.5"}
+
 type UpstreamConfig struct {
-	TimeoutSeconds   int                    `mapstructure:"timeoutSeconds" yaml:"timeoutSeconds" json:"timeoutSeconds"`
-	UserAgent        string                 `mapstructure:"userAgent" yaml:"userAgent" json:"userAgent"`
-	RequestRectifier RequestRectifierConfig `mapstructure:"requestRectifier" yaml:"requestRectifier" json:"requestRectifier"`
+	TimeoutSeconds int    `mapstructure:"timeoutSeconds" yaml:"timeoutSeconds" json:"timeoutSeconds"`
+	UserAgent      string `mapstructure:"userAgent" yaml:"userAgent" json:"userAgent"`
+	// StreamFirstEventTimeoutSeconds 覆盖流式请求等待首个可见生成事件的秒数。<=0 时取默认值。
+	StreamFirstEventTimeoutSeconds int                    `mapstructure:"streamFirstEventTimeoutSeconds" yaml:"streamFirstEventTimeoutSeconds" json:"streamFirstEventTimeoutSeconds"`
+	// HealthProbeTimeoutSeconds 覆盖测活等待可见生成事件的秒数。<=0 时取默认值。
+	HealthProbeTimeoutSeconds int `mapstructure:"healthProbeTimeoutSeconds" yaml:"healthProbeTimeoutSeconds" json:"healthProbeTimeoutSeconds"`
+	// HealthProbeModels 是一键测活/定时测活对 OpenAI 渠道按顺序尝试的模型清单。
+	// 探测按顺序逐个尝试：前一个不行（不支持/超时/非生成响应）才试下一个，命中即停。
+	// 留空时回退到内置默认清单 DefaultOpenAIHealthProbeModels（gpt-5.4 → gpt-5.5），
+	// 保持历史行为。后期上游上新模型时，运维可在系统设置里补进清单，无需改代码发版。
+	HealthProbeModels []string `mapstructure:"healthProbeModels" yaml:"healthProbeModels" json:"healthProbeModels"`
+	// HealthProbeMaxRatio 是"全量兜底扫描"（不指定分组的一键测活 / 定时任务）用来
+	// 控制成本的倍率上限：只测有效倍率 <= 该值的低倍率/公益渠道。<=0 时取默认值。
+	// 明确勾选分组的一键测活不受此限制（尊重用户意图，见 OneClickHealthTestOptions）。
+	HealthProbeMaxRatio float64                `mapstructure:"healthProbeMaxRatio" yaml:"healthProbeMaxRatio" json:"healthProbeMaxRatio"`
+	RequestRectifier    RequestRectifierConfig `mapstructure:"requestRectifier" yaml:"requestRectifier" json:"requestRectifier"`
 }
 
 type RequestRectifierConfig struct {
@@ -180,6 +264,35 @@ func (u UpstreamConfig) WithDefaults() UpstreamConfig {
 	if u.TimeoutSeconds <= 0 {
 		u.TimeoutSeconds = DefaultUpstreamTimeoutSeconds
 	}
+	if u.StreamFirstEventTimeoutSeconds <= 0 {
+		u.StreamFirstEventTimeoutSeconds = DefaultStreamFirstEventTimeoutSeconds
+	}
+	if u.HealthProbeTimeoutSeconds <= 0 {
+		u.HealthProbeTimeoutSeconds = DefaultHealthProbeTimeoutSeconds
+	}
+	if u.HealthProbeMaxRatio <= 0 {
+		u.HealthProbeMaxRatio = DefaultHealthProbeMaxRatio
+	}
+	// 清洗测活模型清单：去空白、去重、丢弃空串；清洗后为空则回退内置默认清单。
+	// 这样前端传来的脏数据（空行、重复模型）不会污染探测顺序，也保证探测清单永不为空。
+	cleanedModels := make([]string, 0, len(u.HealthProbeModels))
+	seenModels := make(map[string]struct{}, len(u.HealthProbeModels))
+	for _, m := range u.HealthProbeModels {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		key := strings.ToLower(m)
+		if _, ok := seenModels[key]; ok {
+			continue
+		}
+		seenModels[key] = struct{}{}
+		cleanedModels = append(cleanedModels, m)
+	}
+	if len(cleanedModels) == 0 {
+		cleanedModels = append(cleanedModels, DefaultOpenAIHealthProbeModels...)
+	}
+	u.HealthProbeModels = cleanedModels
 	userAgent := strings.TrimSpace(u.UserAgent)
 	if userAgent == "" || userAgent == legacyDefaultUpstreamUserAgent {
 		u.UserAgent = DefaultUpstreamUserAgent
@@ -275,6 +388,8 @@ func load(path string, withEnv bool) (*Config, string, error) {
 		return nil, "", fmt.Errorf("unmarshal config: %w", err)
 	}
 	cfg.Upstream = cfg.Upstream.WithDefaults()
+	cfg.App.PublicKey = cfg.App.PublicKey.WithDefaults()
+	cfg.App.RouteAffinity = cfg.App.RouteAffinity.WithDefaults()
 	return cfg, v.ConfigFileUsed(), nil
 }
 
@@ -326,6 +441,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("app.notificationPrefix", "[AI 聚合监控] ")
 	v.SetDefault("app.publicKey.enabled", false)
 	v.SetDefault("app.publicKey.name", "公益 Key")
+	v.SetDefault("app.publicKey.ipConcurrencyLimit", DefaultPublicIPConcurrencyLimit)
+	// 缓存粘性默认开启：切上游会让上游 prompt cache 前缀失效，重喂上下文既慢又降智，
+	// 默认保住缓存优先，仅当新渠道便宜足够多（见 promoteMinSavingsRatio）才切走。
+	v.SetDefault("app.routeAffinity.enabled", true)
+	v.SetDefault("app.routeAffinity.promoteMinSavingsRatio", DefaultRouteAffinityPromoteMinSavingsRatio)
 
 	v.SetDefault("server.port", 8418)
 	v.SetDefault("server.mode", "debug")
@@ -377,6 +497,10 @@ func setDefaults(v *viper.Viper) {
 
 	v.SetDefault("upstream.timeoutSeconds", DefaultUpstreamTimeoutSeconds)
 	v.SetDefault("upstream.userAgent", DefaultUpstreamUserAgent)
+	v.SetDefault("upstream.streamFirstEventTimeoutSeconds", DefaultStreamFirstEventTimeoutSeconds)
+	v.SetDefault("upstream.healthProbeTimeoutSeconds", DefaultHealthProbeTimeoutSeconds)
+	v.SetDefault("upstream.healthProbeModels", DefaultOpenAIHealthProbeModels)
+	v.SetDefault("upstream.healthProbeMaxRatio", DefaultHealthProbeMaxRatio)
 	v.SetDefault("app.homepageCheapestEnabled", true)
 	v.SetDefault("upstream.requestRectifier.enabled", true)
 	v.SetDefault("upstream.requestRectifier.thinkingSignature", true)

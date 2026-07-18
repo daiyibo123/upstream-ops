@@ -298,6 +298,12 @@ export interface SystemPublicKeyConfig {
   password: string
   passwordHint: string
   expiresAt: string
+  ipConcurrencyLimit?: number
+}
+
+export interface SystemRouteAffinityConfig {
+  enabled: boolean
+  promoteMinSavingsRatio: number
 }
 
 export interface AppConfig {
@@ -306,6 +312,7 @@ export interface AppConfig {
 	homepageCheapestEnabled: boolean
 	responseInterceptionRules?: ResponseInterceptionRule[]
   publicKey: SystemPublicKeyConfig
+  routeAffinity: SystemRouteAffinityConfig
 }
 
 export interface ResponseInterceptionRule {
@@ -355,6 +362,10 @@ export interface SystemProxyConfig {
 
 export interface SystemUpstreamConfig {
   timeoutSeconds: number
+  streamFirstEventTimeoutSeconds: number
+  healthProbeTimeoutSeconds: number
+  healthProbeModels: string[]
+  healthProbeMaxRatio: number
   userAgent: string
   requestRectifier: SystemRequestRectifierConfig
 }
@@ -660,6 +671,7 @@ export interface UpstreamGroupKey {
   last_latency_ms?: number
   last_success_at?: string | null
   health_probe_model?: string
+  supported_models?: string
   last_used_at?: string | null
   disabled_until?: string | null
   last_error?: string
@@ -709,6 +721,7 @@ export interface IPPolicy {
   blocked: boolean
   public_concurrency_exempt: boolean
   note?: string
+  blocked_message?: string
   created_at: string
   updated_at: string
 }
@@ -716,6 +729,13 @@ export interface IPPolicy {
 export interface UsageLogsResponse {
   items: UsageLog[]
   total: number
+  stats: {
+    total_requests: number
+    success_requests: number
+    total_tokens: number
+    avg_first_token_ms: number
+    avg_duration_ms: number
+  }
   keys: GatewayKey[]
 }
 

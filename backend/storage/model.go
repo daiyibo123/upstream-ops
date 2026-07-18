@@ -326,17 +326,30 @@ type UsageLog struct {
 
 func (UsageLog) TableName() string { return "usage_logs" }
 
+// UsageLogStats 汇总当前保留的使用明细，用于使用记录页顶部概览。
+// 统计基于 usage_logs；清空明细后会归零，不影响 GatewayKey 上保留的累计用量。
+type UsageLogStats struct {
+	TotalRequests   int64   `json:"total_requests"`
+	SuccessRequests int64   `json:"success_requests"`
+	TotalTokens     int64   `json:"total_tokens"`
+	AvgFirstTokenMS float64 `json:"avg_first_token_ms"`
+	AvgDurationMS   float64 `json:"avg_duration_ms"`
+}
+
 // IPPolicy is a global abuse-control rule for gateway callers. The exemption
 // only applies to the public-key per-IP concurrency guard; blacklisting always
 // takes precedence.
 type IPPolicy struct {
-	ID                      uint      `gorm:"primaryKey" json:"id"`
-	IP                      string    `gorm:"size:64;not null;uniqueIndex" json:"ip"`
-	Blocked                 bool      `gorm:"not null;default:false;index" json:"blocked"`
-	PublicConcurrencyExempt bool      `gorm:"not null;default:false" json:"public_concurrency_exempt"`
-	Note                    string    `gorm:"size:256" json:"note,omitempty"`
-	CreatedAt               time.Time `json:"created_at"`
-	UpdatedAt               time.Time `json:"updated_at"`
+	ID                      uint   `gorm:"primaryKey" json:"id"`
+	IP                      string `gorm:"size:64;not null;uniqueIndex" json:"ip"`
+	Blocked                 bool   `gorm:"not null;default:false;index" json:"blocked"`
+	PublicConcurrencyExempt bool   `gorm:"not null;default:false" json:"public_concurrency_exempt"`
+	Note                    string `gorm:"size:256" json:"note,omitempty"`
+	// BlockedMessage 是这个 IP 被封禁时返回给客户端的自定义文案。为空时用内置默认
+	// 文案兜底（gatewayIPBannedMessage）。参考网关 Key 停用文案（GatewayKey.DisabledMessage）。
+	BlockedMessage string    `gorm:"type:text" json:"blocked_message,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 func (IPPolicy) TableName() string { return "ip_policies" }
@@ -447,11 +460,16 @@ type UpstreamGroupKey struct {
 	LastLatencyMS    int64      `gorm:"not null;default:0" json:"last_latency_ms"`
 	LastSuccessAt    *time.Time `json:"last_success_at,omitempty"`
 	HealthProbeModel string     `gorm:"size:128;not null;default:'';index" json:"health_probe_model,omitempty"`
-	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
-	DisabledUntil    *time.Time `json:"disabled_until,omitempty"`
-	LastError        string     `gorm:"type:text" json:"last_error,omitempty"`
-	CreatedAt        time.Time  `json:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at"`
+	// SupportedModels 是这个渠道声明/同步到的可用模型清单，存 JSON 数组文本。
+	// 数据来源：同步上游 /v1/models（可在可用渠道的编辑弹窗里手动增删）。
+	// 调度语义是"软过滤"——非空时，请求模型命中清单的候选优先；清单为空（未同步）
+	// 的候选视为"未知"正常参与调度，绝不因清单不全而把可用渠道误排除。
+	SupportedModels string     `gorm:"type:text;not null;default:''" json:"supported_models,omitempty"`
+	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
+	DisabledUntil   *time.Time `json:"disabled_until,omitempty"`
+	LastError       string     `gorm:"type:text" json:"last_error,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 func (UpstreamGroupKey) TableName() string { return "upstream_group_keys" }
