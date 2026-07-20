@@ -230,6 +230,13 @@ const (
 	// 网络错误等）首次出现后退出调度池的默认时长。与 Sub2API 的临时不可调度
 	// 语义一致：冷却期间不再把用户请求发送给该上游。
 	DefaultTemporaryFailureCooldownSeconds = 300
+	// DefaultStreamInterceptionScanEvents 是首字节落地前额外缓冲扫描拦截词的事件数。
+	// 0 = 关闭（保持默认低延迟）：preflight 一见到首个可见输出就提交，命中前的正常
+	// 文本可能已透传，只能靠转发阶段的 interceptContent 在命中后中断。
+	// >0 时：preflight 在见到首个可见输出后，仍继续无缓冲地多读最多这么多个可见事件
+	// 做完整拦截扫描，命中就在写首字节前整体切到下一个候选（连命中前那段都不显示），
+	// 代价是首字节延迟增加（要多等这些事件到达）。
+	DefaultStreamInterceptionScanEvents = 0
 )
 
 // DefaultOpenAIHealthProbeModels 是 OpenAI 渠道一键测活默认依次尝试的模型：
@@ -255,8 +262,12 @@ type UpstreamConfig struct {
 	HealthProbeMaxRatio float64 `mapstructure:"healthProbeMaxRatio" yaml:"healthProbeMaxRatio" json:"healthProbeMaxRatio"`
 	// TemporaryFailureCooldownSeconds 控制请求转发中真实上游故障的临时不可调度时长。
 	// <=0 时使用默认 300 秒；明确的 Retry-After 仍优先使用上游给出的时间。
-	TemporaryFailureCooldownSeconds int                    `mapstructure:"temporaryFailureCooldownSeconds" yaml:"temporaryFailureCooldownSeconds" json:"temporaryFailureCooldownSeconds"`
-	RequestRectifier                RequestRectifierConfig `mapstructure:"requestRectifier" yaml:"requestRectifier" json:"requestRectifier"`
+	TemporaryFailureCooldownSeconds int `mapstructure:"temporaryFailureCooldownSeconds" yaml:"temporaryFailureCooldownSeconds" json:"temporaryFailureCooldownSeconds"`
+	// StreamInterceptionScanEvents 是首字节落地前额外缓冲扫描拦截词的可见事件数。
+	// 0 = 关闭（默认，低延迟）；>0 时首字节前多扫描这些事件以便命中拦截词时无缝切换
+	// 候选、连命中前那段都不显示，代价是首字节延迟增加。<0 视为 0。
+	StreamInterceptionScanEvents int                    `mapstructure:"streamInterceptionScanEvents" yaml:"streamInterceptionScanEvents" json:"streamInterceptionScanEvents"`
+	RequestRectifier             RequestRectifierConfig `mapstructure:"requestRectifier" yaml:"requestRectifier" json:"requestRectifier"`
 }
 
 type RequestRectifierConfig struct {
@@ -282,6 +293,9 @@ func (u UpstreamConfig) WithDefaults() UpstreamConfig {
 	}
 	if u.TemporaryFailureCooldownSeconds <= 0 {
 		u.TemporaryFailureCooldownSeconds = DefaultTemporaryFailureCooldownSeconds
+	}
+	if u.StreamInterceptionScanEvents < 0 {
+		u.StreamInterceptionScanEvents = 0
 	}
 	// 清洗测活模型清单：去空白、去重、丢弃空串；清洗后为空则回退内置默认清单。
 	// 这样前端传来的脏数据（空行、重复模型）不会污染探测顺序，也保证探测清单永不为空。
@@ -512,6 +526,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("upstream.healthProbeModels", DefaultOpenAIHealthProbeModels)
 	v.SetDefault("upstream.healthProbeMaxRatio", DefaultHealthProbeMaxRatio)
 	v.SetDefault("upstream.temporaryFailureCooldownSeconds", DefaultTemporaryFailureCooldownSeconds)
+	v.SetDefault("upstream.streamInterceptionScanEvents", DefaultStreamInterceptionScanEvents)
 	v.SetDefault("app.homepageCheapestEnabled", true)
 	v.SetDefault("upstream.requestRectifier.enabled", true)
 	v.SetDefault("upstream.requestRectifier.thinkingSignature", true)

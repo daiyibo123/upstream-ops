@@ -14,11 +14,19 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { apiFetch } from "@/lib/api"
 import { dateTime, formatPercent, formatRatio, formatTokens, relativeTime } from "@/lib/format"
 import type { UsageLogsResponse } from "@/lib/api-types"
 
-const PAGE_SIZE = 50
+const PAGE_SIZE_OPTIONS = [50, 100, 200] as const
+const DEFAULT_PAGE_SIZE = 50
 type DetailView = "usage" | "events"
 
 function cacheRateLabel(rate: number | null | undefined, promptTokens: number | null | undefined) {
@@ -85,6 +93,7 @@ export default function UsagePage() {
   const [loading, setLoading] = useState(true)
   const [clearing, setClearing] = useState(false)
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE)
   const [refreshTick, setRefreshTick] = useState(0)
   const [detailView, setDetailView] = useState<DetailView>("usage")
 
@@ -92,15 +101,15 @@ export default function UsagePage() {
   const keys = data?.keys ?? []
   const total = data?.total ?? 0
   const stats = data?.stats
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
-  const rangeStart = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1
-  const rangeEnd = Math.min(page * PAGE_SIZE, total)
+  const totalPages = Math.max(1, Math.ceil(total / pageSize))
+  const rangeStart = total === 0 ? 0 : (page - 1) * pageSize + 1
+  const rangeEnd = Math.min(page * pageSize, total)
 
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    const offset = (page - 1) * PAGE_SIZE
-    apiFetch<UsageLogsResponse>(`/gateway/usage-logs?view=${detailView}&limit=${PAGE_SIZE}&offset=${offset}`)
+    const offset = (page - 1) * pageSize
+    apiFetch<UsageLogsResponse>(`/gateway/usage-logs?view=${detailView}&limit=${pageSize}&offset=${offset}`)
       .then((res) => {
         if (!cancelled) setData(res)
       })
@@ -113,7 +122,7 @@ export default function UsagePage() {
     return () => {
       cancelled = true
     }
-  }, [detailView, page, refreshTick])
+  }, [detailView, page, pageSize, refreshTick])
 
   const rows = useMemo(() => items, [items])
   const keyRows = useMemo(
@@ -456,8 +465,26 @@ export default function UsagePage() {
 
           {total > 0 ? (
             <div className="flex flex-col gap-2 rounded-md border border-border bg-muted/10 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
-              <div className="text-xs text-muted-foreground">
-                显示 {rangeStart}-{rangeEnd} / {total} 条
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span>显示 {rangeStart}-{rangeEnd} / {total} 条</span>
+                <Select
+                  value={String(pageSize)}
+                  onValueChange={(value) => {
+                    setPageSize(Number(value))
+                    setPage(1)
+                  }}
+                >
+                  <SelectTrigger className="h-8 w-24 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PAGE_SIZE_OPTIONS.map((size) => (
+                      <SelectItem key={size} value={String(size)}>
+                        {size} / 页
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
               <div className="flex items-center gap-1.5">
                 <Button

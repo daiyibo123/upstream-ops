@@ -73,10 +73,15 @@ const (
 	healthNetworkErrorCooldown      = 30 * time.Second
 	healthRateLimitCooldown         = 90 * time.Second
 	proxyPermanentFailureCooldown   = 30 * time.Minute
-	modelSupportPositiveTTL         = 2 * time.Hour
-	modelSupportNegativeTTL         = 15 * time.Minute
-	defaultHealthProbeBatchSize     = 10
-	automaticHealthProbeMaxRatio    = 0.1
+	// proxyHintedCooldownMax 是"上游明确给出 Retry-After / reset_after_seconds 提示"时
+	// 允许的最长冷却。无提示的临时故障仍走 proxyPermanentFailureCooldown(30m) 封顶；但上游
+	// 明说的长窗口（多小时 / 多天的配额耗尽）应被尊重，否则会每 30 分钟反复探测一个明知
+	// 还没恢复的渠道、白白消耗 fail-over 预算。8 天与常见 7 天配额窗口留一天余量对齐。
+	proxyHintedCooldownMax       = 8 * 24 * time.Hour
+	modelSupportPositiveTTL      = 2 * time.Hour
+	modelSupportNegativeTTL      = 15 * time.Minute
+	defaultHealthProbeBatchSize  = 10
+	automaticHealthProbeMaxRatio = 0.1
 
 	openAIHealthProbePrimaryModel  = "gpt-5.4"
 	openAIHealthProbeFallbackModel = "gpt-5.5"
@@ -613,6 +618,13 @@ type sseStreamReader struct {
 	// sanitizeFailure is configured for proxied streams after preflight. It
 	// removes provider-specific interception text from terminal SSE events.
 	sanitizeFailure func(string) (string, bool)
+	// interceptContent is configured for proxied streams after preflight. It
+	// reports whether the visible text accumulated so far matches an
+	// interception rule (for example a provider's "公益 token 休息了" or a relay
+	// error phrase smuggled inside normal content deltas). This catches错误话术
+	// that only appears *after* the first byte is written — preflight alone
+	// cannot see it — so the stream is cut and the候选 route enters cooldown.
+	interceptContent func(text string) bool
 	// closer/idleTimeout 可选：设置后，正式转发阶段每次读事件都带这个 idle 超时，
 	// 避免上游中途卡住导致 reader.Next() 无限阻塞、客户端超时断流。
 	closer            io.Closer
@@ -878,44 +890,10 @@ func (s *Service) ListUsageLogs(limit, offset int, views ...string) ([]storage.U
 		view = views[0]
 	}
 	items, total, err := s.usageLogs.ListView(limit, offset, view)
-	if err != nil || len(items) == 0 || s.groupKeys == nil {
-		return items, total, err
-	}
-	// Old rows were written before the selected group-key ID/charity snapshot
-	// existed. Enrich only an unambiguous channel+group match; never guess when
-	// several group Keys with the same visible name disagree about charity.
-	if groups, listErr := s.groupKeys.List(); listErr == nil {
-		type legacyCharity struct {
-			set     bool
-			charity bool
-			mixed   bool
-		}
-		matches := make(map[string]legacyCharity, len(groups))
-		for _, group := range groups {
-			key := usageLogGroupIdentity(group.ChannelID, group.GroupName)
-			if key == "" {
-				continue
-			}
-			current := matches[key]
-			if !current.set {
-				matches[key] = legacyCharity{set: true, charity: group.Charity}
-				continue
-			}
-			if current.charity != group.Charity {
-				current.mixed = true
-				matches[key] = current
-			}
-		}
-		for i := range items {
-			if items[i].UpstreamGroupKeyID != 0 {
-				continue
-			}
-			if match := matches[usageLogGroupIdentity(items[i].ChannelID, items[i].GroupName)]; match.set && !match.mixed {
-				items[i].UpstreamGroupCharity = match.charity
-			}
-		}
-	}
-	return items, total, nil
+	// 用量明细的倍率 / 公益标记沿用写入时的快照（recordUsageLog 记录当时的有效倍率），
+	// 不按渠道当前配置实时刷新：明细是历史计费凭证，运维事后改倍率不应改动已产生的账单，
+	// 显示值必须与当时实际计费口径一致，避免"历史账单金额随现在的倍率漂移"。
+	return items, total, err
 }
 
 // UsageLogStats 返回当前保留使用明细的聚合指标。
@@ -928,14 +906,6 @@ func (s *Service) UsageLogStats(views ...string) (storage.UsageLogStats, error) 
 		view = views[0]
 	}
 	return s.usageLogs.StatsView(view)
-}
-
-func usageLogGroupIdentity(channelID uint, groupName string) string {
-	groupName = strings.TrimSpace(groupName)
-	if channelID == 0 || groupName == "" {
-		return ""
-	}
-	return strconv.FormatUint(uint64(channelID), 10) + "\x00" + strings.ToLower(groupName)
 }
 
 // ClearUsageLogs 删除请求明细日志，但保留 GatewayKey 上的当日/累计用量统计。
@@ -1194,6 +1164,18 @@ func (s *Service) healthProbeBudget() time.Duration {
 		return time.Duration(secs) * time.Second
 	}
 	return healthProbeTimeout
+}
+
+// streamInterceptionScanEvents 是首字节落地前额外缓冲扫描拦截词的可见事件数。
+// 0（默认）= 关闭，preflight 一见到首个可见输出就提交、走低延迟；>0 时首字节前
+// 会多扫描这些可见事件，命中拦截词就在写首字节前整体切到下一个候选（连命中前那段
+// 都不显示），代价是首字节延迟增加。
+func (s *Service) streamInterceptionScanEvents() int {
+	n := s.upstreamConfig().StreamInterceptionScanEvents
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // healthRunBudget 是单个渠道整轮测活的外层信封。测活内部可能按配置清单先后探测
@@ -2994,18 +2976,31 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	// finalErr 承载"客户端错、换 key 也没用"路径的返回值。
 	// 在 stream 已写字节 / 明确 client-side 400 等场景下，我们把 err 记进来后不再继续 fail-over。
 	var finalErr error
+	// cooldownSkipped 收集"仅因冷却/内存禁用被跳过"的候选及其最早到期时间，
+	// 供绝境兜底使用：当没有任何候选被真正尝试过（全被冷却跳过）时，挑一个冷却最快
+	// 到期的强行试一次，避免刚恢复的渠道因残留冷却被直接判成"无可用上游"而返回 503。
+	type cooldownSkip struct {
+		candidate storage.UpstreamGroupKey
+		until     time.Time
+	}
+	var cooldownSkipped []cooldownSkip
+	recordCooldownSkip := func(candidate storage.UpstreamGroupKey, until time.Time) {
+		cooldownSkipped = append(cooldownSkipped, cooldownSkip{candidate: candidate, until: until})
+	}
 	for i := range candidates {
 		candidate := candidates[i]
 		if until, ok := candidateCooldownUntil(candidate, now); ok {
 			message := cooldownMessage(candidate, until)
 			disabledSeen = append(disabledSeen, message)
 			delayDispatchGroup(candidate)
+			recordCooldownSkip(candidate, until)
 			continue
 		}
 		if until, ok := s.runtimeDisabledUntil(candidate.ID); ok {
 			message := cooldownMessage(candidate, until)
 			disabledSeen = append(disabledSeen, message)
 			delayDispatchGroup(candidate)
+			recordCooldownSkip(candidate, until)
 			continue
 		}
 		if group := dispatchGroupIdentity(candidate); group != "" {
@@ -3056,14 +3051,22 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		delayedSameGroupFallback = s.orderCandidatesWithRuntime(delayedSameGroupFallback, requestedModel)
 		for i := range delayedSameGroupFallback {
 			candidate := delayedSameGroupFallback[i]
+			if err := r.Context().Err(); err != nil {
+				// 与主循环一致：客户端已断开就静默终止，不再用已取消的 context 尝试候选
+				// （否则每个候选都会被误判成 network_error 冷却 300s，拖垮候选池）。
+				s.recordDispatchSkipLog(gatewayKey, nil, requestedModel, normalized.ClientIP, "canceled", "client disconnected before dispatch completed")
+				return cancelGatewayRequest("client disconnected during dispatch: " + err.Error())
+			}
 			if until, ok := candidateCooldownUntil(candidate, time.Now()); ok {
 				message := cooldownMessage(candidate, until)
 				disabledSeen = append(disabledSeen, message)
+				recordCooldownSkip(candidate, until)
 				continue
 			}
 			if until, ok := s.runtimeDisabledUntil(candidate.ID); ok {
 				message := cooldownMessage(candidate, until)
 				disabledSeen = append(disabledSeen, message)
+				recordCooldownSkip(candidate, until)
 				continue
 			}
 			dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
@@ -3095,6 +3098,53 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			}
 			if finalErr != nil {
 				return finalErr
+			}
+		}
+	}
+	// 绝境兜底：本轮没有任何候选被真正尝试过（errorsSeen / saturatedSeen 都为空），
+	// 全部候选都只是因冷却 / 临时禁用被跳过。此时若直接返回 503，客户端就会看到
+	// "明明有渠道却 temporarily unavailable" 并从头重发整个请求。为尽量减少中断，
+	// 挑一个冷却最快到期的候选强行试一次——它可能刚好已经恢复（DB 冷却与内存禁用都是
+	// 保守估计，上游实际早就好了）。这是有界的：最多一次额外尝试，且只在本来就要返回
+	// 503 的绝境里触发，失败最坏也只是回到同样的 503，绝不会让结果更差。
+	// 客户端已断开时不做兜底：继续尝试没有意义，且会被误判成 network_error 冷却候选。
+	if r.Context().Err() == nil && len(errorsSeen) == 0 && len(saturatedSeen) == 0 && len(cooldownSkipped) > 0 {
+		best := cooldownSkipped[0]
+		for _, skip := range cooldownSkipped[1:] {
+			if skip.until.Before(best.until) {
+				best = skip
+			}
+		}
+		candidate := best.candidate
+		dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
+		outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
+		switch outcome.kind {
+		case candSuccess:
+			// 兜底尝试成功：这个候选其实已经恢复，顺手清掉它的冷却与内存禁用，
+			// 让后续请求可以正常调度到它，不必再走兜底。
+			s.clearRuntimeDisable(candidate.ID)
+			_ = s.groupKeys.ClearCooldown(candidate.ID)
+			s.finishDispatchLog(dispatchLog, outcome.logStatus, outcome.errMsg, outcome.usage)
+			return nil
+		case candSaturated:
+			s.finishDispatchLog(dispatchLog, "saturated", "candidate is at concurrency limit", usageTokens{})
+			saturatedSeen = append(saturatedSeen, fmt.Sprintf("%s/%s", candidate.ChannelName, candidate.GroupName))
+		case candRetryable:
+			s.finishDispatchLog(dispatchLog, "switched", outcome.errMsg, usageTokens{})
+			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
+			rememberUnsupportedModel(candidate, outcome.errMsg)
+			if shouldMarkProxyFailure(outcome.errMsg) {
+				s.markProxyFailure(candidate.ID, outcome.errMsg)
+			}
+		case candFatal:
+			s.finishDispatchLog(dispatchLog, "failed", outcome.errMsg, usageTokens{})
+			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
+			rememberUnsupportedModel(candidate, outcome.errMsg)
+			if outcome.markFailure && shouldMarkProxyFailure(outcome.errMsg) {
+				s.markProxyFailure(candidate.ID, outcome.errMsg)
+			}
+			if outcome.err != nil {
+				return outcome.err
 			}
 		}
 	}
@@ -3837,6 +3887,15 @@ func (s *Service) attemptNonStream(
 		writeProxyResponse(w, status, header, respBody, candidate, normalized.ResponseMode)
 		return candOutcome{kind: candSuccess, usage: usage}
 	}
+	// 下游客户端随时可能中断一个非流式请求（超时、导航离开、代理断连）。这会取消本请求
+	// 的 context，client.Do 返回包着 context.Canceled 的错误（status=0），绝不代表上游不健康。
+	// 必须在这里显式拦下：否则它会被 healthFailureStatus 归到 network_error → 冷却 300s，
+	// 且调度循环会拿着已取消的 context 继续尝试后续每个候选、逐个瞬间失败并各自冷却，
+	// 一次客户端断开就能把整个候选池打进冷却。对齐 attemptStream 的 context.Canceled 处理：
+	// 返回 fatal 且不 markFailure，让调度循环停止 fail-over。
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return candOutcome{kind: candFatal, err: err, errMsg: err.Error(), markFailure: false}
+	}
 	errMsg := err.Error()
 	if fallback, reason, ok := fallbackRequestAfterCandidateFailure(normalized, candidate, errMsg, false); ok {
 		start = time.Now()
@@ -3968,7 +4027,8 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		if preflightBudget <= 0 {
 			return true, usageTokens{}, firstOutput.timeoutError()
 		}
-		buffered, err := preflightSSEStream(reader, resp.Body, preflightBudget, func(events []sseEvent) bool { return s.shouldHoldInterceptionPreflight(key, events) })
+		scanEvents := s.streamInterceptionScanEvents()
+		buffered, err := preflightSSEStream(reader, resp.Body, preflightBudget, func(events []sseEvent) bool { return s.shouldHoldInterceptionPreflight(key, events, scanEvents) })
 		if err != nil {
 			if firstOutput.TimedOut() {
 				return true, usageTokens{}, firstOutput.timeoutError()
@@ -3981,10 +4041,16 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		if !firstOutput.MarkReady() {
 			return true, usageTokens{}, firstOutput.timeoutError()
 		}
+		// 首字节前对已缓冲事件做整体拦截扫描：把 buffered 里所有可见文本拼起来一起判定，
+		// 这样分散在多个 delta 的拦截词（"公益"+"token"+"休息了"）也能在提交前命中。命中即
+		// 整体切到下一个候选（retry=true，连命中前那段都不透传）。扫描窗口
+		// streamInterceptionScanEvents>0 时，preflight 已多缓冲了这些事件，命中率更高。
+		var preflightText strings.Builder
 		for _, event := range buffered {
-			if s.interceptedResponseContent(key, event.Data) != "" {
-				return true, usageTokens{}, errors.New("response content intercepted")
-			}
+			preflightText.WriteString(streamEventInterceptableText(event))
+		}
+		if s.interceptedResponseContent(key, preflightText.String()) != "" {
+			return true, usageTokens{}, errors.New("response content intercepted")
 		}
 		// 正式转发阶段的 idle 读超时：上游连续 streamIdleTimeout 没有任何新事件就判定卡死，
 		// 主动关连接返回错误，避免 reader.Next() 无限阻塞导致客户端 stream closed。
@@ -3993,6 +4059,14 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 				return "upstream stream interrupted", true
 			}
 			return message, false
+		}
+		// interceptContent 在正式转发阶段对逐段累积的可见文本做拦截判定。preflight 只
+		// 能在首字节前检查 buffered 事件，一旦上游先吐正常文本、随后再插入"公益 token
+		// 休息了"之类的错误话术（grok 尤其如此），preflight 已放行、无法再切候选。这里
+		// 在转发循环里持续累积可见文本并复用同一套 needles，命中即中断本次流并让调用方
+		// 把该渠道打入冷却，避免把错误话术继续透传给客户端。
+		reader.interceptContent = func(text string) bool {
+			return s.interceptedResponseContent(key, text) != ""
 		}
 		reader.closer = resp.Body
 		reader.idleTimeout = streamIdleTimeout
@@ -4116,7 +4190,12 @@ func (s *Service) interceptedResponseContent(key *storage.UpstreamGroupKey, cont
 // split across several SSE deltas (for example "公益" + "token" + "休息了")
 // before the first byte is written, so the scheduler may safely choose another
 // compatible upstream instead of leaving Codex with a disconnected stream.
-func (s *Service) shouldHoldInterceptionPreflight(key *storage.UpstreamGroupKey, events []sseEvent) bool {
+//
+// scanEvents>0 开启"固定扫描窗口"：即使当前文本已不是任何 needle 的前缀（上游先吐了
+// 正常文本），只要缓冲的可见事件数还没到窗口上限，就继续持有流多缓冲几个事件再判定。
+// 这样"正常文本 + 随后插入的拦截话术"也能在首字节前整体命中并无缝切换候选（连命中前
+// 那段都不透传），代价是首字节延迟增加。scanEvents<=0 时退回历史"仅前缀持有"行为。
+func (s *Service) shouldHoldInterceptionPreflight(key *storage.UpstreamGroupKey, events []sseEvent, scanEvents int) bool {
 	var text strings.Builder
 	for _, event := range events {
 		text.WriteString(streamEventInterceptableText(event))
@@ -4127,6 +4206,11 @@ func (s *Service) shouldHoldInterceptionPreflight(key *storage.UpstreamGroupKey,
 	}
 	if streamBufferedHasTerminal(events) {
 		return false
+	}
+	// 扫描窗口未用满前先持有：无论当前是否为 needle 前缀，都多缓冲一个可见事件继续扫描，
+	// 直到攒够 scanEvents 个带可见文本的事件才落地首字节。
+	if scanEvents > 0 && countVisibleInterceptableEvents(events) < scanEvents {
+		return true
 	}
 	for _, needle := range s.responseInterceptionNeedles(key) {
 		needle = normalizeResponseInterceptionText(needle)
@@ -4151,6 +4235,19 @@ func (s *Service) shouldHoldInterceptionPreflight(key *storage.UpstreamGroupKey,
 		}
 	}
 	return false
+}
+
+// countVisibleInterceptableEvents 统计已缓冲事件里"带可见可拦截文本"的事件数，
+// 供扫描窗口判定用。只数真正含可见文本的事件，纯生命周期噪声（response.created
+// 之类）不占窗口额度，避免窗口被无内容事件提前耗尽。
+func countVisibleInterceptableEvents(events []sseEvent) int {
+	n := 0
+	for _, ev := range events {
+		if strings.TrimSpace(streamEventInterceptableText(ev)) != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func streamEventInterceptableText(ev sseEvent) string {
@@ -4228,11 +4325,20 @@ func (s *Service) createUpstreamKey(ctx context.Context, ch storage.Channel, gro
 	return rec, nil
 }
 
+// autoSyncEnabledDefaultMaxRatio 是"覆盖同步"新建自动分组时默认启用的倍率上限。
+// 超过该倍率的分组默认置为 Enabled=false（不参与调度也不测活），避免同步一批渠道后
+// 高倍率分组被自动拉进调度池烧钱；运维确认后可在渠道页手动开启。只影响新建：已存在
+// 分组的 enabled 不在 upsertColumns 内，覆盖同步不会翻动用户手动开关。
+const autoSyncEnabledDefaultMaxRatio = 0.1
+
 func upstreamGroupKeyFrom(ch storage.Channel, group connector.APIKeyGroup, groupRef, keyCipher string) *storage.UpstreamGroupKey {
 	if groupRef == "" {
 		groupRef, _ = groupRefFor(ch.Type, group)
 	}
 	format := inferGroupClientFormat(group.Name, group.Description)
+	ratio := normalizedRatio(group.Ratio)
+	// 倍率高于阈值的分组默认关闭：ratio<=0 视为"未知倍率"，同样保守关闭，等待运维确认。
+	enabled := ratio > 0 && ratio <= autoSyncEnabledDefaultMaxRatio
 	return &storage.UpstreamGroupKey{
 		ChannelID:             ch.ID,
 		ChannelName:           ch.Name,
@@ -4245,11 +4351,11 @@ func upstreamGroupKeyFrom(ch storage.Channel, group connector.APIKeyGroup, group
 		GroupRef:              groupRef,
 		GroupName:             strings.TrimSpace(group.Name),
 		GroupDesc:             strings.TrimSpace(group.Description),
-		Ratio:                 normalizedRatio(group.Ratio),
+		Ratio:                 ratio,
 		RatioScalePercent:     100,
 		InputPricePerMillion:  storage.DefaultInputPricePerMillion,
 		OutputPricePerMillion: storage.DefaultOutputPricePerMillion,
-		Enabled:               true,
+		Enabled:               enabled,
 		ConcurrencyLimit:      0,
 		KeyCipher:             keyCipher,
 		Status:                "alive",
@@ -4334,6 +4440,11 @@ func (s *Service) testGroupKeyWithUpstreamSlot(ctx context.Context, key *storage
 	item.CheckedAt = &now
 	if last.succeeded() {
 		item.Status = "alive"
+		// 测活成功必须同时清掉内存里的 runtime disable：MarkHealthSuccessWithModel 只清 DB 的
+		// disabled_until，而调度时会同时检查 DB 冷却和 runtimeDisabledUntil（并发降级 / 代理失败
+		// 冷却都记在内存）。漏清会造成"测活显示活、DB 冷却已解，但渠道仍被内存态冻住不可调度"，
+		// 便宜渠道被压在 fallback 层、付费渠道反而被选中，全被冻时直接显示"无可用上游"。
+		s.clearRuntimeDisable(key.ID)
 		_ = s.groupKeys.MarkHealthSuccessWithModel(key.ID, item.LatencyMS, last.model)
 		if last.model != "" {
 			s.rememberCandidateModelCapability(key.ID, last.model, true)
@@ -5691,17 +5802,25 @@ type proxyFailurePolicy struct {
 func (s *Service) proxyFailurePolicy(status string, msg string) proxyFailurePolicy {
 	switch status {
 	case "rate_limited":
-		delay := s.temporaryFailureCooldown()
+		// 上游明确给出的 Retry-After / reset 边界优先，且尊重其真实长度（长窗口用 8 天上限，
+		// 不再被 30 分钟封顶反复探测）。无提示时退回用户可配的默认冷却（默认 300s）。
 		if hinted, ok := retryAfterDurationFromText(msg, time.Now()); ok {
-			delay = hinted
+			return proxyFailurePolicy{cooldown: clampProxyCooldown(hinted, time.Second, proxyHintedCooldownMax)}
 		}
-		return proxyFailurePolicy{cooldown: clampProxyCooldown(delay, time.Second, proxyPermanentFailureCooldown)}
+		return proxyFailurePolicy{cooldown: clampProxyCooldown(s.temporaryFailureCooldown(), time.Second, proxyPermanentFailureCooldown)}
 	case "zero_balance", "auth_failed":
 		return proxyFailurePolicy{disableKey: true}
 	case "forbidden":
 		return proxyFailurePolicy{cooldown: proxyPermanentFailureCooldown}
 	}
-	return proxyFailurePolicy{cooldown: s.temporaryFailureCooldown()}
+	// 其它临时故障（502/503/500 等 server_error、network_error、timeout、upstream_error）：
+	// 上游若明确给了 Retry-After / reset_after_seconds，就按它的重试边界冷却（尊重真实长度），
+	// 而不是一律套用默认 5 分钟。502 (retry-after: 60) 应只冷却 60s，避免把可用渠道长时间
+	// 踢出候选池；无提示时退回默认冷却（默认 300s）。
+	if hinted, ok := retryAfterDurationFromText(msg, time.Now()); ok {
+		return proxyFailurePolicy{cooldown: clampProxyCooldown(hinted, time.Second, proxyHintedCooldownMax)}
+	}
+	return proxyFailurePolicy{cooldown: clampProxyCooldown(s.temporaryFailureCooldown(), time.Second, proxyPermanentFailureCooldown)}
 }
 
 func (s *Service) temporaryFailureCooldown() time.Duration {
@@ -8888,6 +9007,7 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	toolCalls := map[int]*chatToolCallState{}
 	toolOrder := make([]int, 0)
 	sawDone := false
+	var interceptBuf strings.Builder
 
 	emitCreated := func() error {
 		if createdSent {
@@ -8986,6 +9106,27 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			best.SoftFailure = message
 			best.Status = "failed"
 			return errResponsesStreamTerminal
+		}
+		// 正式转发阶段的内容拦截：上游（尤其 grok 中转）可能先吐正常文本，再把"公益 token
+		// 休息了 / 当前没有可用上游"之类的软失败话术塞进后续 delta。preflight 只看首字节前的
+		// 内容抓不到，这里逐段累积可见文本，命中拦截词就写 response.failed 终态并中断，标记
+		// SoftFailure 让上层把该渠道打入冷却，避免把错误话术继续透传给客户端。
+		if reader != nil && reader.interceptContent != nil {
+			if text := streamEventInterceptableText(sseEvent{Event: event, Data: data}); text != "" {
+				interceptBuf.WriteString(text)
+				if reader.interceptContent(interceptBuf.String()) {
+					message := "response content intercepted"
+					if err := emitCreated(); err != nil {
+						return err
+					}
+					if err := writeResponsesStreamFailure(w, id, model, "upstream_error", "upstream stream interrupted"); err != nil {
+						return err
+					}
+					best.SoftFailure = message
+					best.Status = "failed"
+					return errResponsesStreamTerminal
+				}
+			}
 		}
 		var raw map[string]any
 		if err := json.Unmarshal([]byte(data), &raw); err != nil {
@@ -9157,6 +9298,7 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	roleSent := false
 	doneSent := false
 	var best usageTokens
+	var interceptBuf strings.Builder
 	err := readSSEEvents(buffered, reader, func(event, data string) error {
 		if data == "" {
 			return nil
@@ -9181,6 +9323,33 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			best.SoftFailure = message
 			best.Status = "failed"
 			return errResponsesStreamTerminal
+		}
+		// 正式转发阶段的内容拦截：grok 等中转常把"公益 token 休息了 / 当前没有可用上游"之类
+		// 的软失败话术塞进正常文本之后的 delta 里，preflight 只看首字节前的内容抓不到。这里
+		// 逐段累积可见文本，命中拦截词就按 chat 格式收尾（stop + [DONE]）并标记 SoftFailure，
+		// 让上层把该渠道打入冷却，避免把错误话术继续透传给客户端。
+		if reader != nil && reader.interceptContent != nil {
+			if text := streamEventInterceptableText(sseEvent{Event: event, Data: data}); text != "" {
+				interceptBuf.WriteString(text)
+				if reader.interceptContent(interceptBuf.String()) {
+					if !roleSent {
+						if err := writeChatStreamChunk(w, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
+							return err
+						}
+						roleSent = true
+					}
+					if err := writeChatStreamChunk(w, id, model, created, map[string]any{}, "stop"); err != nil {
+						return err
+					}
+					if err := writeSSEData(w, "[DONE]"); err != nil {
+						return err
+					}
+					doneSent = true
+					best.SoftFailure = "response content intercepted"
+					best.Status = "failed"
+					return errResponsesStreamTerminal
+				}
+			}
 		}
 		var raw map[string]any
 		if err := json.Unmarshal([]byte(data), &raw); err != nil {
@@ -9287,6 +9456,7 @@ func streamResponsesAsClaudeEvents(w http.ResponseWriter, buffered []sseEvent, r
 	started := false
 	stopped := false
 	var best usageTokens
+	var interceptBuf strings.Builder
 	err := readSSEEvents(buffered, reader, func(event, data string) error {
 		if data == "" {
 			return nil
@@ -9311,6 +9481,32 @@ func streamResponsesAsClaudeEvents(w http.ResponseWriter, buffered []sseEvent, r
 			best.SoftFailure = message
 			best.Status = "failed"
 			return errResponsesStreamTerminal
+		}
+		// 正式转发阶段的内容拦截（Claude 格式）：上游先吐正常文本、再插入软失败话术时
+		// preflight 抓不到。逐段累积可见文本，命中拦截词就以 Claude 终态收尾并中断，
+		// 标记 SoftFailure 让上层把该渠道打入冷却。
+		if reader != nil && reader.interceptContent != nil {
+			if text := streamEventInterceptableText(sseEvent{Event: event, Data: data}); text != "" {
+				interceptBuf.WriteString(text)
+				if reader.interceptContent(interceptBuf.String()) {
+					if !started {
+						if err := writeClaudeStart(w, id, model); err != nil {
+							return err
+						}
+						started = true
+					}
+					if err := writeClaudeEvent(w, "content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}); err != nil {
+						return err
+					}
+					if err := writeClaudeEvent(w, "message_stop", map[string]any{"type": "message_stop"}); err != nil {
+						return err
+					}
+					stopped = true
+					best.SoftFailure = "response content intercepted"
+					best.Status = "failed"
+					return errResponsesStreamTerminal
+				}
+			}
 		}
 		var raw map[string]any
 		if err := json.Unmarshal([]byte(data), &raw); err != nil {
@@ -10071,6 +10267,7 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 	var best usageTokens
 	if responseMode != "responses" {
 		var textBuf strings.Builder
+		var interceptBuf strings.Builder
 		err := readSSEEvents(buffered, reader, func(event, data string) error {
 			if failed, message := sanitizedStreamEventFailure(reader, sseEvent{Event: event, Data: data}); failed {
 				payload := mustJSON(map[string]any{"error": map[string]any{"message": message, "type": "upstream_error"}})
@@ -10080,6 +10277,25 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 				best.SoftFailure = message
 				best.Status = "failed"
 				return errResponsesStreamTerminal
+			}
+			// 正式转发阶段的内容拦截：上游可能先吐正常文本、再把"公益 token 休息了 / 当前
+			// 没有可用上游"之类的软失败话术塞进后续 delta（grok 尤甚），preflight 只看首字节
+			// 前的内容抓不到。这里逐段累积可见文本，命中拦截词就立即中断透传、标记 SoftFailure，
+			// 让上层把该渠道打入冷却，避免把错误话术继续喂给客户端。
+			if reader != nil && reader.interceptContent != nil {
+				if text := streamEventInterceptableText(sseEvent{Event: event, Data: data}); text != "" {
+					interceptBuf.WriteString(text)
+					if reader.interceptContent(interceptBuf.String()) {
+						message := "upstream stream interrupted"
+						payload := mustJSON(map[string]any{"error": map[string]any{"message": message, "type": "upstream_error"}})
+						if err := writeSSEEvent(w, sseEvent{Event: "error", Data: payload}); err != nil {
+							return err
+						}
+						best.SoftFailure = message
+						best.Status = "failed"
+						return errResponsesStreamTerminal
+					}
+				}
 			}
 			usage := usageFromSSEData(data)
 			if usage.ResponseID != "" {
@@ -10117,6 +10333,7 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 	model := ""
 	respID := "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	var textBuf strings.Builder
+	var interceptBuf strings.Builder
 
 	sendDone := func() error {
 		if doneSent {
@@ -10201,6 +10418,25 @@ func streamRawSSE(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamR
 			best.Status = "failed"
 			doneSent = true
 			return errResponsesStreamTerminal
+		}
+		// 正式转发阶段的内容拦截：上游先吐正常文本、再把软失败话术塞进后续 delta 时，
+		// preflight 抓不到。逐段累积可见文本，命中拦截词就写 response.failed 终态并中断，
+		// 标记 SoftFailure 让上层把该渠道打入冷却。
+		if reader != nil && reader.interceptContent != nil {
+			if text := streamEventInterceptableText(ev); text != "" {
+				interceptBuf.WriteString(text)
+				if reader.interceptContent(interceptBuf.String()) {
+					message := "response content intercepted"
+					failedSeen = true
+					if err := writeResponsesStreamFailure(w, respID, model, "upstream_error", "upstream stream interrupted"); err != nil {
+						return err
+					}
+					best.SoftFailure = message
+					best.Status = "failed"
+					doneSent = true
+					return errResponsesStreamTerminal
+				}
+			}
 		}
 
 		typ := sseEventType(ev)

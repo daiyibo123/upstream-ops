@@ -8,6 +8,22 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.27.3 - 2026-07-20
+
+### Changed
+
+- Streaming interception can optionally buffer additional visible events before the first byte, and now continues scanning forwarded OpenAI, Claude, and raw SSE streams for soft upstream failure text.
+- Saved system settings now apply to the runtime immediately, and the settings form no longer gets overwritten by background refreshes while it is being edited.
+- Usage logs can show 50, 100, or 200 rows per page; dashboard and home-page ratio displays now use the same effective-ratio value used by scheduling.
+- Cover-synced upstream groups above the default automatic ratio ceiling now start disabled until an operator explicitly enables them.
+
+### Fixed
+
+- Client disconnects no longer cool down healthy upstream candidates, and successful health probes now clear both persisted cooldowns and in-memory runtime disables.
+- When every candidate is blocked only by cooldown, the gateway makes one bounded retry against the soonest-expiring route instead of returning a hard 503 immediately.
+- Upstream `Retry-After` and reset hints are respected for both short retries and longer quota windows without repeatedly probing known-cooling routes.
+- Historical usage rows keep their recorded ratio and charity snapshots instead of changing when current channel settings are edited.
+
 ## v0.27.2 - 2026-07-18
 
 ### Changed

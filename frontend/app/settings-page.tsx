@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import {
@@ -38,7 +38,6 @@ import { apiFetch } from "@/lib/api";
 import { useTriggerRefresh } from "@/lib/refresh-context";
 import type {
   AppVersion,
-  ApplyConfigResult,
   NotificationChannel,
   NotificationChannelType,
   SystemConfig,
@@ -74,6 +73,7 @@ function withConfigDefaults(cfg: SystemConfig): SystemConfig {
     healthProbeModels?: string[];
     healthProbeMaxRatio?: number;
     temporaryFailureCooldownSeconds?: number;
+    streamInterceptionScanEvents?: number;
   };
   return {
     ...cfg,
@@ -102,6 +102,7 @@ function withConfigDefaults(cfg: SystemConfig): SystemConfig {
           : ["gpt-5.4", "gpt-5.5"],
       healthProbeMaxRatio: upstream.healthProbeMaxRatio ?? 0.1,
       temporaryFailureCooldownSeconds: upstream.temporaryFailureCooldownSeconds ?? 300,
+      streamInterceptionScanEvents: upstream.streamInterceptionScanEvents ?? 0,
     },
   };
 }
@@ -125,9 +126,7 @@ export default function SettingsPage() {
   const { confirm, dialog: confirmDialog } = useConfirm();
   const [form, setForm] = useState<SystemConfig | null>(null);
   const [saving, setSaving] = useState(false);
-  const [applying, setApplying] = useState(false);
   const [healthProbeModelDraft, setHealthProbeModelDraft] = useState("");
-  const [configSavedPendingApply, setConfigSavedPendingApply] = useState(false);
   const [testingProxy, setTestingProxy] = useState(false);
   const [checkingVersion, setCheckingVersion] = useState(false);
   const [updatingSystem, setUpdatingSystem] = useState(false);
@@ -143,8 +142,14 @@ export default function SettingsPage() {
   );
   const [versionInfo, setVersionInfo] = useState<AppVersion | null>(null);
 
+  // 只在首次加载（form 尚未初始化）时用服务端配置填充表单。后续的手动刷新 / 保存后
+  // refetch 都不再覆盖 form，避免用户改了代理 IP、冷却时长等字段还没点“保存/应用”时，
+  // 一次后台刷新就把正在编辑的表单冲回配置文件里的旧值（表现为“保存后自动切回原值”）。
+  // 保存成功后 form 已经持有最新值，无需再从服务端回填。
+  const formInitializedRef = useRef(false);
   useEffect(() => {
-    if (query.data?.config) {
+    if (!formInitializedRef.current && query.data?.config) {
+      formInitializedRef.current = true;
       setForm(withConfigDefaults(query.data.config));
     }
   }, [query.data]);
@@ -271,38 +276,22 @@ export default function SettingsPage() {
   }
 
   async function handleSave() {
+    if (!form) return;
     setSaving(true);
     try {
-      await apiFetch("/settings/config", {
+      // 后端 PUT /settings/config 已在写文件后立即 ApplyFromFile()，保存即生效，
+      // 无需再单独点“应用”。保存成功后不回填表单：form 已持有用户刚提交的最新值，
+      // 若再从服务端拉取覆盖会把用户输入冲回旧值（表现为“改了代理 IP 等一会儿又跳回”）。
+      const result = await apiFetch<{ message?: string }>("/settings/config", {
         method: "PUT",
         body: JSON.stringify(form),
       });
-      toast.success("已写入配置文件");
-      setConfigSavedPendingApply(true);
-      query.refetch();
-      appVersion.refetch();
+      toast.success(result?.message || "已保存并生效");
       refresh();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "保存失败");
     } finally {
       setSaving(false);
-    }
-  }
-
-  async function handleApply() {
-    setApplying(true);
-    try {
-      const result = await apiFetch<ApplyConfigResult>("/settings/apply", {
-        method: "POST",
-      });
-      toast.success(result.message);
-      setConfigSavedPendingApply(false);
-      query.refetch();
-      refresh();
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "应用失败");
-    } finally {
-      setApplying(false);
     }
   }
 
@@ -1443,6 +1432,31 @@ export default function SettingsPage() {
                   }
                 />
               </Field>
+              <Field
+                label="首字节前拦截扫描事件数"
+                description="0 = 关闭（默认，低延迟）：命中拦截词前的正常文本可能已透传。大于 0 时首字节落地前额外多缓冲这些可见事件做完整拦截扫描，命中拦截词就在写首字节前无缝切换到下一个候选（连命中前那段都不显示），代价是首字节延迟增加。"
+              >
+                <Input
+                  type="number"
+                  min={0}
+                  max={24}
+                  step={1}
+                  value={String(form.upstream.streamInterceptionScanEvents ?? 0)}
+                  onChange={(e) =>
+                    setForm((prev) =>
+                      prev
+                        ? {
+                            ...prev,
+                            upstream: {
+                              ...prev.upstream,
+                              streamInterceptionScanEvents: Math.max(0, Number(e.target.value || 0)),
+                            },
+                          }
+                        : prev,
+                    )
+                  }
+                />
+              </Field>
             </div>
             <div className="mt-4 grid gap-4 md:grid-cols-2">
               <InlineSwitch
@@ -1651,27 +1665,11 @@ export default function SettingsPage() {
           </SectionCard>
 
           <div className="flex flex-wrap items-center gap-3 border-t border-border pt-5">
-            <Button onClick={handleSave} disabled={saving || applying}>
-              {saving ? "保存中..." : "保存"}
+            <Button onClick={handleSave} disabled={saving}>
+              {saving ? "保存中..." : "保存并生效"}
             </Button>
-            <Button
-              variant="outline"
-              onClick={handleApply}
-              disabled={saving || applying}
-            >
-              {applying ? "应用中..." : "应用"}
-            </Button>
-            <span
-              className={cn(
-                "text-xs",
-                configSavedPendingApply
-                  ? "font-medium text-warning"
-                  : "text-muted-foreground",
-              )}
-            >
-              {configSavedPendingApply
-                ? "配置已保存但尚未应用，点击应用后才会立即生效。"
-                : "保存写入配置文件，应用让鉴权、调度、通知策略、代理和上游请求配置立即更新。"}
+            <span className="text-xs text-muted-foreground">
+              保存后立即写入配置文件并应用到运行时，鉴权、调度、通知策略、代理和上游请求配置即时更新，无需重启。
             </span>
           </div>
             </CardContent>

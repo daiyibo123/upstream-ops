@@ -231,5 +231,8 @@ export function useAnnouncements(page = 1, pageSize = 20) {
 }
 
 export function useSystemConfig() {
-  return useApi<SystemConfigResponse>("/settings/config")
+  // watchRefresh=false：系统设置页有可编辑表单，若订阅 30s 全局轮询 tick，后台每次
+  // 刷新都会重新拉 /settings/config 并覆盖用户正在编辑但还没保存的表单（表现为"改了
+  // 代理 IP 等一会儿又跳回原值"）。这里只在首次加载 / 显式 refetch 时取服务端数据。
+  return useApi<SystemConfigResponse>("/settings/config", false)
 }

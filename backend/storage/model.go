@@ -441,6 +441,7 @@ type UpstreamGroupKey struct {
 	// RatioScalePercent converts the upstream-advertised ratio into the real
 	// local consumption ratio.  100 keeps the upstream value unchanged.
 	RatioScalePercent     float64 `gorm:"not null;default:100" json:"ratio_scale_percent"`
+	EffectiveRatio        *float64 `gorm:"-" json:"effective_ratio,omitempty"`
 	InputPricePerMillion  float64 `gorm:"not null;default:5" json:"input_price_per_million"`
 	OutputPricePerMillion float64 `gorm:"not null;default:30" json:"output_price_per_million"`
 	Priority              int     `gorm:"not null;default:0;index" json:"priority"`
@@ -473,3 +474,23 @@ type UpstreamGroupKey struct {
 }
 
 func (UpstreamGroupKey) TableName() string { return "upstream_group_keys" }
+
+// EffectiveRatioValue 返回本地真正用于调度、成本排序、展示和计费的有效倍率：
+// 优先用已算好的 EffectiveRatio（List 时按 RatioScalePercent 缩放并写入内存），
+// 否则回退到 RatioScalePercent 现算。标称 Ratio<=0 视为 1（历史行兜底），
+// RatioScalePercent<=0 视为 100%（向后兼容零值列）。这是调度侧 effectiveGroupRatio
+// 的可导出等价实现，供 dashboard 等 api 层复用，保证"首页展示倍率 == 调度倍率"。
+func (k UpstreamGroupKey) EffectiveRatioValue() float64 {
+	ratio := k.Ratio
+	if ratio <= 0 {
+		ratio = 1
+	}
+	if k.EffectiveRatio != nil {
+		return *k.EffectiveRatio
+	}
+	percent := k.RatioScalePercent
+	if percent <= 0 {
+		percent = 100
+	}
+	return ratio * percent / 100
+}

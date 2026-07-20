@@ -135,10 +135,21 @@ func saveSettingsConfig(c *gin.Context, d *Deps) {
 		return
 	}
 
+	// 保存后立即加载到运行时，做到"编辑保存即生效"，无需前端再点一次“应用”。
+	// 独立的 /settings/apply 仍保留（供仅重载运行时的场景），但正常保存路径一步到位。
+	// ApplyFromFile 失败不回滚已写入的文件：文件是权威配置源，下次重启或手动 apply
+	// 仍会生效；这里只把错误透传给前端提示，避免"保存成功但运行时没变"却无任何反馈。
+	result, applyErr := d.Runtime.ApplyFromFile()
+	if applyErr != nil {
+		fail(c, http.StatusInternalServerError, applyErr)
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"data": gin.H{
 			"config_path": path,
-			"message":     "已写入配置文件",
+			"message":     "已保存并生效",
+			"apply":       result,
 		},
 	})
 }

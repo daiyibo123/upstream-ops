@@ -496,6 +496,9 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 		}
 		stat.PromptTokens += group.PromptTokens
 		stat.CompletionTokens += group.CompletionTokens
+		// 展示与前五名比较统一用有效倍率（EffectiveRatioValue），与调度器口径一致。
+		// 否则首页按标称 Ratio 显示便宜（如 0.02/0.03），调度却按含 RatioScalePercent
+		// 缩放的有效倍率选中更贵的渠道（0.04），造成"页面显示便宜实际调度贵"的错位。
 		g := dashboardGatewayGroup{
 			ID:                    group.ID,
 			ChannelID:             group.ChannelID,
@@ -503,7 +506,7 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 			SiteDomain:            siteDomains[group.ChannelID],
 			ClientFormat:          group.ClientFormat,
 			GroupName:             group.GroupName,
-			Ratio:                 group.Ratio,
+			Ratio:                 group.EffectiveRatioValue(),
 			InputPricePerMillion:  group.InputPricePerMillion,
 			OutputPricePerMillion: group.OutputPricePerMillion,
 			Priority:              group.Priority,
@@ -518,7 +521,7 @@ func dashboardGateway(d *Deps) dashboardGatewayStat {
 		}
 		stat.Groups = append(stat.Groups, g)
 		if isOpenAI && group.Enabled && (status == "alive" || status == "unknown") {
-			if stat.Cheapest == nil || group.Ratio < stat.Cheapest.Ratio {
+			if stat.Cheapest == nil || g.Ratio < stat.Cheapest.Ratio {
 				copy := g
 				stat.Cheapest = &copy
 			}

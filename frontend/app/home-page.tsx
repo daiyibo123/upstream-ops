@@ -513,6 +513,9 @@ export default function HomePage() {
                           <div key={`${group.id}-${index}`} className="flex h-8 shrink-0 items-center gap-2 rounded-md bg-muted/50 px-3">
                             <span className="w-5 font-semibold text-brand">#{rank}</span>
                             <span className="min-w-0 flex-1 truncate text-foreground">{group.site_domain || group.channel_name || "未知网站"}</span>
+                            {group.charity ? (
+                              <HeartHandshake className="size-3.5 shrink-0 text-rose-500" aria-label="公益渠道" />
+                            ) : null}
                             <span className="font-mono font-semibold text-success">{formatRatio(group.ratio)}</span>
                           </div>
                         )

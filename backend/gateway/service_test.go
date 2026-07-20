@@ -5260,14 +5260,14 @@ func TestResponseInterceptionHandlesPublicTokenRestAcrossDeltas(t *testing.T) {
 		t.Fatal("public token rest message must be intercepted despite whitespace")
 	}
 	first := []sseEvent{{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"公益"}`}}
-	if !svc.shouldHoldInterceptionPreflight(key, first) {
+	if !svc.shouldHoldInterceptionPreflight(key, first, 0) {
 		t.Fatal("interception prefix should keep preflight buffered")
 	}
 	complete := append(first,
 		sseEvent{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"token"}`},
 		sseEvent{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"休息了"}`},
 	)
-	if svc.shouldHoldInterceptionPreflight(key, complete) {
+	if svc.shouldHoldInterceptionPreflight(key, complete, 0) {
 		t.Fatal("matched interception text should return to caller for retry")
 	}
 	if got := svc.interceptedResponseContent(key, "公益token休息了"); got == "" {
@@ -5286,6 +5286,34 @@ func TestResponseInterceptionHandlesPublicTokenRestAcrossDeltas(t *testing.T) {
 		if got := svc.interceptedResponseContent(key, content); got == "" {
 			t.Fatalf("upstream soft-failure text must be intercepted for %q", content)
 		}
+	}
+}
+
+// scanEvents>0 时，上游先吐正常文本、随后插入拦截话术的场景应在首字节前整体命中：
+// 只要缓冲的可见事件数还没到窗口上限就继续持有流，攒够后拼接判定命中，返回 false（停止持有）
+// 让调用方在写首字节前整体切换候选（连命中前那段都不透传）。scanEvents=0 时退回历史行为，
+// 上游一吐正常文本就放行、命中前那段无法拦下。
+func TestShouldHoldInterceptionPreflightScanWindow(t *testing.T) {
+	svc := &Service{}
+	key := &storage.UpstreamGroupKey{ChannelID: 11}
+	normal := sseEvent{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"好的，"}`}
+	needle := sseEvent{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"当前没有可用上游"}`}
+
+	// scanEvents=0：正常文本不是任何 needle 前缀，preflight 立即放行（不持有）。
+	if svc.shouldHoldInterceptionPreflight(key, []sseEvent{normal}, 0) {
+		t.Fatal("scanEvents=0 时正常文本应立即放行，不持有")
+	}
+	// scanEvents=3：窗口未满时应持续持有，即使当前文本已不是 needle 前缀。
+	if !svc.shouldHoldInterceptionPreflight(key, []sseEvent{normal}, 3) {
+		t.Fatal("扫描窗口未满时应继续持有流以便多缓冲事件")
+	}
+	// 攒够可见事件且拼接后命中拦截词：返回 false（停止持有），交回调用方整体切换候选。
+	complete := []sseEvent{normal, needle}
+	if svc.shouldHoldInterceptionPreflight(key, complete, 2) {
+		t.Fatal("命中拦截词后应停止持有，交回调用方切换候选")
+	}
+	if got := svc.interceptedResponseContent(key, "好的，当前没有可用上游"); got == "" {
+		t.Fatal("拼接后的可见文本必须命中拦截词")
 	}
 }
 
@@ -6905,6 +6933,57 @@ func TestStreamRawSSEConvertsIncompleteToFailedTerminal(t *testing.T) {
 		t.Fatalf("response.incomplete must not be exposed as terminal: %s", out)
 	}
 	assertResponsesStreamTerminalOnce(t, out, "response.failed")
+}
+
+// 上游先吐正常文本、再把拦截话术塞进后续 chat delta（grok 常见）时，转发阶段的
+// interceptContent 钩子应命中并中断透传、标记 SoftFailure，让上层把渠道打入冷却。
+func TestStreamRawSSEInterceptsChatContentDuringForward(t *testing.T) {
+	body := strings.NewReader("data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\"公益token休息了\"}}]}\n\n" +
+		"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":\" trailing\"}}]}\n\n" +
+		"data: [DONE]\n\n")
+	reader := newSSEStreamReader(body)
+	reader.interceptContent = func(text string) bool {
+		return strings.Contains(text, "公益token休息了")
+	}
+	rec := httptest.NewRecorder()
+	usage, err := streamRawSSE(rec, nil, reader, "raw")
+	if err != nil {
+		t.Fatalf("stream raw sse: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "upstream_error") {
+		t.Fatalf("intercepted stream should emit an error event: %s", out)
+	}
+	if strings.Contains(out, "trailing") {
+		t.Fatalf("content after interception must not be forwarded: %s", out)
+	}
+	if usage.SoftFailure != "upstream stream interrupted" || usage.Status != "failed" {
+		t.Fatalf("intercepted stream should mark soft failure for cooldown: %#v", usage)
+	}
+}
+
+// Responses 流同理：拦截话术出现在 output_text.delta 里时，转发阶段应中断并标记失败。
+func TestStreamRawSSEInterceptsResponsesDeltaDuringForward(t *testing.T) {
+	body := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp_x\",\"model\":\"gpt-test\",\"delta\":\"hi \"}\n\n" +
+		"data: {\"type\":\"response.output_text.delta\",\"response_id\":\"resp_x\",\"model\":\"gpt-test\",\"delta\":\"当前没有可用上游\"}\n\n" +
+		"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_x\",\"model\":\"gpt-test\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n")
+	reader := newSSEStreamReader(body)
+	reader.interceptContent = func(text string) bool {
+		return strings.Contains(text, "当前没有可用上游")
+	}
+	rec := httptest.NewRecorder()
+	usage, err := streamRawSSE(rec, nil, reader, "responses")
+	if err != nil {
+		t.Fatalf("stream raw responses sse: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "response.failed") {
+		t.Fatalf("intercepted responses stream should emit a failed terminal: %s", out)
+	}
+	if usage.SoftFailure == "" || usage.Status != "failed" {
+		t.Fatalf("intercepted responses stream should mark soft failure for cooldown: %#v", usage)
+	}
 }
 
 func TestReadSSEEventsSendsHeartbeatWhileWaitingForNextEvent(t *testing.T) {

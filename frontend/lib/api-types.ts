@@ -367,6 +367,7 @@ export interface SystemUpstreamConfig {
   healthProbeModels: string[]
   healthProbeMaxRatio: number
   temporaryFailureCooldownSeconds: number
+  streamInterceptionScanEvents: number
   userAgent: string
   requestRectifier: SystemRequestRectifierConfig
 }
