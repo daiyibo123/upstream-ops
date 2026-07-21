@@ -123,19 +123,19 @@ export function KpiRow() {
   ]
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-2 xl:grid-cols-5">
       {kpis.map((k) => (
         <Card
           key={k.label}
-          className="flex flex-row items-start justify-between gap-2 border border-border p-3 shadow-none sm:p-4"
+          className="relative min-h-28 gap-2 border border-border p-3 shadow-none last:col-span-2 sm:last:col-span-1 sm:p-4"
         >
-          <div className="flex min-w-0 flex-col">
+          <div className="flex min-w-0 flex-col pr-8 sm:pr-10">
             <span className="text-xs text-muted-foreground">{k.label}</span>
-            <p className="mt-1 text-xl font-bold tracking-tight text-foreground sm:text-2xl">{k.value}</p>
-            <p className="mt-1 min-w-0 text-xs">{k.footer}</p>
+            <p className="mt-1 text-lg font-bold tracking-tight text-foreground sm:text-2xl">{k.value}</p>
+            <p className="mt-1 min-w-0 text-[11px] leading-4 sm:text-xs">{k.footer}</p>
           </div>
-          <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-xl sm:size-10", k.iconBg)}>
-            <k.icon className={cn("size-5", k.iconColor)} />
+          <span className={cn("absolute right-3 top-3 flex size-8 shrink-0 items-center justify-center rounded-lg sm:right-4 sm:top-4 sm:size-10", k.iconBg)}>
+            <k.icon className={cn("size-4 sm:size-5", k.iconColor)} />
           </span>
         </Card>
       ))}

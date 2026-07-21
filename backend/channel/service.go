@@ -76,6 +76,26 @@ func (s *Service) proxyURL() (string, error) {
 	return cfg.ActiveURL()
 }
 
+func (s *Service) proxyURLForChannel(c *storage.Channel) (string, error) {
+	if c == nil {
+		return "", nil
+	}
+	s.mu.RLock()
+	cfg := s.proxyConfig
+	s.mu.RUnlock()
+	targets := []string{config.ProxyChannelTarget(c.ID)}
+	switch strings.ToLower(strings.TrimSpace(string(c.Type))) {
+	case "chatgpt_pool":
+		targets = append(targets, config.ProxyTargetChatGPTPool, config.ProxyTargetGPTPoolChannel)
+	case "grok_pool":
+		targets = append(targets, config.ProxyTargetGrokPool, config.ProxyTargetGrokPoolChannel)
+	}
+	if !cfg.AppliesTo(targets...) {
+		return "", nil
+	}
+	return cfg.URL()
+}
+
 func (s *Service) upstreamConfig() config.UpstreamConfig {
 	s.mu.RLock()
 	cfg := s.upstream
@@ -512,11 +532,9 @@ func (s *Service) Resolve(ctx context.Context, c *storage.Channel) (*connector.C
 		return nil, err
 	}
 	resolved.LoginExtraParams = loginExtraParams
-	if c.ProxyEnabled {
-		proxyURL, err := s.proxyURL()
-		if err != nil {
-			return nil, err
-		}
+	if proxyURL, err := s.proxyURLForChannel(c); err != nil {
+		return nil, err
+	} else if proxyURL != "" {
 		resolved.ProxyURL = proxyURL
 	}
 	if c.CredentialMode == storage.CredentialModeToken {

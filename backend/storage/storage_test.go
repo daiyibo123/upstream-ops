@@ -99,6 +99,62 @@ func TestUsageLogsClearPreservesGatewayKeyUsage(t *testing.T) {
 	}
 }
 
+func TestHealthFailureCannotShortenExistingCooldown(t *testing.T) {
+	db := openTestDB(t)
+	repository := NewUpstreamGroupKeys(db)
+	long := time.Now().Add(time.Hour).UTC()
+	item := &UpstreamGroupKey{
+		ChannelID: 1, GroupRef: "cooldown", GroupName: "cooldown", Status: "rate_limited",
+		ClientFormat: "openai", RequestMode: "responses", Enabled: true, DisabledUntil: &long,
+	}
+	if err := db.Create(item).Error; err != nil {
+		t.Fatal(err)
+	}
+	short := time.Now().Add(time.Minute).UTC()
+	if err := repository.MarkHealthFailureStatus(item.ID, "network_error", "temporary", &short, 10); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := repository.FindByID(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.DisabledUntil == nil || updated.DisabledUntil.Before(long.Add(-time.Millisecond)) {
+		t.Fatalf("health failure shortened cooldown: got=%v want>=%v", updated.DisabledUntil, long)
+	}
+	if updated.Status != "rate_limited" {
+		t.Fatalf("health failure downgraded status: %s", updated.Status)
+	}
+}
+
+func TestAutoMigrateBackfillsLegacySupportedModelsAsStrictPolicy(t *testing.T) {
+	db := openTestDB(t)
+	channel := &Channel{Name: "legacy-model-policy", Type: ChannelTypeSub2API, SiteURL: "https://example.test", MonitorEnabled: true}
+	if err := db.Create(channel).Error; err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	group := &UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelType: channel.Type, ClientFormat: "openai", RequestMode: "responses",
+		GroupRef: "legacy", GroupName: "legacy", KeyCipher: "cipher", Enabled: true, Status: "alive",
+		SupportedModels: `["gpt-a","gpt-b"]`, ModelRestrictionEnabled: false,
+	}
+	if err := db.Create(group).Error; err != nil {
+		t.Fatalf("create legacy group: %v", err)
+	}
+	if err := AutoMigrate(db); err != nil {
+		t.Fatalf("migrate legacy group: %v", err)
+	}
+	var got UpstreamGroupKey
+	if err := db.First(&got, group.ID).Error; err != nil {
+		t.Fatalf("load migrated group: %v", err)
+	}
+	if !got.ModelRestrictionEnabled || got.AvailableModels != group.SupportedModels || got.SupportedModels != group.SupportedModels {
+		t.Fatalf("migrated policy = %#v", got)
+	}
+	if err := AutoMigrate(db); err != nil {
+		t.Fatalf("repeat migration: %v", err)
+	}
+}
+
 func TestUsageLogsStats(t *testing.T) {
 	db := openTestDB(t)
 	logs := NewUsageLogs(db)
@@ -206,7 +262,7 @@ func TestAutoMigrateNormalizesTransientGroupStatusesAndFailureCounts(t *testing.
 	}
 }
 
-func TestExpiredCooldownResetsTransientFailureCount(t *testing.T) {
+func TestExpiredCooldownCandidateDoesNotWriteDuringHotPathRead(t *testing.T) {
 	db := openTestDB(t)
 	past := time.Now().Add(-time.Minute)
 	channel := &Channel{Name: "cooldown-channel", Type: ChannelTypeNewAPI, SiteURL: "https://example.test"}
@@ -218,15 +274,111 @@ func TestExpiredCooldownResetsTransientFailureCount(t *testing.T) {
 		t.Fatalf("create cooldown group: %v", err)
 	}
 	repo := NewUpstreamGroupKeys(db)
-	if _, err := repo.ListCandidates(time.Now()); err != nil {
+	candidates, err := repo.ListCandidates(time.Now())
+	if err != nil {
 		t.Fatalf("list candidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].ID != group.ID {
+		t.Fatalf("expired cooldown should remain available for one recovery probe: %#v", candidates)
 	}
 	stored, err := repo.FindByID(group.ID)
 	if err != nil {
 		t.Fatalf("reload cooldown group: %v", err)
 	}
-	if stored.Status != "alive" || stored.FailureCount != 0 || stored.DisabledUntil != nil {
-		t.Fatalf("expired cooldown should fully recover the group: %#v", stored)
+	if stored.Status != "network_error" || stored.FailureCount != 3 || stored.DisabledUntil == nil {
+		t.Fatalf("candidate listing must not mutate persisted cooldown state: %#v", stored)
+	}
+}
+
+func TestRecordDispatchFailureNeverShortensCooldownOrDowngradesStatus(t *testing.T) {
+	db := openTestDB(t)
+	repository := NewUpstreamGroupKeys(db)
+	group := &UpstreamGroupKey{ChannelID: 9201, GroupRef: "cooldown-monotonic", GroupName: "cooldown-monotonic", Enabled: true, Status: "alive"}
+	if err := db.Create(group).Error; err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+
+	first, err := repository.RecordDispatchFailure(group.ID, "auth_failed", "credential rejected", 3, 5*time.Minute, 2*time.Hour, true)
+	if err != nil || first.DisabledUntil == nil {
+		t.Fatalf("record auth failure = %#v, err = %v", first, err)
+	}
+	shorter, err := repository.RecordDispatchFailure(group.ID, "alive", "later network error", 1, 5*time.Minute, time.Minute, false)
+	if err != nil {
+		t.Fatalf("record later transient failure: %v", err)
+	}
+	if shorter.DisabledUntil == nil || !shorter.DisabledUntil.Equal(*first.DisabledUntil) {
+		t.Fatalf("cooldown shortened from %v to %v", first.DisabledUntil, shorter.DisabledUntil)
+	}
+
+	var stored UpstreamGroupKey
+	if err := db.First(&stored, group.ID).Error; err != nil {
+		t.Fatalf("reload group: %v", err)
+	}
+	if stored.Status != "auth_failed" || stored.FailureCount != 2 || stored.DisabledUntil == nil || !stored.DisabledUntil.Equal(*first.DisabledUntil) {
+		t.Fatalf("failure state was downgraded: %#v", stored)
+	}
+
+	extended, err := repository.RecordDispatchFailure(group.ID, "rate_limited", "longer retry-after", 1, 5*time.Minute, 3*time.Hour, true)
+	if err != nil || extended.DisabledUntil == nil || !extended.DisabledUntil.After(*first.DisabledUntil) {
+		t.Fatalf("longer cooldown was not retained: %#v err=%v", extended, err)
+	}
+	if err := db.First(&stored, group.ID).Error; err != nil {
+		t.Fatalf("reload extended group: %v", err)
+	}
+	if stored.Status != "auth_failed" || stored.DisabledUntil == nil || !stored.DisabledUntil.Equal(*extended.DisabledUntil) {
+		t.Fatalf("strong status or extended cooldown lost: %#v", stored)
+	}
+}
+
+func TestRecordDispatchFailureConcurrentKeepsStrongestStatusAndLongestCooldown(t *testing.T) {
+	db := openTestDB(t)
+	repository := NewUpstreamGroupKeys(db)
+	group := &UpstreamGroupKey{ChannelID: 9202, GroupRef: "cooldown-concurrent", GroupName: "cooldown-concurrent", Enabled: true, Status: "alive"}
+	if err := db.Create(group).Error; err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+
+	type failure struct {
+		status    string
+		cooldown  time.Duration
+		immediate bool
+	}
+	failures := []failure{
+		{status: "alive", cooldown: 30 * time.Minute},
+		{status: "rate_limited", cooldown: 2 * time.Hour, immediate: true},
+		{status: "auth_failed", cooldown: time.Hour, immediate: true},
+	}
+	start := make(chan struct{})
+	errorsSeen := make(chan error, len(failures))
+	var workers sync.WaitGroup
+	for _, item := range failures {
+		item := item
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			_, err := repository.RecordDispatchFailure(group.ID, item.status, item.status, 1, 5*time.Minute, item.cooldown, item.immediate)
+			errorsSeen <- err
+		}()
+	}
+	close(start)
+	workers.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		if err != nil {
+			t.Fatalf("concurrent failure update: %v", err)
+		}
+	}
+
+	var stored UpstreamGroupKey
+	if err := db.First(&stored, group.ID).Error; err != nil {
+		t.Fatalf("reload group: %v", err)
+	}
+	if stored.Status != "auth_failed" || stored.FailureCount != len(failures) {
+		t.Fatalf("concurrent status/count lost: %#v", stored)
+	}
+	if stored.DisabledUntil == nil || time.Until(*stored.DisabledUntil) < 110*time.Minute {
+		t.Fatalf("longest concurrent cooldown lost: %v", stored.DisabledUntil)
 	}
 }
 
@@ -288,6 +440,60 @@ func TestUpsertKeepsManualRatioScaleDuringAutomaticSync(t *testing.T) {
 	}
 	if stored.Ratio != 0.5 || stored.RatioScalePercent != 25 {
 		t.Fatalf("sync overwrote manual ratio correction: %#v", stored)
+	}
+}
+
+// TestChannelsListPageOrdersBalanceBeforeEmpty 校验渠道列表排序：置顶最前，其次
+// "有余额"的渠道，再按最低分组倍率升序，无余额（null/0）沉底。对应前端"除置顶外
+// 有余额在前、无余额在后"的展示需求。
+func TestChannelsListPageOrdersBalanceBeforeEmpty(t *testing.T) {
+	db := openTestDB(t)
+	repo := NewChannels(db)
+	groups := NewUpstreamGroupKeys(db)
+
+	// bal-cheap：有余额、低倍率；bal-pricey：有余额、高倍率；
+	// zero：余额为 0；none：余额 nil；pinned：置顶但无余额（应仍排最前）。
+	seed := func(name string, balance *float64, ratio float64, pinned bool) uint {
+		c := &Channel{Name: name, Type: ChannelTypeNewAPI, SiteURL: "https://" + name + ".test", Pinned: pinned}
+		if balance != nil {
+			c.LastBalance = balance
+		}
+		if err := repo.Create(c); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		if err := groups.Upsert(&UpstreamGroupKey{
+			ChannelID: c.ID, ChannelName: c.Name, ChannelType: c.Type,
+			GroupRef: name + "-g", GroupName: name + "-g", Ratio: ratio, KeyCipher: "cipher", Enabled: true, Status: "alive",
+		}); err != nil {
+			t.Fatalf("seed group %s: %v", name, err)
+		}
+		return c.ID
+	}
+	f := func(v float64) *float64 { return &v }
+
+	seed("bal-pricey", f(50), 0.9, false)
+	seed("bal-cheap", f(10), 0.1, false)
+	seed("zero-bal", f(0), 0.2, false)
+	seed("no-bal", nil, 0.2, false)
+	seed("pinned-empty", nil, 0.9, true)
+
+	list, total, err := repo.ListPage(1, -1, "")
+	if err != nil {
+		t.Fatalf("list page: %v", err)
+	}
+	if total != 5 {
+		t.Fatalf("total = %d, want 5", total)
+	}
+	got := make([]string, len(list))
+	for i, c := range list {
+		got[i] = c.Name
+	}
+	// 置顶最前；然后有余额的（cheap 因倍率低排 pricey 前）；最后无余额的两个。
+	want := []string{"pinned-empty", "bal-cheap", "bal-pricey", "zero-bal", "no-bal"}
+	for i := range want {
+		if i >= len(got) || got[i] != want[i] {
+			t.Fatalf("ListPage order = %v, want %v", got, want)
+		}
 	}
 }
 

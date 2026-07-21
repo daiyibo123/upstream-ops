@@ -173,6 +173,9 @@ func createChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusInternalServerError, err)
 		return
 	}
+	if d.Gateway != nil {
+		d.Gateway.InvalidateSchedulingCache()
+	}
 	c.JSON(http.StatusOK, gin.H{"data": channelOutputFor(d, *created)})
 }
 
@@ -268,6 +271,9 @@ func updateChannel(c *gin.Context, d *Deps) {
 			fail(c, http.StatusInternalServerError, err)
 			return
 		}
+		if d.Gateway != nil {
+			d.Gateway.InvalidateSchedulingCache()
+		}
 		c.JSON(http.StatusOK, gin.H{"data": channelOutputFor(d, *updated)})
 		return
 	}
@@ -300,6 +306,9 @@ func updateChannel(c *gin.Context, d *Deps) {
 		fail(c, http.StatusInternalServerError, err)
 		return
 	}
+	if d.Gateway != nil {
+		d.Gateway.InvalidateSchedulingCache()
+	}
 	c.JSON(http.StatusOK, gin.H{"data": channelOutputFor(d, *updated)})
 }
 
@@ -312,6 +321,9 @@ func deleteChannel(c *gin.Context, d *Deps) {
 	if err := d.ChannelSvc.Delete(id); err != nil {
 		fail(c, http.StatusInternalServerError, err)
 		return
+	}
+	if d.Gateway != nil {
+		d.Gateway.InvalidateSchedulingCache()
 	}
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }

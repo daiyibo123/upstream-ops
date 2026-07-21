@@ -134,6 +134,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&GatewayKey{},
 		&GatewayAffinity{},
 		&UpstreamGroupKey{},
+		&OAuthAccount{},
 		&UsageLog{},
 		&IPPolicy{},
 	); err != nil {
@@ -162,6 +163,18 @@ func AutoMigrate(db *gorm.DB) error {
 		Where("status IN ?", []string{"rate_limited", "network_error", "timeout", "upstream_error", "server_error"}).
 		Updates(map[string]any{"status": "alive", "failure_count": 0, "disabled_until": nil}).Error; err != nil {
 		return fmt.Errorf("normalize transient upstream statuses: %w", err)
+	}
+	// Older builds used supported_models only as a soft scheduling hint. Once a
+	// catalog exists, preserve it as both the selectable catalog and the initial
+	// strict allowlist. Rows without a catalog retain legacy unrestricted
+	// behavior until an operator synchronizes or saves model selections.
+	if err := db.Model(&UpstreamGroupKey{}).
+		Where("TRIM(COALESCE(supported_models, '')) <> '' AND model_restriction_enabled = ?", false).
+		Updates(map[string]any{
+			"available_models":          gorm.Expr("supported_models"),
+			"model_restriction_enabled": true,
+		}).Error; err != nil {
+		return fmt.Errorf("backfill upstream model allowlists: %w", err)
 	}
 	return backfillGatewayKeyGroupScopes(db)
 }

@@ -4,6 +4,11 @@
 
 ## 功能概览
 
+- **OAuth 号池**：内置不可删除的 ChatGPT/Grok 号池与固定网关渠道，支持 JSON 导入、测活、巡检、额度查询、分页筛选、批量删除和存活账号公平轮询。
+- **轻量熔断调度**：保持公益与倍率优先，连续三次失败临时熔断，冷却到期后单 half-open 恢复；Key 可在同倍率层选择号池优先或普通上游优先。
+- **严格模型白名单**：从上游或版本化目录获取模型后勾选允许列表，未选模型在请求上游前直接拒绝。
+- **选择性代理 IP**：代理可全局应用，也可只应用到指定普通渠道、固定号池渠道或 OAuth 号池，并覆盖流式请求、测活、巡检与额度查询。
+
 - **聚合调度**：创建密钥请求本站 → 本站在活着的上游里挑最便宜的转发。公益/免费渠道优先，其次按倍率从低到高。
 - **自动故障切换**：请求失败自动切换下一个候选；失败渠道冷却 5 分钟后自动恢复，也可手动解除。
 - **健康检查（测活）**：并发测活、独立超时、极小 token 的流式 `1+1=` 探针（最多 2 token）；OpenAI、Claude 与 Grok 渠道分别自动识别并使用各自原生格式探测，避免误判。活的标绿、死的标红。
@@ -41,7 +46,7 @@ docker compose pull && docker compose up -d
 
 ```bash
 cd /root/upstream-ops
-curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.27.3/docker-compose.yml
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/daiyibo123/upstream-ops/v0.30.0/docker-compose.yml
 sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=latest/' .env
 docker compose pull && docker compose up -d
 ```
@@ -54,12 +59,7 @@ docker compose pull && docker compose up -d
 
 ## 致谢
 
-本项目是在他人开源成果基础上的二次开发，特此致谢：
-
-- 直接二开自 **[bejix/upstream-ops](https://github.com/bejix/upstream-ops)** —— 感谢 [@bejix](https://github.com/bejix) 的开源工作。
-- 其上游最初二开自 **[worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub)** —— 感谢 [@worryzyy](https://github.com/worryzyy) 的原始开源工作。
-
-同时感谢 [sub2api](https://github.com/Wei-Shaw/sub2api)、[new-api](https://github.com/QuantumNous/new-api) 等项目在请求转发、密钥管理、并发控制等方面的实现思路提供的参考。
+项目在账号管理、请求转发和控制台交互方面参考了 [sub2api](https://github.com/Wei-Shaw/sub2api)、[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[CPA-Manager-Plus](https://github.com/seakee/CPA-Manager-Plus) 等开源项目的实现思路。
 
 ## 说明
 

@@ -1,12 +1,15 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/gin-gonic/gin"
 )
+
+const maskedSettingSecret = "********"
 
 type settingsConfigView struct {
 	App           config.AppConfig           `json:"app"`
@@ -37,6 +40,29 @@ func registerSettings(g *gin.RouterGroup, d *Deps) {
 	gs.PUT("/config", func(c *gin.Context) { saveSettingsConfig(c, d) })
 	gs.POST("/apply", func(c *gin.Context) { applySettingsConfig(c, d) })
 	gs.POST("/proxy/test", func(c *gin.Context) { testProxy(c) })
+	gs.GET("/proxy/targets", func(c *gin.Context) {
+		items := []gin.H{
+			{"id": config.ProxyTargetChatGPTPool, "name": "chatgpt号池", "kind": "oauth_pool", "fixed": true},
+			{"id": config.ProxyTargetGrokPool, "name": "grok号池", "kind": "oauth_pool", "fixed": true},
+			{"id": config.ProxyTargetGPTPoolChannel, "name": "gpt号池", "kind": "fixed_channel", "fixed": true},
+			{"id": config.ProxyTargetGrokPoolChannel, "name": "grok号池", "kind": "fixed_channel", "fixed": true},
+		}
+		if d.Channels != nil {
+			channels, err := d.Channels.List()
+			if err != nil {
+				fail(c, http.StatusInternalServerError, err)
+				return
+			}
+			for _, channel := range channels {
+				kind := strings.ToLower(strings.TrimSpace(string(channel.Type)))
+				if kind == "chatgpt_pool" || kind == "grok_pool" {
+					continue
+				}
+				items = append(items, gin.H{"id": config.ProxyChannelTarget(channel.ID), "name": channel.Name, "kind": "channel", "channel_id": channel.ID})
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"data": items})
+	})
 	gs.GET("/response-interception", func(c *gin.Context) {
 		cfg, err := config.LoadFile(d.Runtime.ConfigPath())
 		if err != nil {
@@ -82,6 +108,14 @@ func getSettingsConfig(c *gin.Context, d *Deps) {
 		fail(c, http.StatusInternalServerError, err)
 		return
 	}
+	safeProxy := cfg.Proxy
+	if strings.TrimSpace(safeProxy.Username) != "" {
+		safeProxy.Username = maskSettingValue(safeProxy.Username)
+	}
+	if safeProxy.Password != "" {
+		safeProxy.Password = maskedSettingSecret
+	}
+	safeProxy.SelectedTargets = config.CleanProxyTargets(safeProxy.SelectedTargets)
 	c.JSON(http.StatusOK, gin.H{
 		"data": gin.H{
 			"config_path": d.Runtime.ConfigPath(),
@@ -90,7 +124,7 @@ func getSettingsConfig(c *gin.Context, d *Deps) {
 				Auth:          cfg.Auth,
 				Scheduler:     cfg.Scheduler,
 				Notifications: cfg.Notifications,
-				Proxy:         cfg.Proxy,
+				Proxy:         safeProxy,
 				Upstream:      cfg.Upstream,
 			},
 		},
@@ -127,7 +161,21 @@ func saveSettingsConfig(c *gin.Context, d *Deps) {
 	cfg.Auth = in.Auth
 	cfg.Scheduler = in.Scheduler
 	cfg.Notifications = in.Notifications
-	cfg.Proxy = in.Proxy
+	proxy := in.Proxy
+	if proxy.Password == maskedSettingSecret {
+		proxy.Password = cfg.Proxy.Password
+	}
+	if proxy.Username == maskSettingValue(cfg.Proxy.Username) {
+		proxy.Username = cfg.Proxy.Username
+	}
+	proxy.SelectedTargets = config.CleanProxyTargets(proxy.SelectedTargets)
+	if proxy.Enabled {
+		if _, err := proxy.URL(); err != nil {
+			fail(c, http.StatusBadRequest, fmt.Errorf("invalid proxy configuration: %w", err))
+			return
+		}
+	}
+	cfg.Proxy = proxy
 	cfg.Upstream = in.Upstream.WithDefaults()
 
 	if err := config.Save(path, cfg); err != nil {
@@ -152,6 +200,18 @@ func saveSettingsConfig(c *gin.Context, d *Deps) {
 			"apply":       result,
 		},
 	})
+}
+
+func maskSettingValue(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= 2 {
+		return maskedSettingSecret
+	}
+	return string(runes[:1]) + "***" + string(runes[len(runes)-1:])
 }
 
 func applySettingsConfig(c *gin.Context, d *Deps) {

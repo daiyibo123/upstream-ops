@@ -1,7 +1,8 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import { CheckCircle2, ChevronLeft, ChevronRight, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, XCircle } from "lucide-react"
+import { useNavigate } from "react-router-dom"
+import { CheckCircle2, ChevronLeft, ChevronRight, Copy, Eye, EyeOff, HeartHandshake, KeyRound, Loader2, Pencil, Plus, RefreshCw, Search, Trash2, Users, XCircle } from "lucide-react"
 import { toast } from "sonner"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -44,6 +45,7 @@ import type {
   GatewayHealthResult,
   GatewayKey,
   GatewayKeyReveal,
+  GroupModelPolicy,
   IPPolicy,
   UpstreamGroupKey,
   ResponseInterceptionRule,
@@ -61,6 +63,7 @@ type RateFilter = "all" | "0-0.05" | "0.06-0.1" | "0.1-0.2" | "0.2+"
 type CharityFilter = "all" | "charity" | "normal"
 type GroupStatusFilter = "all" | "alive" | "dead" | "zero_balance" | "rate_limited" | "forbidden"
 type MaxGroupRatioLimit = "0" | "0.05" | "0.1"
+type RoutePreference = "ratio_first" | "pool_first" | "upstream_first"
 
 interface GroupFilters {
   search: string
@@ -68,6 +71,46 @@ interface GroupFilters {
   rateBand: RateFilter
   charity: CharityFilter
   status: GroupStatusFilter
+}
+
+interface OAuthPoolStatsView {
+  total: number
+  rate_limited: number
+  available: number
+}
+
+const FIXED_POOL_GROUPS = [
+  { pool: "chatgpt" as const, ref: "pool-scope:gpt", name: "gpt号池", channelType: "chatgpt_pool" as const },
+  { pool: "grok" as const, ref: "pool-scope:grok", name: "grok号池", channelType: "grok_pool" as const },
+]
+
+function isFixedPoolGroup(group: UpstreamGroupKey) {
+  return group.group_ref === "pool-scope:gpt" || group.group_ref === "pool-scope:grok"
+}
+
+function fixedPoolGroupPlaceholder(definition: (typeof FIXED_POOL_GROUPS)[number], index: number): UpstreamGroupKey {
+  return {
+    id: -(index + 1),
+    channel_id: -(index + 1),
+    channel_name: definition.pool === "chatgpt" ? "chatgpt号池" : "grok号池",
+    channel_type: definition.channelType,
+    client_format: "openai",
+    request_mode: "responses",
+    group_ref: definition.ref,
+    group_name: definition.name,
+    ratio: 1,
+    priority: 0,
+    enabled: true,
+    upstream_key_id: 0,
+    status: "unknown",
+    concurrency_limit: 0,
+    failure_count: 0,
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+    created_at: "",
+    updated_at: "",
+  }
 }
 
 function createDefaultGroupFilters(): GroupFilters {
@@ -91,6 +134,7 @@ interface KeyDraft {
   balanceLimit: string
   concurrencyLimit: string
   maxGroupRatio: MaxGroupRatioLimit
+  routePreference: RoutePreference
   expiresInDays: string
 }
 
@@ -106,6 +150,7 @@ function createDefaultDraft(): KeyDraft {
     balanceLimit: "",
     concurrencyLimit: "",
     maxGroupRatio: "0",
+    routePreference: "ratio_first",
     expiresInDays: "0",
   }
 }
@@ -695,6 +740,7 @@ function draftFromKey(key: GatewayKey): KeyDraft {
     balanceLimit: key.balance_limit > 0 ? String(key.balance_limit) : "",
     concurrencyLimit: key.concurrency_limit > 0 ? String(key.concurrency_limit) : "",
     maxGroupRatio: normalizeMaxGroupRatio(key.max_group_ratio),
+    routePreference: key.route_preference || "ratio_first",
     expiresInDays: "keep",
   }
 }
@@ -710,6 +756,7 @@ function buildGatewayKeyPayload(draft: KeyDraft, includeEnabled: boolean, includ
     balance_limit: Math.max(0, Number(draft.balanceLimit) || 0),
     concurrency_limit: Math.max(0, Math.floor(Number(draft.concurrencyLimit) || 0)),
     max_group_ratio: Number(draft.maxGroupRatio) || 0,
+    route_preference: draft.routePreference,
   }
   if (includeEnabled) {
     payload.enabled = draft.enabled
@@ -947,6 +994,23 @@ function KeyDraftFields({
             </SelectContent>
           </Select>
         </div>
+        <div className="space-y-1.5 sm:col-span-2 lg:col-span-1">
+          <Label>调度来源偏好</Label>
+          <Select
+            value={draft.routePreference}
+            onValueChange={(value) => onChange({ ...draft, routePreference: value as RoutePreference })}
+          >
+            <SelectTrigger><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="ratio_first">倍率优先（默认）</SelectItem>
+              <SelectItem value="pool_first">同倍率时号池优先</SelectItem>
+              <SelectItem value="upstream_first">同倍率时上游优先</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-[11px] leading-5 text-muted-foreground">
+            倍率和分组规则始终优先；仅在同一调度层内决定先用固定号池还是普通上游。
+          </p>
+        </div>
         <p className="text-xs leading-5 text-muted-foreground sm:col-span-2 lg:col-span-2 lg:self-end">
           余额按命中的上游分组价格和倍率折算；超过最大并发的请求会排队等待，不会直接失败。
         </p>
@@ -1135,6 +1199,7 @@ function KeyDraftFields({
 }
 
 export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "groups" } = {}) {
+	const navigate = useNavigate()
   const showKeys = section === "all" || section === "keys"
   const showGroups = section === "all" || section === "groups"
   const [keys, setKeys] = useState<GatewayKey[]>([])
@@ -1168,18 +1233,27 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   const [manualGroupDialogOpen, setManualGroupDialogOpen] = useState(false)
   const [modelEditorOpen, setModelEditorOpen] = useState(false)
   const [modelEditorGroup, setModelEditorGroup] = useState<UpstreamGroupKey | null>(null)
-  const [modelEditorDraft, setModelEditorDraft] = useState("")
+  const [modelEditorPolicy, setModelEditorPolicy] = useState<GroupModelPolicy>({
+    available_models: [],
+    supported_models: [],
+    restriction_enabled: false,
+  })
   const [interceptionOpen, setInterceptionOpen] = useState(false)
   const [interceptionRules, setInterceptionRules] = useState<ResponseInterceptionRule[]>([])
   const [interceptionDraft, setInterceptionDraft] = useState<ResponseInterceptionRule>({ enabled: true, channelId: 0, content: "" })
   const [selectedKeyIDs, setSelectedKeyIDs] = useState<number[]>([])
   const [disableMessage, setDisableMessage] = useState("此调用 Key 已停用，请联系管理员。")
   const [disableOpen, setDisableOpen] = useState(false)
+	const [poolStats, setPoolStats] = useState<Record<"chatgpt" | "grok", OAuthPoolStatsView | null>>({
+		chatgpt: null,
+		grok: null,
+	})
+	const [poolStatsErrors, setPoolStatsErrors] = useState<Record<"chatgpt" | "grok", boolean>>({ chatgpt: false, grok: false })
 
   const displayKeys = keys
   const displayGroups = useMemo(() => {
     const channelByID = new Map(channels.map((channel) => [channel.id, channel]))
-    return groups.map((group) => {
+		return groups.filter((group) => !group.group_ref.startsWith("oauth-account:")).map((group) => {
       const channel = channelByID.get(group.channel_id)
       if (!channel) return group
       return { ...group, channel_name: channel.name || group.channel_name, channel_url: channel.site_url || group.channel_url }
@@ -1200,6 +1274,16 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     () => sortGroupsForDisplay(displayGroups.filter((group) => groupMatchesFilters(group, groupFilters))),
     [displayGroups, groupFilters],
   )
+	const fixedPoolGroups = useMemo(
+		() => FIXED_POOL_GROUPS.map((definition, index) => (
+			displayGroups.find((group) => group.group_ref === definition.ref) ?? fixedPoolGroupPlaceholder(definition, index)
+		)),
+		[displayGroups],
+	)
+	const regularFilteredGroups = useMemo(
+		() => filteredGroups.filter((group) => !isFixedPoolGroup(group)),
+		[filteredGroups],
+	)
   const matchedChannelsWithoutGroups = useMemo(() => {
     const terms = normalizeSearchText(groupFilters.search).split(/\s+/).filter(Boolean)
     if (terms.length === 0) return []
@@ -1210,11 +1294,11 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       return terms.every((term) => text.includes(term))
     })
   }, [channels, groups, groupFilters.search])
-  const groupPages = Math.max(1, Math.ceil(filteredGroups.length / groupPageSize))
+  const groupPages = Math.max(1, Math.ceil(regularFilteredGroups.length / groupPageSize))
   const safeGroupPage = Math.min(groupPage, groupPages)
   const pagedGroups = useMemo(
-    () => filteredGroups.slice((safeGroupPage - 1) * groupPageSize, safeGroupPage * groupPageSize),
-    [filteredGroups, groupPageSize, safeGroupPage],
+    () => regularFilteredGroups.slice((safeGroupPage - 1) * groupPageSize, safeGroupPage * groupPageSize),
+    [regularFilteredGroups, groupPageSize, safeGroupPage],
   )
   const displayAliveCount = useMemo(
     () => filteredGroups.filter((group) => effectiveStatus(group) === "alive").length,
@@ -1254,10 +1338,20 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     [filteredOpenAIHealthGroups],
   )
 
+  async function loadPoolStats() {
+		const [chatgptStats, grokStats] = await Promise.all([
+			apiFetch<OAuthPoolStatsView>("/oauth-accounts/chatgpt/stats").catch(() => null),
+			apiFetch<OAuthPoolStatsView>("/oauth-accounts/grok/stats").catch(() => null),
+		])
+		setPoolStats({ chatgpt: chatgptStats, grok: grokStats })
+		setPoolStatsErrors({ chatgpt: chatgptStats == null, grok: grokStats == null })
+	}
+
   async function load() {
     setLoading(true)
+		void loadPoolStats()
     try {
-      const [keyList, groupResult, policyResult, channelList] = await Promise.all([
+		const [keyList, groupResult, policyResult, channelList] = await Promise.all([
         apiFetch<GatewayKey[]>("/gateway/keys"),
         apiFetch<UpstreamGroupKey[]>("/gateway/group-keys"),
         apiFetch<IPPolicy[]>("/gateway/ip-policies"),
@@ -1795,33 +1889,38 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
-  function updateGroupSupportedModels(id: number, models: string[]) {
-    const supportedModels = models.length > 0 ? JSON.stringify(models) : ""
-    setGroups((prev) =>
-      prev.map((item) =>
-        item.id === id ? { ...item, supported_models: supportedModels } : item,
-      ),
-    )
-    setModelEditorGroup((prev) =>
-      prev?.id === id ? { ...prev, supported_models: supportedModels } : prev,
-    )
-    setModelEditorDraft(models.join("\n"))
+  function updateGroupModelPolicy(id: number, policy: GroupModelPolicy) {
+    const patch = {
+      supported_models: JSON.stringify(policy.supported_models),
+      available_models: JSON.stringify(policy.available_models),
+      model_restriction_enabled: policy.restriction_enabled,
+    }
+    setGroups((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)))
+    setModelEditorGroup((prev) => (prev?.id === id ? { ...prev, ...patch } : prev))
+    setModelEditorPolicy(policy)
   }
 
   function openGroupModelEditor(group: UpstreamGroupKey) {
     setModelEditorGroup(group)
-    setModelEditorDraft(parseSupportedModels(group.supported_models).join("\n"))
+    setModelEditorPolicy({
+      available_models: parseSupportedModels(group.available_models),
+      supported_models: parseSupportedModels(group.supported_models),
+      restriction_enabled: group.model_restriction_enabled === true,
+    })
     setModelEditorOpen(true)
+    void apiFetch<GroupModelPolicy>(`/gateway/group-keys/${group.id}/models`)
+      .then((policy) => updateGroupModelPolicy(group.id, policy))
+      .catch(() => undefined)
   }
 
   async function syncGroupModels(group: UpstreamGroupKey) {
     setBusy(`sync-models-${group.id}`)
     try {
-      const models = await apiFetch<string[]>(`/gateway/group-keys/${group.id}/models/sync`, {
+      const policy = await apiFetch<GroupModelPolicy>(`/gateway/group-keys/${group.id}/models/sync`, {
         method: "POST",
       })
-      updateGroupSupportedModels(group.id, models)
-      toast.success(`已从上游同步 ${models.length} 个模型`)
+      updateGroupModelPolicy(group.id, policy)
+      toast.success(`已获取 ${policy.available_models.length} 个模型，当前允许 ${policy.supported_models.length} 个`)
     } catch (e) {
       const err = e as Error
       toast.error(err.message || "同步上游模型失败")
@@ -1832,16 +1931,16 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
 
   async function saveGroupModels() {
     if (!modelEditorGroup) return
-    const models = uniqueModelNames(modelEditorDraft.split(/[\n,]/))
+    const models = uniqueModelNames(modelEditorPolicy.supported_models)
     setBusy(`save-models-${modelEditorGroup.id}`)
     try {
-      const saved = await apiFetch<string[]>(`/gateway/group-keys/${modelEditorGroup.id}/models`, {
+      const saved = await apiFetch<GroupModelPolicy>(`/gateway/group-keys/${modelEditorGroup.id}/models`, {
         method: "PUT",
         body: JSON.stringify({ models }),
       })
-      updateGroupSupportedModels(modelEditorGroup.id, saved)
+      updateGroupModelPolicy(modelEditorGroup.id, saved)
       setModelEditorOpen(false)
-      toast.success(saved.length > 0 ? `已保存 ${saved.length} 个支持模型` : "已清空模型清单，调度将按未知能力处理")
+      toast.success(saved.supported_models.length > 0 ? `已保存 ${saved.supported_models.length} 个允许模型` : "已保存空白名单：该渠道将拒绝全部模型")
     } catch (e) {
       const err = e as Error
       toast.error(err.message || "保存模型清单失败")
@@ -1851,6 +1950,48 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
   }
 
   function renderGroupRow(group: UpstreamGroupKey) {
+		if (group.group_ref === "pool-scope:gpt" || group.group_ref === "pool-scope:grok") {
+			const pool = group.group_ref === "pool-scope:gpt" ? "chatgpt" : "grok"
+			const stats = poolStats[pool]
+			const statsError = poolStatsErrors[pool]
+			const available = (stats?.available ?? 0) > 0
+			const availabilityLabel = statsError ? "状态未知" : stats == null ? "加载中" : available ? "可用" : "不可用"
+			return (
+				<div key={group.id} className="grid gap-3 border-t border-border p-4 text-xs lg:grid-cols-[minmax(260px,1fr)_minmax(260px,420px)_auto] lg:items-center">
+					<div className="flex min-w-0 items-center gap-3">
+						<div className={cn("flex size-9 shrink-0 items-center justify-center rounded-md", statsError || stats == null ? "bg-muted text-muted-foreground" : available ? "bg-success/10 text-success" : "bg-danger/10 text-danger")}>
+							<Users className="size-4" />
+						</div>
+						<div className="min-w-0">
+							<div className="flex flex-wrap items-center gap-2">
+								<p className="truncate text-sm font-semibold text-foreground">{group.group_name}</p>
+								<Badge variant="outline">固定可用渠道</Badge>
+								<Badge variant="outline" className={statsError || stats == null ? "border-border bg-muted text-muted-foreground" : available ? "border-success/20 bg-success/10 text-success" : "border-danger/20 bg-danger/10 text-danger"}>{availabilityLabel}</Badge>
+							</div>
+							<p className="mt-1 text-xs text-muted-foreground">
+								{pool === "chatgpt" ? "API Key 请求 gpt号池时，后端轮询 chatgpt号池中的存活账号。" : "API Key 请求 grok号池时，后端轮询 grok号池中的存活账号。"}
+							</p>
+						</div>
+					</div>
+					<div className="grid grid-cols-3 gap-2">
+						{[["总账号", stats?.total], ["限流", stats?.rate_limited], ["可调度", stats?.available]].map(([label, value]) => (
+							<div key={String(label)} className="rounded-md border border-border bg-muted/20 px-3 py-2 text-center">
+								<p className="text-[10px] text-muted-foreground">{label}</p>
+								<p className={cn("mt-0.5 text-base font-semibold tabular-nums", label === "可调度" && stats != null && (available ? "text-success" : "text-danger"))}>{value ?? "-"}</p>
+							</div>
+						))}
+					</div>
+					<div className="flex flex-wrap gap-2">
+						<Button size="sm" variant="outline" className="gap-1.5 text-xs" onClick={() => openGroupModelEditor(group)}>
+							<Pencil className="size-3.5" />模型 {parseSupportedModels(group.supported_models).length}
+						</Button>
+						<Button size="sm" variant="outline" className="gap-1.5 text-xs" onClick={() => navigate(`/oauth?pool=${pool}`)}>
+							<Users className="size-3.5" />管理账号
+						</Button>
+					</div>
+				</div>
+			)
+		}
     const latestHealth = healthResults[group.id]
     const status = latestHealth?.status ?? effectiveStatus(group)
     const Icon = status === "alive" ? CheckCircle2 : isFailureHealthStatus(status) ? XCircle : RefreshCw
@@ -1859,6 +2000,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     const requestMode = selectedRequestMode(group)
     const canTest = group.enabled !== false
     const supportedModels = parseSupportedModels(group.supported_models)
+    const availableModels = parseSupportedModels(group.available_models)
+    const modelRestrictionEnabled = group.model_restriction_enabled === true
     const oneClickHealthTarget = group.enabled !== false && isOneClickHealthTarget(group)
     const healthCheckLabel = latestHealth?.checked_at
       ? relativeTime(latestHealth.checked_at)
@@ -1907,9 +2050,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
               className="rounded-full disabled:cursor-not-allowed disabled:opacity-60"
               disabled={!!busy}
               title={
-                supportedModels.length > 0
-                  ? `编辑支持模型：${supportedModels.join(", ")}`
-                  : "同步或手工编辑该渠道支持的模型清单"
+                modelRestrictionEnabled
+                  ? `已允许 ${supportedModels.length}/${availableModels.length} 个模型`
+                  : "尚未启用模型白名单"
               }
               onClick={() => openGroupModelEditor(group)}
             >
@@ -1917,10 +2060,10 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 variant="outline"
                 className={cn(
                   "gap-1 bg-background transition-colors hover:border-brand/40 hover:bg-brand/5",
-                  supportedModels.length > 0 ? "border-brand/20 text-brand" : "text-muted-foreground",
+                  modelRestrictionEnabled ? "border-brand/20 text-brand" : "text-muted-foreground",
                 )}
               >
-                模型 {supportedModels.length > 0 ? supportedModels.length : "未知"}
+                模型 {modelRestrictionEnabled ? `${supportedModels.length}/${availableModels.length}` : "未限制"}
                 <Pencil className="size-2.5" />
               </Badge>
             </button>
@@ -2504,10 +2647,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             <div className="rounded-md border border-border bg-muted/10 p-3">
               <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
                 <div>
-                  <p className="text-xs font-medium text-foreground">统一筛选区</p>
-                  <p className="mt-1 text-[11px] text-muted-foreground">
-                    已填写的搜索、格式、倍率、公益和状态条件会同时生效；不填条件时展示全部渠道。
-                  </p>
+                  <p className="text-xs font-medium text-foreground">筛选渠道</p>
+                  <p className="mt-1 text-[11px] text-muted-foreground">按名称、格式、倍率和状态筛选。</p>
                 </div>
                 <Badge variant="outline" className="border-border bg-background text-muted-foreground">
                   命中 {filteredGroups.length}/{totalGroups}
@@ -2647,16 +2788,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
                 加载中...
               </div>
-            ) : groups.length === 0 && matchedChannelsWithoutGroups.length === 0 ? (
-              <div className="rounded-md border border-dashed border-border bg-background px-3 py-12 text-center text-xs text-muted-foreground">
-                还没有分组 Key，先点“一键创建分组 Key”
-              </div>
-            ) : filteredGroups.length === 0 && matchedChannelsWithoutGroups.length === 0 ? (
-              <div className="rounded-md border border-dashed border-border bg-background px-3 py-12 text-center text-xs text-muted-foreground">
-                没有符合当前筛选条件的渠道
-              </div>
             ) : (
               <div className="space-y-2">
+				{fixedPoolGroups.map((group) => renderGroupRow(group))}
                 {matchedChannelsWithoutGroups.map((channel) => (
                   <div key={`channel-${channel.id}`} className="flex flex-col gap-2 rounded-md border border-warning/30 bg-warning/5 p-3 sm:flex-row sm:items-center sm:justify-between">
                     <div className="min-w-0">
@@ -2673,16 +2807,17 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 {pagedGroups.map((group) => renderGroupRow(group))}
               </div>
             )}
-            {filteredGroups.length > 0 ? (
+            {regularFilteredGroups.length > 0 ? (
               <div className="flex flex-col gap-2 border-t border-border px-3 py-3 text-xs sm:flex-row sm:items-center sm:justify-between">
                 <span className="text-muted-foreground">
-                  共 {filteredGroups.length} 个渠道，第 {safeGroupPage}/{groupPages} 页
+                  共 {regularFilteredGroups.length} 个普通渠道，第 {safeGroupPage}/{groupPages} 页
                 </span>
                 <div className="flex items-center gap-2">
                   <Select value={String(groupPageSize)} onValueChange={(value) => setGroupPageSize(Number(value))}>
                     <SelectTrigger className="h-8 w-24 text-xs"><SelectValue /></SelectTrigger>
                     <SelectContent>
                       <SelectItem value="10">10 / 页</SelectItem>
+                      <SelectItem value="20">20 / 页</SelectItem>
                       <SelectItem value="50">50 / 页</SelectItem>
                       <SelectItem value="100">100 / 页</SelectItem>
                     </SelectContent>
@@ -2764,7 +2899,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
           setModelEditorOpen(open)
           if (!open) {
             setModelEditorGroup(null)
-            setModelEditorDraft("")
+            setModelEditorPolicy({ available_models: [], supported_models: [], restriction_enabled: false })
           }
         }}
       >
@@ -2773,27 +2908,43 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
             <DialogTitle>渠道支持模型</DialogTitle>
             <DialogDescription>
               {modelEditorGroup
-                ? `${modelEditorGroup.channel_name || "上游"} / ${modelEditorGroup.group_name}。每行一个模型；命中清单的渠道会在对应模型请求中优先调度，未命中仍按“未知”参与，不会被硬排除。`
-                : "同步或手工维护渠道支持的模型清单。"}
+                ? `${modelEditorGroup.channel_name || "上游"} / ${modelEditorGroup.group_name}。先获取模型目录，再勾选允许请求的模型。`
+                : "获取并选择该渠道允许请求的模型。"}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
               <span className="text-muted-foreground">
-                当前 {uniqueModelNames(modelEditorDraft.split(/[\n,]/)).length} 个模型
+                已获取 {modelEditorPolicy.available_models.length} 个，已选择 {modelEditorPolicy.supported_models.length} 个
               </span>
               <Badge variant="outline" className="bg-background">
                 {modelEditorGroup ? clientFormatLabel(groupClientFormat(modelEditorGroup)) : "—"}
               </Badge>
             </div>
-            <Textarea
-              className="min-h-64 font-mono text-xs leading-6"
-              value={modelEditorDraft}
-              onChange={(event) => setModelEditorDraft(event.target.value)}
-              placeholder={"gpt-5.6\ngpt-5.5\ngpt-5.4"}
-            />
+            <div className="max-h-72 space-y-1 overflow-y-auto rounded-md border border-border p-2">
+              {modelEditorPolicy.available_models.length === 0 ? (
+                <p className="px-2 py-8 text-center text-xs text-muted-foreground">尚未获取模型，请点击“获取模型”。</p>
+              ) : modelEditorPolicy.available_models.map((model) => {
+                const checked = modelEditorPolicy.supported_models.some((item) => item.toLowerCase() === model.toLowerCase())
+                return (
+                  <label key={model} className="flex cursor-pointer items-center gap-2 rounded px-2 py-2 text-xs hover:bg-muted/60">
+                    <Checkbox
+                      checked={checked}
+                      onCheckedChange={(value) => setModelEditorPolicy((prev) => ({
+                        ...prev,
+                        restriction_enabled: true,
+                        supported_models: value === true
+                          ? uniqueModelNames([...prev.supported_models, model])
+                          : prev.supported_models.filter((item) => item.toLowerCase() !== model.toLowerCase()),
+                      }))}
+                    />
+                    <span className="font-mono">{model}</span>
+                  </label>
+                )
+              })}
+            </div>
             <p className="text-[11px] leading-5 text-muted-foreground">
-              “从上游同步”会调用该渠道的 /v1/models 并覆盖当前清单；仅 OpenAI 格式渠道支持自动同步。清空后保存会回到“能力未知”，不会停止调度。
+              未勾选的模型会在请求上游前直接拒绝。再次获取会保留仍存在的旧选择，新模型默认不自动启用；保存空选择代表该渠道拒绝全部模型。
             </p>
           </div>
           <DialogFooter className="gap-2 sm:justify-between">
@@ -2803,8 +2954,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 variant="outline"
                 disabled={
                   !modelEditorGroup ||
-                  !!busy ||
-                  groupClientFormat(modelEditorGroup) !== "openai"
+                  !!busy
                 }
                 onClick={() => modelEditorGroup && void syncGroupModels(modelEditorGroup)}
               >
@@ -2813,13 +2963,13 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                 ) : (
                   <RefreshCw className="size-3.5" />
                 )}
-                从上游同步
+                获取模型
               </Button>
               <Button
                 type="button"
                 variant="ghost"
-                disabled={!!busy || !modelEditorDraft.trim()}
-                onClick={() => setModelEditorDraft("")}
+                disabled={!!busy || modelEditorPolicy.supported_models.length === 0}
+                onClick={() => setModelEditorPolicy((prev) => ({ ...prev, restriction_enabled: true, supported_models: [] }))}
               >
                 清空清单
               </Button>

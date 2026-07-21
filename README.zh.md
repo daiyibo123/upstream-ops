@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-> 本项目基于 [bejix/upstream-ops](https://github.com/bejix/upstream-ops) 二次开发，其上游最初来自 [worryzyy/upstream-hub](https://github.com/worryzyy/upstream-hub)。感谢 [@bejix](https://github.com/bejix)、[@worryzyy](https://github.com/worryzyy) 的开源工作，也感谢 [sub2api](https://github.com/Wei-Shaw/sub2api)、[new-api](https://github.com/QuantumNous/new-api) 等项目提供的实现参考。
+> AI Gateway 是一个独立维护的聚合调度与账号运维控制台，并参考了 sub2api、CLIProxyAPI、CPA-Manager-Plus 等开源项目的交互和实现思路。
 
 > AI Gateway 是一个面向 NewAPI / Sub2API 上游站点的集中监控、运维与 AI API 聚合调度网关。它可以统一管理上游账号、查看余额与消费、同步模型倍率、追踪倍率变化、维护上游 API Key、发起充值/兑换，并通过多种通知渠道推送余额告警、倍率变更、登录异常、监控异常和上游公告。
 它也可以创建本站密钥并转发 `/v1/*` 模型请求，在多个存活上游之间按公益优先、优先级和低倍率自动调度。
@@ -56,6 +56,15 @@ AI Gateway 主要解决这些痛点：
 ![应用预览 7](docs/images/demo7.png)
 
 ## 功能概览
+
+### OAuth 号池与严格模型控制
+
+- 内置不可删除的 `chatgpt号池`、`grok号池` 及对应 `gpt号池`、`grok号池` 固定网关渠道。
+- 支持 Sub2API、CLIProxyAPI/CPA 与 Grok SSO JSON 导入、账号测活/巡检、额度、分页筛选、统计和批量删除。
+- API Key 先按公益、倍率、成本和分组规则选择渠道，再在固定号池内并发安全地轮询存活账号。
+- Key 可配置倍率优先、同倍率号池优先或同倍率普通上游优先。
+- 模型目录与允许列表分离；未勾选模型不会发往上游，空白名单表示该渠道拒绝全部模型。
+- 代理 IP 支持全局或按普通渠道、固定渠道、OAuth 号池选择，并覆盖业务请求、流式、测活、巡检和额度查询。
 
 ### 上游渠道管理
 

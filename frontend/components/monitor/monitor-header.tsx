@@ -1,55 +1,47 @@
-import { useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 import { useNavigate } from "react-router-dom"
 import { Activity, Github, Home, LogIn, LogOut, RefreshCw, Settings } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ThemeToggle } from "@/components/theme-toggle"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 import { useAuth } from "@/lib/auth-context"
-import { apiFetch } from "@/lib/api"
 import { useTriggerRefresh } from "@/lib/refresh-context"
-import { useAppVersion, useChannels } from "@/lib/queries"
-import type { AppVersion } from "@/lib/api-types"
+import { useChannels } from "@/lib/queries"
 import { relativeTime } from "@/lib/format"
-import { toast } from "sonner"
+import type { AppVersion } from "@/lib/api-types"
+import { PROJECT_REPOSITORY_URL, projectReleaseURL } from "@/lib/project-links"
 
-export function MonitorHeader() {
+interface MonitorHeaderProps {
+  appTitle: string
+  versionInfo: AppVersion | null
+  checkingVersion: boolean
+  onCheckVersion: () => void
+}
+
+function formatVersion(version?: string | null) {
+  const value = version?.trim()
+  if (!value) return null
+  return value.toLowerCase().startsWith("v") ? value : `v${value}`
+}
+
+export function MonitorHeader({ appTitle, versionInfo, checkingVersion, onCheckVersion }: MonitorHeaderProps) {
   const navigate = useNavigate()
   const { username, authDisabled, logout } = useAuth()
   const refresh = useTriggerRefresh()
   const channels = useChannels()
-  const appVersion = useAppVersion()
   const [syncing, setSyncing] = useState(false)
-  const [checkingVersion, setCheckingVersion] = useState(false)
 
-  const appTitle = appVersion.data?.title?.trim() || "AI Gateway"
-  const version = appVersion.data?.version?.trim()
-  const latestVersion = appVersion.data?.latest_version?.trim()
-  const updateAvailable = Boolean(appVersion.data?.update_available && latestVersion)
-  const updateURL = appVersion.data?.release_url?.trim() || appVersion.data?.repo_url?.trim()
-
-  useEffect(() => {
-    document.title = appTitle
-  }, [appTitle])
-
-  /**
-   * 找出所有渠道中最近一次采集时间——这是"上次采集"展示的依据，
-   * 让用户知道页面上的余额到底是多新的快照（区别于"我刚点了刷新"）。
-   */
   const lastCollectedAt = useMemo(() => {
     const list = channels.data ?? []
     let best: string | null = null
     let bestT = -Infinity
-    for (const c of list) {
-      if (!c.last_balance_at) continue
-      const t = new Date(c.last_balance_at).getTime()
-      if (Number.isFinite(t) && t > bestT) {
-        bestT = t
-        best = c.last_balance_at
+    for (const channel of list) {
+      if (!channel.last_balance_at) continue
+      const time = new Date(channel.last_balance_at).getTime()
+      if (Number.isFinite(time) && time > bestT) {
+        bestT = time
+        best = channel.last_balance_at
       }
     }
     return best
@@ -58,147 +50,95 @@ export function MonitorHeader() {
   function handleRefresh() {
     setSyncing(true)
     refresh()
-    setTimeout(() => setSyncing(false), 800)
-  }
-
-  async function handleCheckVersion() {
-    setCheckingVersion(true)
-    try {
-      const result = await apiFetch<AppVersion>("/version?force=1")
-      appVersion.setData(result)
-      if (result.update_error) {
-        toast.error(result.update_error)
-      } else if (result.update_available && result.latest_version) {
-        toast.warning(`发现新版本 ${result.latest_version}`)
-      } else {
-        toast.success("当前已是最新版本")
-      }
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "检测更新失败")
-    } finally {
-      setCheckingVersion(false)
-    }
+    window.setTimeout(() => setSyncing(false), 800)
   }
 
   return (
-    <header className="sticky top-0 z-20 border-b border-border bg-background/95 backdrop-blur-sm">
-      <div className="mx-auto flex h-14 max-w-420 items-center justify-between gap-2 px-3 sm:gap-4 sm:px-5">
-        {/* left: logo + title */}
-        <div className="flex min-w-0 items-center gap-2.5">
-          <div className="flex size-8 items-center justify-center rounded-lg bg-foreground text-background">
-            <Activity className="size-4" strokeWidth={2.5} />
+    <header className="sticky top-0 z-30 border-b border-border/80 bg-background/95 backdrop-blur-xl">
+      <div className="flex h-14 items-center gap-3 px-3 sm:px-5 lg:px-7 xl:px-9">
+        <div className="flex min-w-0 items-center gap-2.5 lg:hidden">
+          <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-foreground text-background">
+            <Activity className="size-4" strokeWidth={2.4} />
           </div>
           <div className="min-w-0">
-            <h1 className="truncate text-base font-semibold tracking-tight text-foreground">{appTitle}</h1>
-            {version ? (
-              <p className="truncate text-[11px] leading-3 text-muted-foreground">
-                <button
-                  type="button"
-                  className="font-medium underline-offset-2 hover:text-foreground hover:underline"
-                  onClick={handleCheckVersion}
-                  disabled={checkingVersion}
-                  title="点击检测更新"
+            <p className="truncate text-sm font-semibold leading-4 text-foreground">{appTitle}</p>
+            <div className="mt-0.5 flex items-center gap-1 text-[10px] leading-3">
+              {versionInfo?.version ? (
+                <a
+                  href={projectReleaseURL(versionInfo.version)}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
+                  title={`打开 ${formatVersion(versionInfo.version)} 发布页`}
                 >
-                  {checkingVersion ? "检测中..." : `v${version}`}
-                </button>
-                {updateAvailable ? (
-                  <a
-                    href={updateURL || "https://github.com/daiyibo123/upstream-ops"}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="ml-2 font-medium text-success underline-offset-2 hover:text-success hover:underline"
-                  >
-                    有新版本 {latestVersion}
-                  </a>
-                ) : null}
-              </p>
-            ) : null}
+                  {formatVersion(versionInfo.version)}
+                </a>
+              ) : (
+                <span className="text-muted-foreground">版本加载中</span>
+              )}
+              <button
+                type="button"
+                className="flex size-3.5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-wait"
+                onClick={onCheckVersion}
+                disabled={checkingVersion}
+                title="检测更新"
+                aria-label="检测应用更新"
+              >
+                <RefreshCw className={cn("size-2.5", checkingVersion && "animate-spin")} />
+              </button>
+            </div>
           </div>
         </div>
 
-        {/* right: actions */}
-        <div className="flex shrink-0 items-center gap-1.5 sm:gap-3">
-          {/* last collected + refresh */}
-          <div className="hidden items-center gap-2 sm:flex">
-            <span className="text-xs text-muted-foreground">
-              {"上次采集 "}
-              <span className="font-medium text-foreground">{relativeTime(lastCollectedAt)}</span>
-            </span>
-            <Tooltip delayDuration={200}>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleRefresh}
-                  disabled={syncing}
-                  className="gap-1.5 border-border bg-background text-foreground hover:bg-muted"
-                  aria-label="刷新视图"
-                >
-                  <RefreshCw className={cn("size-3.5", syncing && "animate-spin")} />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" className="max-w-xs text-xs">
-                <p>{"重新拉取最新的快照数据。"}</p>
-                <p className="mt-1 text-muted-foreground">
-                  {"提示：实际采集由后台定时任务执行，如需立即采集请到具体渠道点 \"同步\"。"}
-                </p>
-              </TooltipContent>
-            </Tooltip>
-          </div>
-
-          {/* mobile-only refresh (no tooltip / no timestamp to save space) */}
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          <span className="mr-1 hidden text-xs text-muted-foreground lg:inline">
+            上次采集 <span className="font-medium text-foreground">{relativeTime(lastCollectedAt)}</span>
+          </span>
 
           <Tooltip delayDuration={200}>
             <TooltipTrigger asChild>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleRefresh}
-            disabled={syncing}
-            className="gap-1.5 border-border bg-background px-2 text-foreground hover:bg-muted sm:hidden"
-            aria-label="刷新视图"
-          >
-            <RefreshCw className={cn("size-3.5", syncing && "animate-spin")} />
-          </Button>
+              <Button
+                variant="outline"
+                size="icon-sm"
+                onClick={handleRefresh}
+                disabled={syncing}
+                className="border-border bg-background text-foreground hover:bg-muted"
+                aria-label="刷新视图"
+              >
+                <RefreshCw className={cn("size-3.5", syncing && "animate-spin")} />
+              </Button>
             </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">
-              {"刷新视图"}
-            </TooltipContent>
+            <TooltipContent side="bottom" className="text-xs">刷新视图</TooltipContent>
           </Tooltip>
 
           <Tooltip delayDuration={200}>
             <TooltipTrigger asChild>
               <Button
                 variant="outline"
-                size="icon"
+                size="icon-sm"
                 onClick={() => navigate(username ? "/dashboard" : "/")}
-                className="size-8 border-border bg-background text-foreground hover:bg-muted"
+                className="hidden border-border bg-background text-foreground hover:bg-muted sm:inline-flex"
                 aria-label="主页"
               >
                 <Home className="size-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">
-              {"主页"}
-            </TooltipContent>
+            <TooltipContent side="bottom" className="text-xs">主页</TooltipContent>
           </Tooltip>
 
-          {/* settings */}
           <Tooltip delayDuration={200}>
             <TooltipTrigger asChild>
               <Button
                 variant="outline"
-                size="icon"
+                size="icon-sm"
                 onClick={() => navigate("/settings")}
-                className="size-8 border-border bg-background text-foreground hover:bg-muted"
+                className="hidden border-border bg-background text-foreground hover:bg-muted sm:inline-flex"
                 aria-label="系统设置"
               >
                 <Settings className="size-3.5" />
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">
-              {"系统设置"}
-            </TooltipContent>
+            <TooltipContent side="bottom" className="text-xs">系统设置</TooltipContent>
           </Tooltip>
 
           <Tooltip delayDuration={200}>
@@ -206,32 +146,27 @@ export function MonitorHeader() {
               <Button
                 asChild
                 variant="outline"
-                size="icon"
-                className="size-8 border-border bg-background text-foreground hover:bg-muted"
-                aria-label="GitHub 仓库"
+                size="icon-sm"
+                className="hidden border-border bg-background text-foreground hover:bg-muted sm:inline-flex"
               >
                 <a
-                  href="https://github.com/daiyibo123/upstream-ops"
+                  href={PROJECT_REPOSITORY_URL}
                   target="_blank"
                   rel="noopener noreferrer"
+                  aria-label="打开 GitHub 项目"
                 >
                   <Github className="size-3.5" />
                 </a>
               </Button>
             </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">
-              {"GitHub · daiyibo123/upstream-ops"}
-            </TooltipContent>
+            <TooltipContent side="bottom" className="text-xs">GitHub · daiyibo123/upstream-ops</TooltipContent>
           </Tooltip>
 
-          {/* theme toggle */}
           <Tooltip delayDuration={200}>
             <TooltipTrigger asChild>
               <ThemeToggle className="border-border bg-background text-foreground hover:bg-muted" />
             </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">
-              切换主题
-            </TooltipContent>
+            <TooltipContent side="bottom" className="text-xs">切换主题</TooltipContent>
           </Tooltip>
 
           {authDisabled ? (
@@ -239,26 +174,24 @@ export function MonitorHeader() {
               <TooltipTrigger asChild>
                 <Button
                   variant="outline"
-                  size="icon"
+                  size="icon-sm"
                   onClick={() => navigate("/login")}
-                  className="size-8 border-border bg-background text-foreground hover:bg-muted"
+                  className="border-border bg-background text-foreground hover:bg-muted"
                   aria-label="登录"
                 >
                   <LogIn className="size-3.5" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom" className="text-xs">
-                {"登录"}
-              </TooltipContent>
+              <TooltipContent side="bottom" className="text-xs">登录</TooltipContent>
             </Tooltip>
           ) : (
             <Tooltip delayDuration={200}>
               <TooltipTrigger asChild>
                 <Button
                   variant="outline"
-                  size="icon"
+                  size="icon-sm"
                   onClick={logout}
-                  className="size-8 border-border bg-background text-foreground hover:bg-muted"
+                  className="border-border bg-background text-foreground hover:bg-muted"
                   aria-label="退出登录"
                 >
                   <LogOut className="size-3.5" />

@@ -6,8 +6,10 @@ import "time"
 type ChannelType string
 
 const (
-	ChannelTypeNewAPI  ChannelType = "newapi"
-	ChannelTypeSub2API ChannelType = "sub2api"
+	ChannelTypeNewAPI      ChannelType = "newapi"
+	ChannelTypeSub2API     ChannelType = "sub2api"
+	ChannelTypeChatGPTPool ChannelType = "chatgpt_pool"
+	ChannelTypeGrokPool    ChannelType = "grok_pool"
 )
 
 // CredentialMode 渠道凭据模式：
@@ -62,6 +64,15 @@ type Channel struct {
 	TodayCost     *float64   `json:"today_cost,omitempty"`
 	TotalCost     *float64   `json:"total_cost,omitempty"`
 	LastError     string     `gorm:"type:text" json:"last_error,omitempty"`
+
+	// Fixed and the pool summary fields are populated by repository/API code.
+	// They are deliberately transient so no credential or derived scheduler
+	// state is duplicated in the channels table.
+	Fixed               bool      `gorm:"-" json:"fixed,omitempty"`
+	PoolType            OAuthPool `gorm:"-" json:"pool_type,omitempty"`
+	TotalAccounts       int64     `gorm:"-" json:"total_accounts,omitempty"`
+	RateLimitedAccounts int64     `gorm:"-" json:"rate_limited_accounts,omitempty"`
+	AvailableAccounts   int64     `gorm:"-" json:"available_accounts,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -319,6 +330,12 @@ type UsageLog struct {
 	Ratio                float64   `json:"ratio"`
 	Status               string    `gorm:"size:32;not null;default:'success';index" json:"status"`
 	ErrorMessage         string    `gorm:"type:text" json:"error_message,omitempty"`
+	ErrorCode            string    `gorm:"size:64;index" json:"error_code,omitempty"`
+	ErrorStatus          int       `gorm:"not null;default:0" json:"error_status,omitempty"`
+	ErrorDetail          string    `gorm:"type:text" json:"error_detail,omitempty"`
+	OAuthPool            string    `gorm:"column:oauth_pool;size:32;index" json:"oauth_pool,omitempty"`
+	OAuthAccount         string    `gorm:"column:oauth_account;size:128" json:"oauth_account,omitempty"`
+	DispatchAttempt      int       `gorm:"not null;default:0" json:"dispatch_attempt,omitempty"`
 	FirstTokenMS         int64     `gorm:"not null;default:0" json:"first_token_ms"`
 	DurationMS           int64     `gorm:"not null;default:0" json:"duration_ms"`
 	CreatedAt            time.Time `gorm:"index" json:"created_at"`
@@ -385,6 +402,7 @@ type GatewayKey struct {
 	BalanceLimit         float64    `gorm:"not null;default:0" json:"balance_limit"`
 	ConcurrencyLimit     int        `gorm:"not null;default:0" json:"concurrency_limit"`
 	MaxGroupRatio        float64    `gorm:"not null;default:0" json:"max_group_ratio"`
+	RoutePreference      string     `gorm:"size:24;not null;default:'ratio_first';index" json:"route_preference"`
 	TodayCost            float64    `gorm:"not null;default:0" json:"today_cost"`
 	TotalCost            float64    `gorm:"not null;default:0" json:"total_cost"`
 	UsageDate            string     `gorm:"size:10;index" json:"usage_date,omitempty"`
@@ -440,11 +458,11 @@ type UpstreamGroupKey struct {
 	Ratio     float64 `gorm:"not null;default:1" json:"ratio"`
 	// RatioScalePercent converts the upstream-advertised ratio into the real
 	// local consumption ratio.  100 keeps the upstream value unchanged.
-	RatioScalePercent     float64 `gorm:"not null;default:100" json:"ratio_scale_percent"`
+	RatioScalePercent     float64  `gorm:"not null;default:100" json:"ratio_scale_percent"`
 	EffectiveRatio        *float64 `gorm:"-" json:"effective_ratio,omitempty"`
-	InputPricePerMillion  float64 `gorm:"not null;default:5" json:"input_price_per_million"`
-	OutputPricePerMillion float64 `gorm:"not null;default:30" json:"output_price_per_million"`
-	Priority              int     `gorm:"not null;default:0;index" json:"priority"`
+	InputPricePerMillion  float64  `gorm:"not null;default:5" json:"input_price_per_million"`
+	OutputPricePerMillion float64  `gorm:"not null;default:30" json:"output_price_per_million"`
+	Priority              int      `gorm:"not null;default:0;index" json:"priority"`
 	// Charity 标记这个分组是"公益/免费"渠道。调度时公益永远优先于付费，
 	// 公益内部再按倍率高低（这里沿用 ratio 低者优先）排序，公益全挂了才轮到付费。
 	Charity          bool       `gorm:"not null;default:false;index" json:"charity"`
@@ -465,12 +483,17 @@ type UpstreamGroupKey struct {
 	// 数据来源：同步上游 /v1/models（可在可用渠道的编辑弹窗里手动增删）。
 	// 调度语义是"软过滤"——非空时，请求模型命中清单的候选优先；清单为空（未同步）
 	// 的候选视为"未知"正常参与调度，绝不因清单不全而把可用渠道误排除。
-	SupportedModels string     `gorm:"type:text;not null;default:''" json:"supported_models,omitempty"`
-	LastUsedAt      *time.Time `json:"last_used_at,omitempty"`
-	DisabledUntil   *time.Time `json:"disabled_until,omitempty"`
-	LastError       string     `gorm:"type:text" json:"last_error,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	SupportedModels string `gorm:"type:text;not null;default:''" json:"supported_models,omitempty"`
+	// AvailableModels is the latest catalog discovered from the upstream. It is
+	// kept separate from SupportedModels so operators can uncheck a model
+	// without losing it from the selectable catalog.
+	AvailableModels         string     `gorm:"type:text;not null;default:''" json:"available_models,omitempty"`
+	ModelRestrictionEnabled bool       `gorm:"not null;default:false;index" json:"model_restriction_enabled"`
+	LastUsedAt              *time.Time `json:"last_used_at,omitempty"`
+	DisabledUntil           *time.Time `json:"disabled_until,omitempty"`
+	LastError               string     `gorm:"type:text" json:"last_error,omitempty"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
 }
 
 func (UpstreamGroupKey) TableName() string { return "upstream_group_keys" }

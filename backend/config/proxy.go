@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+const (
+	ProxyTargetChatGPTPool       = "pool:chatgpt"
+	ProxyTargetGrokPool          = "pool:grok"
+	ProxyTargetGPTPoolChannel    = "fixed-channel:gpt"
+	ProxyTargetGrokPoolChannel   = "fixed-channel:grok"
+)
+
 func (p ProxyConfig) URL() (string, error) {
 	protocol := strings.ToLower(strings.TrimSpace(p.Protocol))
 	if protocol == "" {
@@ -44,4 +51,49 @@ func (p ProxyConfig) ActiveURL() (string, error) {
 		return "", nil
 	}
 	return p.URL()
+}
+
+// AppliesTo implements the persisted selection semantics: disabled means
+// direct; enabled with no selected target means global proxy; otherwise any
+// matching stable target enables the proxy for that request.
+func (p ProxyConfig) AppliesTo(targets ...string) bool {
+	if !p.Enabled {
+		return false
+	}
+	if len(p.SelectedTargets) == 0 {
+		return true
+	}
+	wanted := make(map[string]struct{}, len(p.SelectedTargets))
+	for _, target := range p.SelectedTargets {
+		if target = strings.ToLower(strings.TrimSpace(target)); target != "" {
+			wanted[target] = struct{}{}
+		}
+	}
+	for _, target := range targets {
+		if _, ok := wanted[strings.ToLower(strings.TrimSpace(target))]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func ProxyChannelTarget(id uint) string {
+	return "channel:" + strconv.FormatUint(uint64(id), 10)
+}
+
+func CleanProxyTargets(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }

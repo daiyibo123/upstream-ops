@@ -21,10 +21,13 @@ import (
 	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/bejix/upstream-ops/backend/connector"
 	appcrypto "github.com/bejix/upstream-ops/backend/crypto"
+	"github.com/bejix/upstream-ops/backend/oauthpool"
 	"github.com/bejix/upstream-ops/backend/storage"
+	"gorm.io/gorm"
 )
 
 type gatewayProxyTestEnv struct {
+	db         *gorm.DB
 	svc        *Service
 	channels   *storage.Channels
 	groupKeys  *storage.UpstreamGroupKeys
@@ -68,6 +71,7 @@ func newGatewayProxyTestEnv(t *testing.T, secret string) *gatewayProxyTestEnv {
 		t.Fatalf("create gateway key: %v", err)
 	}
 	return &gatewayProxyTestEnv{
+		db:         db,
 		svc:        svc,
 		channels:   channels,
 		groupKeys:  groupKeys,
@@ -89,6 +93,81 @@ func enableTestRectifier(svc *Service) {
 			HeuristicTextOnlyModels:  false,
 		},
 	})
+}
+
+func TestAPIKeyRoundRobinsFixedChatGPTPoolAccounts(t *testing.T) {
+	var mu sync.Mutex
+	hits := make([]string, 0, 4)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accountID := r.Header.Get("chatgpt-account-id")
+		mu.Lock()
+		hits = append(hits, accountID)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"resp_%s","model":"gpt-test","output_text":"%s","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}`, accountID, accountID)
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("p", 32))
+	if err := storage.EnsureFixedOAuthPoolScopes(env.channels, env.groupKeys, env.cipher); err != nil {
+		t.Fatalf("ensure fixed pools: %v", err)
+	}
+	accounts := storage.NewOAuthAccounts(env.db, env.cipher)
+	imported, err := accounts.ImportJSON(storage.OAuthPoolChatGPT, []byte(`[
+		{"type":"codex","account_id":"account-a","access_token":"token-a"},
+		{"type":"codex","account_id":"account-b","access_token":"token-b"}
+	]`))
+	if err != nil || imported.Succeeded != 2 {
+		t.Fatalf("import accounts=%#v err=%v", imported, err)
+	}
+	for _, item := range imported.Items {
+		if err := accounts.RecordRuntimeSuccess(storage.OAuthPoolChatGPT, item.AccountID, time.Now()); err != nil {
+			t.Fatalf("activate account %d: %v", item.AccountID, err)
+		}
+	}
+	poolService := oauthpool.NewService(accounts, oauthpool.WithEndpoints(oauthpool.Endpoints{ChatGPTCodex: upstream.URL}))
+	env.svc.SetOAuthPool(poolService)
+	env.svc.SetOAuthAccounts(accounts)
+	env.svc.InvalidateSchedulingCache()
+
+	for i := 0; i < 4; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`))
+		req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		if err := env.svc.Proxy(recorder, req, "/v1/responses"); err != nil {
+			t.Fatalf("request %d: %v body=%s", i, err, recorder.Body.String())
+		}
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("request %d status=%d body=%s", i, recorder.Code, recorder.Body.String())
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := strings.Join(hits, ","); got != "account-a,account-b,account-a,account-b" {
+		t.Fatalf("pool hit order=%s", got)
+	}
+}
+
+func TestDispatchEventDetailIsSanitizedAndBounded(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("e", 32))
+	candidate := &storage.UpstreamGroupKey{ID: 77, ChannelID: 9, ChannelName: "relay", GroupName: "group", Ratio: 1}
+	attempt := env.svc.startDispatchLog(nil, candidate, "gpt-test", "192.0.2.1", 2)
+	secret := strings.Repeat("x", 5000)
+	env.svc.finishDispatchLog(attempt, "failed", "Authorization: Bearer "+secret+"\nCookie: sso=private", usageTokens{})
+	detail, err := env.svc.UsageLogDetail(attempt.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(detail.ErrorMessage, secret) || strings.Contains(detail.ErrorDetail, secret) || strings.Contains(detail.ErrorDetail, "sso=private") {
+		t.Fatalf("dispatch detail leaked credentials: %#v", detail)
+	}
+	if len([]rune(detail.ErrorDetail)) > 4096 {
+		t.Fatalf("dispatch detail is not bounded: %d", len([]rune(detail.ErrorDetail)))
+	}
+	if detail.DispatchAttempt != 2 || detail.ErrorCode == "" || detail.ErrorStatus == 0 {
+		t.Fatalf("dispatch detail lacks scheduling metadata: %#v", detail)
+	}
 }
 
 func TestProxyBlockedIPWritesRecognizableResponsesText(t *testing.T) {
@@ -125,7 +204,7 @@ func TestProxyFailsOverAndSkipsTemporarilyDisabledGroup(t *testing.T) {
 			t.Fatalf("authorization = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":[{"id":"ok"}]}`))
+		_, _ = w.Write([]byte(`{"id":"resp_ok","object":"response","status":"completed","model":"gpt-test","output_text":"ok","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}]}`))
 	}))
 	defer liveUpstream.Close()
 
@@ -187,10 +266,11 @@ func TestProxyFailsOverAndSkipsTemporarilyDisabledGroup(t *testing.T) {
 		t.Fatalf("insert live group key: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`))
 	req.Header.Set("Authorization", "Bearer "+localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	if err := svc.Proxy(rec, req, "/v1/models"); err != nil {
+	if err := svc.Proxy(rec, req, "/v1/responses"); err != nil {
 		t.Fatalf("proxy first request: %v", err)
 	}
 	if rec.Code != http.StatusOK {
@@ -200,10 +280,11 @@ func TestProxyFailsOverAndSkipsTemporarilyDisabledGroup(t *testing.T) {
 		t.Fatalf("hits after first request: dead=%d live=%d", deadHits, liveHits)
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-test","input":"ping"}`))
 	req.Header.Set("Authorization", "Bearer "+localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
 	rec = httptest.NewRecorder()
-	if err := svc.Proxy(rec, req, "/v1/models"); err != nil {
+	if err := svc.Proxy(rec, req, "/v1/responses"); err != nil {
 		t.Fatalf("proxy second request: %v", err)
 	}
 	if rec.Code != http.StatusOK {
@@ -709,8 +790,8 @@ func TestProxyFailsOverOnHTTP200ErrorPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load dead group key: %v", err)
 	}
-	if deadGroup.Status != "alive" || deadGroup.FailureCount != 1 || deadGroup.DisabledUntil == nil || !deadGroup.Enabled {
-		t.Fatalf("a first transient upstream error must enter temporary cooldown: %#v", deadGroup)
+	if deadGroup.Status != "alive" || deadGroup.FailureCount != 1 || deadGroup.DisabledUntil != nil || !deadGroup.Enabled {
+		t.Fatalf("a first transient upstream error must be counted without opening the breaker: %#v", deadGroup)
 	}
 }
 
@@ -780,7 +861,7 @@ func TestProxyDelaysSameGroupSiblingAfterRetryableGroupFailure(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "same group fallback") {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	want := []string{"first-group-key", "backup-group", "same-group-sibling"}
+	want := []string{"first-group-key", "same-group-sibling"}
 	if strings.Join(hitOrder, "|") != strings.Join(want, "|") {
 		t.Fatalf("hit order = %#v, want %#v", hitOrder, want)
 	}
@@ -849,7 +930,7 @@ func TestProxyDelaysSameGroupSiblingAfterCooldownSignal(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "cooldown sibling fallback") {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	want := []string{"backup-group", "same-group-sibling"}
+	want := []string{"same-group-sibling"}
 	if strings.Join(hitOrder, "|") != strings.Join(want, "|") {
 		t.Fatalf("hit order = %#v, want %#v", hitOrder, want)
 	}
@@ -927,7 +1008,7 @@ func TestProxyDelaysSameGroupSiblingWhenCandidateSaturated(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "saturated sibling fallback") {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	want := []string{"backup-group", "same-group-sibling"}
+	want := []string{"same-group-sibling"}
 	if strings.Join(hitOrder, "|") != strings.Join(want, "|") {
 		t.Fatalf("hit order = %#v, want %#v", hitOrder, want)
 	}
@@ -970,6 +1051,8 @@ func TestProxyUsesUnmonitoredChannelCandidates(t *testing.T) {
 	}
 }
 
+// TestCooldownCandidateIsNotProbed 锁定契约：冷却剩余时间还很长（这里 2 分钟）的候选，
+// 即便它是唯一候选、请求本会返回 503，也不应在冷却到期前被业务流量强行探测。
 func TestCooldownCandidateIsNotProbed(t *testing.T) {
 	var hits int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1586,13 +1669,14 @@ func TestSuccessfulFailoverStaysStickyWhileFailedCandidateCoolsDown(t *testing.T
 		}
 		return rec
 	}
-	first := request()
-	second := request()
-	if !strings.Contains(first.Body.String(), "ok") || !strings.Contains(second.Body.String(), "ok") {
-		t.Fatalf("healthy fallback did not complete both requests: first=%s second=%s", first.Body.String(), second.Body.String())
+	responses := []*httptest.ResponseRecorder{request(), request(), request(), request()}
+	for i, response := range responses {
+		if !strings.Contains(response.Body.String(), "ok") {
+			t.Fatalf("healthy fallback did not complete request %d: %s", i, response.Body.String())
+		}
 	}
-	if failedHits != 1 || healthyHits != 2 {
-		t.Fatalf("failed candidate should cool after first hit while healthy route stays sticky: failed=%d healthy=%d", failedHits, healthyHits)
+	if failedHits != 3 || healthyHits != 4 {
+		t.Fatalf("failed candidate should cool after three hits: failed=%d healthy=%d", failedHits, healthyHits)
 	}
 }
 
@@ -1927,17 +2011,13 @@ func TestProxyFailurePolicyImmediatelyUsesConfiguredCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load group key: %v", err)
 	}
-	before := time.Now()
 	env.svc.markProxyFailure(group.ID, "upstream returned HTTP 503: temporary upstream failure")
 	stored, err := env.groupKeys.FindByID(group.ID)
 	if err != nil {
 		t.Fatalf("load group after failure: %v", err)
 	}
-	if stored.FailureCount != 1 || stored.DisabledUntil == nil || !stored.Enabled || stored.Status != "alive" {
-		t.Fatalf("first transient failure should enter cooldown but keep display status alive: %#v", stored)
-	}
-	if delay := stored.DisabledUntil.Sub(before); delay < 290*time.Second || delay > 310*time.Second {
-		t.Fatalf("temporary failure cooldown = %s, want about 300s", delay)
+	if stored.FailureCount != 1 || stored.DisabledUntil != nil || !stored.Enabled || stored.Status != "alive" {
+		t.Fatalf("first transient failure should be counted without cooldown: %#v", stored)
 	}
 }
 
@@ -1962,19 +2042,18 @@ func TestProxyFailureDoesNotCoolDownSlowFirstOutput(t *testing.T) {
 		t.Fatalf("load group key: %v", err)
 	}
 
-	// 慢首字节只是"这一次等太久"，推理模型的 reasoning 阶段本就可能很长。它绝不代表
-	// 渠道坏了：调用方 shouldMarkProxyFailure 已对它返回 false，即使误触 markProxyFailure，
-	// 也不能进入任何冷却、不累加失败计数、状态保持 alive，否则可用渠道会被逐个打进冷却。
-	if shouldMarkProxyFailure("upstream did not produce first output within 60s") {
-		t.Fatal("slow first output must not be marked as a proxy failure")
+	if !shouldMarkProxyFailure("upstream did not produce first output within 60s") {
+		t.Fatal("slow first output must contribute to the temporary circuit breaker")
 	}
-	env.svc.markProxyFailure(group.ID, "upstream did not produce first output within 60s")
+	for i := 0; i < 3; i++ {
+		env.svc.markProxyFailure(group.ID, "upstream did not produce first output within 60s")
+	}
 	stored, err := env.groupKeys.FindByID(group.ID)
 	if err != nil {
 		t.Fatalf("load group after slow first output: %v", err)
 	}
-	if stored.DisabledUntil != nil || !stored.Enabled || stored.Status != "alive" {
-		t.Fatalf("slow first output must not cool down the candidate: %#v", stored)
+	if stored.DisabledUntil == nil || stored.FailureCount < 3 || !stored.Enabled {
+		t.Fatalf("three slow first outputs must temporarily cool down the candidate: %#v", stored)
 	}
 }
 
@@ -2071,8 +2150,8 @@ func TestProxyFailurePolicyUsesRetryAfterForRateLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load group: %v", err)
 	}
-	if stored.Status != "alive" || stored.DisabledUntil == nil || !stored.Enabled {
-		t.Fatalf("rate limit should set cooldown without painting the key dead-like: %#v", stored)
+	if stored.Status != "rate_limited" || stored.DisabledUntil == nil || !stored.Enabled {
+		t.Fatalf("rate limit should immediately leave normal rotation: %#v", stored)
 	}
 	if delay := stored.DisabledUntil.Sub(before); delay < 110*time.Second || delay > 130*time.Second {
 		t.Fatalf("retry-after cooldown = %s, want about 120s", delay)
@@ -2475,6 +2554,104 @@ func TestModelDiscoveryRemembersAdvertisedModelCapabilities(t *testing.T) {
 	if got := env.svc.candidateModelCapabilityRank(stored.ID, "gpt-unknown"); got != 1 {
 		t.Fatalf("unlisted model rank = %d, want unknown", got)
 	}
+}
+
+func TestGroupModelPolicySyncPreservesSelectionAndStrictlyRejectsUnselectedModel(t *testing.T) {
+	var mu sync.Mutex
+	models := []string{"gpt-a", "gpt-b"}
+	var generationHits int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			mu.Lock()
+			current := append([]string(nil), models...)
+			mu.Unlock()
+			data := make([]map[string]string, 0, len(current))
+			for _, model := range current {
+				data = append(data, map[string]string{"id": model})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+		case "/v1/responses":
+			generationHits++
+			_, _ = w.Write([]byte(`{"id":"resp_unexpected","output_text":"unexpected"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	env := newGatewayProxyTestEnv(t, strings.Repeat("w", 32))
+	channel := &storage.Channel{Name: "model-policy", Type: storage.ChannelTypeSub2API, SiteURL: upstream.URL, MonitorEnabled: true}
+	if err := env.channels.Create(channel); err != nil {
+		t.Fatalf("create channel: %v", err)
+	}
+	cipher, err := env.cipher.Encrypt("sk-model-policy")
+	if err != nil {
+		t.Fatalf("encrypt key: %v", err)
+	}
+	group := &storage.UpstreamGroupKey{
+		ChannelID: channel.ID, ChannelName: channel.Name, ChannelType: channel.Type,
+		ClientFormat: "openai", RequestMode: "responses", GroupRef: "model-policy", GroupName: "model-policy",
+		Ratio: 0.1, KeyCipher: cipher, Status: "alive",
+	}
+	if err := env.groupKeys.Upsert(group); err != nil {
+		t.Fatalf("insert group: %v", err)
+	}
+	stored, err := env.groupKeys.FindByChannelGroup(channel.ID, group.GroupRef)
+	if err != nil {
+		t.Fatalf("load group: %v", err)
+	}
+
+	policy, err := env.svc.SyncGroupKeyModels(context.Background(), stored.ID)
+	if err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if !policy.RestrictionEnabled || strings.Join(policy.AvailableModels, ",") != "gpt-a,gpt-b" || strings.Join(policy.SupportedModels, ",") != "gpt-a,gpt-b" {
+		t.Fatalf("first policy = %#v", policy)
+	}
+	if _, err := env.svc.SetGroupKeyModels(stored.ID, []string{"gpt-a"}); err != nil {
+		t.Fatalf("save selection: %v", err)
+	}
+	mu.Lock()
+	models = []string{"gpt-a", "gpt-b", "gpt-c"}
+	mu.Unlock()
+	policy, err = env.svc.SyncGroupKeyModels(context.Background(), stored.ID)
+	if err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	if strings.Join(policy.AvailableModels, ",") != "gpt-a,gpt-b,gpt-c" || strings.Join(policy.SupportedModels, ",") != "gpt-a" {
+		t.Fatalf("second policy = %#v", policy)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-b","input":"ping"}`))
+	req.Header.Set("Authorization", "Bearer "+env.localKey.Key)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	err = env.svc.Proxy(rec, req, "/v1/responses")
+	var gatewayErr *GatewayError
+	if !errors.As(err, &gatewayErr) || gatewayErr.Status != http.StatusBadRequest || !strings.Contains(string(gatewayErr.Body), "no configured upstream supports") {
+		t.Fatalf("strict rejection err=%v gateway=%#v", err, gatewayErr)
+	}
+	if generationHits != 0 {
+		t.Fatalf("unselected model reached upstream %d times", generationHits)
+	}
+}
+
+func TestExtractHealthProbeModelsSupportsGrokStyleObjectCatalog(t *testing.T) {
+	body := []byte(`{"models":{"grok-4.5":{"model_name":"grok-4.5"},"grok-code-fast-1":{"slug":"grok-code-fast-1"}}}`)
+	got := extractHealthProbeModels(body)
+	if !stringSliceContains(got, "grok-4.5") || !stringSliceContains(got, "grok-code-fast-1") {
+		t.Fatalf("models = %#v", got)
+	}
+}
+
+func stringSliceContains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func TestTestGroupKeysRecordsFallbackProbeModelCapability(t *testing.T) {
@@ -7115,6 +7292,32 @@ func TestStreamEventReadyWaitsForVisibleGeneration(t *testing.T) {
 	}
 	if failed, _ := streamEventPreflightFailure(sseEvent{Data: "[DONE]"}); !failed {
 		t.Fatal("premature [DONE] must fail preflight instead of pinning the stream")
+	}
+}
+
+// TestHealthBufferedDispatchFailureMatchesDispatch 校验测活复用调度的终态失败判定：
+// 只有可见生成文本才算活；纯生命周期噪声后跟 [DONE]（无可见输出）判失败；一旦已见
+// 可见文本，随后的终态事件不再翻案为失败。对齐"测活活但调度死"的修复。
+func TestHealthBufferedDispatchFailureMatchesDispatch(t *testing.T) {
+	// 生命周期噪声 + 过早 [DONE]，从未产出可见文本 → 判失败（与调度一致）。
+	if failed, _ := healthBufferedDispatchFailure([]sseEvent{
+		{Event: "response.created", Data: `{"type":"response.created","response":{"id":"r","status":"in_progress"}}`},
+		{Data: "[DONE]"},
+	}); !failed {
+		t.Fatal("lifecycle-only then premature [DONE] must be a health failure")
+	}
+	// 已出可见文本后再来终态事件 → 不判失败（正常完成的流）。
+	if failed, _ := healthBufferedDispatchFailure([]sseEvent{
+		{Event: "response.output_text.delta", Data: `{"type":"response.output_text.delta","delta":"2"}`},
+		{Data: "[DONE]"},
+	}); failed {
+		t.Fatal("visible generation followed by [DONE] must stay a health success")
+	}
+	// 上游明确的 failed 事件 → 判失败。
+	if failed, _ := healthBufferedDispatchFailure([]sseEvent{
+		{Event: "response.failed", Data: `{"type":"response.failed"}`},
+	}); !failed {
+		t.Fatal("response.failed event must be a health failure")
 	}
 }
 

@@ -204,6 +204,11 @@ type ProxyConfig struct {
 	Port                int    `mapstructure:"port" yaml:"port" json:"port"`
 	Username            string `mapstructure:"username" yaml:"username" json:"username"`
 	Password            string `mapstructure:"password" yaml:"password" json:"password"`
+	// SelectedTargets is a set of stable target references. Empty means the
+	// enabled proxy applies globally; otherwise only matching channels/pools use
+	// it. This remains compatible with older config files where the field is
+	// absent.
+	SelectedTargets []string `mapstructure:"selectedTargets" yaml:"selectedTargets" json:"selectedTargets"`
 }
 
 const (
@@ -213,12 +218,13 @@ const (
 	DefaultUpstreamUserAgent       = DefaultCodexOriginator + "/" + DefaultCodexVersion + " (Ubuntu 22.4.0; x86_64) xterm-256color"
 	legacyDefaultUpstreamUserAgent = "upstream-ops/0.1"
 	// DefaultStreamFirstEventTimeoutSeconds 是"等上游吐出第一个可见生成事件"的窗口。
-	// 推理模型（gpt-5.5/5.6 等）在真正出字前会先经历 reasoning 阶段，常需 5-30s，
-	// 秒级窗口会把完全可用的渠道误判成卡死并送去冷却。放宽到 45s 与成熟网关对齐
-	// （new-api StreamingTimeout 默认 300s、sub2api 默认禁用本地首字节截断），
-	// 45s 已足够覆盖推理模型的 reasoning 阶段，同时把"真卡死渠道"的最坏切换延迟
-	// 控制在一个更稳的时间点。等待期间仍按心跳间隔向客户端发 SSE 心跳，避免被下游断连。
-	DefaultStreamFirstEventTimeoutSeconds = 45
+	// 推理模型（gpt-5.5/5.6 等）在真正出字前会先经历 reasoning 阶段，常需 5-20s，
+	// 秒级窗口会把完全可用的渠道误判成卡死并送去冷却。取 20s 兼顾两头：覆盖推理模型
+	// 的 reasoning 阶段，同时把"真卡死渠道"的最坏切换延迟压到 20s——配合单请求候选
+	// 尝试上限（MaxDispatchAttemptsPerRequest），单次请求最坏等待被限制在可控范围内，
+	// 不再出现"逐个候选各等 45s、累计等两分钟"。等待期间仍按心跳间隔向客户端发 SSE
+	// 心跳避免被下游断连；超慢上游可在系统设置里调大该值。
+	DefaultStreamFirstEventTimeoutSeconds = 20
 	// DefaultHealthProbeTimeoutSeconds 是单次测活"等一个可见生成事件"的窗口。
 	// 推理模型 6s 内产不出 1+1= 的可见答案就会被判死，同样需要放宽。
 	DefaultHealthProbeTimeoutSeconds = 30
@@ -237,6 +243,10 @@ const (
 	// 做完整拦截扫描，命中就在写首字节前整体切到下一个候选（连命中前那段都不显示），
 	// 代价是首字节延迟增加（要多等这些事件到达）。
 	DefaultStreamInterceptionScanEvents = 0
+	// DefaultMaxDispatchAttemptsPerRequest 是单次请求最多"真正尝试"的候选数上限。
+	// 冷却/内存禁用被跳过的候选不计入。达到上限即停止继续 fail-over，直接返回失败，
+	// 避免候选池很大时逐个候选各等一个首字节窗口叠成分钟级等待。<=0 视为不限（逃生阀）。
+	DefaultMaxDispatchAttemptsPerRequest = 6
 )
 
 // DefaultOpenAIHealthProbeModels 是 OpenAI 渠道一键测活默认依次尝试的模型：
@@ -266,8 +276,12 @@ type UpstreamConfig struct {
 	// StreamInterceptionScanEvents 是首字节落地前额外缓冲扫描拦截词的可见事件数。
 	// 0 = 关闭（默认，低延迟）；>0 时首字节前多扫描这些事件以便命中拦截词时无缝切换
 	// 候选、连命中前那段都不显示，代价是首字节延迟增加。<0 视为 0。
-	StreamInterceptionScanEvents int                    `mapstructure:"streamInterceptionScanEvents" yaml:"streamInterceptionScanEvents" json:"streamInterceptionScanEvents"`
-	RequestRectifier             RequestRectifierConfig `mapstructure:"requestRectifier" yaml:"requestRectifier" json:"requestRectifier"`
+	StreamInterceptionScanEvents int `mapstructure:"streamInterceptionScanEvents" yaml:"streamInterceptionScanEvents" json:"streamInterceptionScanEvents"`
+	// MaxDispatchAttemptsPerRequest 限制单次请求最多真正尝试的候选数（冷却/禁用跳过不计）。
+	// 达到上限即停止 fail-over 直接返回失败，把最坏单请求等待压到"上限 × 首字节窗口"以内。
+	// <=0 时不限（保持逃生阀，行为回退到历史"遍历全部候选"）。
+	MaxDispatchAttemptsPerRequest int                    `mapstructure:"maxDispatchAttemptsPerRequest" yaml:"maxDispatchAttemptsPerRequest" json:"maxDispatchAttemptsPerRequest"`
+	RequestRectifier              RequestRectifierConfig `mapstructure:"requestRectifier" yaml:"requestRectifier" json:"requestRectifier"`
 }
 
 type RequestRectifierConfig struct {
@@ -527,6 +541,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("upstream.healthProbeMaxRatio", DefaultHealthProbeMaxRatio)
 	v.SetDefault("upstream.temporaryFailureCooldownSeconds", DefaultTemporaryFailureCooldownSeconds)
 	v.SetDefault("upstream.streamInterceptionScanEvents", DefaultStreamInterceptionScanEvents)
+	v.SetDefault("upstream.maxDispatchAttemptsPerRequest", DefaultMaxDispatchAttemptsPerRequest)
 	v.SetDefault("app.homepageCheapestEnabled", true)
 	v.SetDefault("upstream.requestRectifier.enabled", true)
 	v.SetDefault("upstream.requestRectifier.thinkingSignature", true)

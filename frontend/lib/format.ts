@@ -116,6 +116,10 @@ export function channelTypeLabel(t: string) {
       return "NewAPI"
     case "sub2api":
       return "Sub2API"
+		case "chatgpt_pool":
+			return "ChatGPT 号池"
+		case "grok_pool":
+			return "Grok 号池"
     default:
       return t
   }

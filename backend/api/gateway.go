@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -9,7 +10,9 @@ import (
 
 	gatewaySvc "github.com/bejix/upstream-ops/backend/gateway"
 	"github.com/bejix/upstream-ops/backend/progress"
+	"github.com/bejix/upstream-ops/backend/sanitize"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
@@ -17,6 +20,13 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		return
 	}
 	gp := g.Group("/gateway")
+	gp.GET("/route-preferences", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"data": []gin.H{
+			{"id": "ratio_first", "name": "倍率优先", "default": true},
+			{"id": "pool_first", "name": "号池优先"},
+			{"id": "upstream_first", "name": "上游优先"},
+		}})
+	})
 	gp.GET("/ip-policies", func(c *gin.Context) {
 		items, err := d.Gateway.ListIPPolicies()
 		if err != nil {
@@ -315,21 +325,37 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 		}
 		c.JSON(http.StatusOK, gin.H{"data": item})
 	})
-	// 同步上游 /v1/models 到该渠道的支持模型清单（软过滤用，命中清单的渠道排序靠前）。
+	gp.GET("/group-keys/:id/models", func(c *gin.Context) {
+		id, err := uintParam(c, "id")
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		policy, err := d.Gateway.GroupKeyModels(id)
+		if err != nil {
+			fail(c, http.StatusBadRequest, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": policy})
+	})
+	// Discover the upstream catalog and preserve the operator's explicit
+	// allowlist. Newly discovered models are not silently enabled after the
+	// first synchronization.
 	gp.POST("/group-keys/:id/models/sync", func(c *gin.Context) {
 		id, err := uintParam(c, "id")
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		models, err := d.Gateway.SyncGroupKeyModels(c.Request.Context(), id)
+		policy, err := d.Gateway.SyncGroupKeyModels(c.Request.Context(), id)
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"data": models})
+		c.JSON(http.StatusOK, gin.H{"data": policy})
 	})
-	// 手动覆盖该渠道的支持模型清单（增删后保存）。传空清单表示清空、回到未同步状态。
+	// Save a strict allowlist. An empty selection intentionally rejects every
+	// model for this route.
 	gp.PUT("/group-keys/:id/models", func(c *gin.Context) {
 		id, err := uintParam(c, "id")
 		if err != nil {
@@ -343,12 +369,12 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		models, err := d.Gateway.SetGroupKeyModels(id, body.Models)
+		policy, err := d.Gateway.SetGroupKeyModels(id, body.Models)
 		if err != nil {
 			fail(c, http.StatusBadRequest, err)
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"data": models})
+		c.JSON(http.StatusOK, gin.H{"data": policy})
 	})
 	gp.POST("/group-keys/test", func(c *gin.Context) {
 		groupIDs := parseUintCSV(c.Query("ids"))
@@ -402,6 +428,40 @@ func registerGatewayAPI(g *gin.RouterGroup, d *Deps) {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"data": gin.H{"items": items, "total": total, "stats": stats, "keys": keys}})
+	})
+	gp.GET("/usage-logs/:id", func(c *gin.Context) {
+		value, err := strconv.ParseUint(strings.TrimSpace(c.Param("id")), 10, 64)
+		if err != nil || value == 0 {
+			fail(c, http.StatusBadRequest, errors.New("invalid dispatch event id"))
+			return
+		}
+		entry, err := d.Gateway.UsageLogDetail(uint(value))
+		if err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				fail(c, http.StatusNotFound, errors.New("dispatch event not found"))
+				return
+			}
+			fail(c, http.StatusInternalServerError, err)
+			return
+		}
+		var detail any
+		if strings.TrimSpace(entry.ErrorDetail) != "" {
+			if json.Unmarshal([]byte(entry.ErrorDetail), &detail) != nil {
+				detail = gin.H{"error": entry.ErrorDetail}
+			}
+		}
+		if fields, ok := detail.(map[string]any); ok {
+			if entry.OAuthPool != "" {
+				fields["pool"] = entry.OAuthPool
+			}
+			if entry.OAuthAccount != "" {
+				fields["account"] = entry.OAuthAccount
+			}
+			if entry.DispatchAttempt > 0 {
+				fields["attempt"] = entry.DispatchAttempt
+			}
+		}
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"event": entry, "detail": detail}})
 	})
 	gp.DELETE("/usage-logs", func(c *gin.Context) {
 		deleted, err := d.Gateway.ClearUsageLogs()
@@ -478,10 +538,11 @@ func handleGatewayProxy(c *gin.Context, d *Deps, path string) {
 				c.Writer.Header().Set("Content-Type", "application/json")
 			}
 			c.Writer.WriteHeader(gerr.Status)
-			_, _ = c.Writer.Write(gerr.Body)
+			safeBody := []byte(sanitize.Truncate(sanitize.RedactText(string(gerr.Body)), 64<<10))
+			_, _ = c.Writer.Write(safeBody)
 			return
 		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": sanitize.Truncate(sanitize.RedactText(err.Error()), 2000)})
 	}
 }
 

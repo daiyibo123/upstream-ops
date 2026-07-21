@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -12,13 +13,39 @@ type Channels struct{ db *gorm.DB }
 
 func NewChannels(db *gorm.DB) *Channels { return &Channels{db: db} }
 
-func (r *Channels) Create(c *Channel) error { return r.db.Create(c).Error }
-func (r *Channels) Update(c *Channel) error { return r.db.Save(c).Error }
+func (r *Channels) Create(c *Channel) error {
+	if c == nil {
+		return errors.New("channel is nil")
+	}
+	if IsFixedPoolChannelType(c.Type) {
+		return ErrFixedPoolChannelImmutable
+	}
+	return r.db.Create(c).Error
+}
+
+func (r *Channels) Update(c *Channel) error {
+	if c == nil {
+		return errors.New("channel is nil")
+	}
+	var current Channel
+	if err := r.db.Select("id", "type").First(&current, c.ID).Error; err != nil {
+		return err
+	}
+	if IsFixedPoolChannelType(current.Type) || IsFixedPoolChannelType(c.Type) {
+		return ErrFixedPoolChannelImmutable
+	}
+	return r.db.Save(c).Error
+}
+
 func (r *Channels) Delete(id uint) error {
 	return r.db.Transaction(func(tx *gorm.DB) error {
 		var channel Channel
-		if err := tx.Select("id", "name").First(&channel, id).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
+		if err := tx.Select("id", "name", "type").First(&channel, id).Error; err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		} else if IsFixedPoolChannelType(channel.Type) {
+			return ErrFixedPoolChannelImmutable
 		}
 		if err := tx.Where("channel_id = ?", id).Delete(&AuthSession{}).Error; err != nil {
 			return err
@@ -55,11 +82,21 @@ func (r *Channels) FindByID(id uint) (*Channel, error) {
 	if err := r.db.First(&c, id).Error; err != nil {
 		return nil, err
 	}
+	markFixedPoolChannel(&c)
+	if c.Fixed {
+		if err := r.populateFixedPoolStats([]*Channel{&c}); err != nil {
+			return nil, err
+		}
+	}
 	return &c, nil
 }
 func (r *Channels) List() ([]Channel, error) {
 	var list []Channel
 	if err := r.db.Order("pinned DESC").Order("sort_order DESC").Order("id ASC").Find(&list).Error; err != nil {
+		return nil, err
+	}
+	markFixedPoolChannels(list)
+	if err := r.populateFixedPoolListStats(list); err != nil {
 		return nil, err
 	}
 	return list, nil
@@ -88,11 +125,16 @@ func (r *Channels) ListPage(page, pageSize int, search string) ([]Channel, int64
 		return nil, 0, err
 	}
 	var list []Channel
-	// 按"该渠道下最低倍率的分组"从低到高排序：越便宜的渠道越靠前。
-	// 没有可用分组（min 为 NULL）的渠道排最后；同价再按 sort_order / id。
+	// 排序优先级：
+	//   1. 置顶（pinned）最前；
+	//   2. "有余额"的渠道在前、无余额（NULL/<=0，含未采集的手动分组）沉底；
+	//   3. 该渠道下最低倍率的分组从低到高（越便宜越靠前）；没有可用分组（min 为 NULL）的排后；
+	//   4. 同价再按 sort_order / id。
+	// COALESCE 把 NULL 余额视为 0，避免"未采集"渠道因 NULL 参与比较产生数据库方言差异。
 	minRatioSub := "(SELECT MIN(ratio) FROM upstream_group_keys g WHERE g.channel_id = channels.id AND g.key_cipher <> '')"
 	q = q.
 		Order("pinned DESC").
+		Order("CASE WHEN COALESCE(channels.last_balance, 0) > 0 THEN 0 ELSE 1 END ASC").
 		Order("CASE WHEN " + minRatioSub + " IS NULL THEN 1 ELSE 0 END ASC").
 		Order(minRatioSub + " ASC").
 		Order("sort_order DESC").
@@ -103,7 +145,62 @@ func (r *Channels) ListPage(page, pageSize int, search string) ([]Channel, int64
 	if err := q.Find(&list).Error; err != nil {
 		return nil, 0, err
 	}
+	markFixedPoolChannels(list)
+	if err := r.populateFixedPoolListStats(list); err != nil {
+		return nil, 0, err
+	}
 	return list, total, nil
+}
+
+type oauthPoolChannelStats struct {
+	Pool        OAuthPool
+	Total       int64
+	RateLimited int64
+	Available   int64
+}
+
+func (r *Channels) populateFixedPoolListStats(channels []Channel) error {
+	pointers := make([]*Channel, 0, len(channels))
+	for i := range channels {
+		if channels[i].Fixed {
+			pointers = append(pointers, &channels[i])
+		}
+	}
+	return r.populateFixedPoolStats(pointers)
+}
+
+func (r *Channels) populateFixedPoolStats(channels []*Channel) error {
+	if len(channels) == 0 || r == nil || r.db == nil || !r.db.Migrator().HasTable(&OAuthAccount{}) {
+		return nil
+	}
+	var stats []oauthPoolChannelStats
+	now := time.Now().UTC()
+	if err := r.db.Model(&OAuthAccount{}).Select(`pool,
+		COUNT(*) AS total,
+		COALESCE(SUM(CASE WHEN status = ? THEN 1 ELSE 0 END), 0) AS rate_limited,
+		COALESCE(SUM(CASE WHEN enabled = ? AND in_rotation = ? AND status = ? AND credential_cipher <> '' AND (disabled_until IS NULL OR disabled_until <= ?) THEN 1 ELSE 0 END), 0) AS available`,
+		OAuthStatusRateLimited, true, true, OAuthStatusAlive, now).
+		Where("pool IN ?", []OAuthPool{OAuthPoolChatGPT, OAuthPoolGrok}).Group("pool").Scan(&stats).Error; err != nil {
+		return err
+	}
+	byPool := make(map[OAuthPool]oauthPoolChannelStats, len(stats))
+	for _, item := range stats {
+		byPool[item.Pool] = item
+	}
+	for _, channel := range channels {
+		if channel == nil {
+			continue
+		}
+		pool := OAuthPoolChatGPT
+		if channel.Type == ChannelTypeGrokPool {
+			pool = OAuthPoolGrok
+		}
+		item := byPool[pool]
+		channel.TotalAccounts = item.Total
+		channel.RateLimitedAccounts = item.RateLimited
+		channel.AvailableAccounts = item.Available
+	}
+	return nil
 }
 func (r *Channels) ListMonitorEnabled() ([]Channel, error) {
 	var list []Channel

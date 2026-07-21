@@ -21,6 +21,8 @@ import (
 	"github.com/bejix/upstream-ops/backend/logger"
 	"github.com/bejix/upstream-ops/backend/monitor"
 	"github.com/bejix/upstream-ops/backend/notify"
+	"github.com/bejix/upstream-ops/backend/oauthadmin"
+	"github.com/bejix/upstream-ops/backend/oauthpool"
 	"github.com/bejix/upstream-ops/backend/runtimeconfig"
 	"github.com/bejix/upstream-ops/backend/scheduler"
 	"github.com/bejix/upstream-ops/backend/storage"
@@ -103,6 +105,17 @@ func main() {
 	gatewayKeys := storage.NewGatewayKeys(db)
 	gatewayAffinities := storage.NewGatewayAffinities(db)
 	upstreamGroupKeys := storage.NewUpstreamGroupKeys(db)
+	if err := storage.EnsureFixedOAuthPoolScopes(channels, upstreamGroupKeys, cipher); err != nil {
+		log.Error("ensure fixed OAuth pools failed", "err", err)
+		os.Exit(1)
+	}
+	oauthAccounts := storage.NewOAuthAccounts(db, cipher)
+	oauthPoolSvc := oauthpool.NewService(oauthAccounts)
+	if err := oauthPoolSvc.UpdateProxyConfig(cfg.Proxy); err != nil {
+		log.Error("configure OAuth pool proxy failed", "err", err)
+		os.Exit(1)
+	}
+	oauthAdminSvc := oauthadmin.New(oauthAccounts, oauthPoolSvc)
 
 	channelSvc := channel.NewService(channels, authSessions, captchas, rates, monLogs, cipher)
 	channelSvc.UpdateProxyConfig(cfg.Proxy)
@@ -125,6 +138,9 @@ func main() {
 	gatewaySvc := gateway.NewService(channels, gatewayKeys, gatewayAffinities, upstreamGroupKeys, cipher, channelSvc, log)
 	gatewaySvc.UpdateUpstreamConfig(cfg.Upstream)
 	gatewaySvc.UpdateAppConfig(cfg.App)
+	gatewaySvc.UpdateProxyConfig(cfg.Proxy)
+	gatewaySvc.SetOAuthPool(oauthPoolSvc)
+	gatewaySvc.SetOAuthAccounts(oauthAccounts)
 	usageLogs := storage.NewUsageLogs(db)
 	gatewaySvc.SetUsageLogs(usageLogs)
 	gatewaySvc.SetIPPolicies(storage.NewIPPolicies(db))
@@ -152,6 +168,7 @@ func main() {
 		cfg.Upstream,
 		schedulerFactory,
 	)
+	runtimeMgr.SetOAuthPoolService(oauthPoolSvc)
 
 	gin.SetMode(cfg.Server.Mode)
 	router := gin.New()
@@ -185,6 +202,7 @@ func main() {
 		Monitor:       monitorSvc,
 		Dispatcher:    dispatcher,
 		Gateway:       gatewaySvc,
+		OAuthAdmin:    oauthAdminSvc,
 		Log:           log,
 		Frontend:      frontendFS,
 	})

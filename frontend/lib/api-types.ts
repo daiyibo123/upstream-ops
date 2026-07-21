@@ -3,7 +3,7 @@
  * Keep in sync with backend/storage/*.go and backend/api/*.go.
  */
 
-export type ChannelType = "newapi" | "sub2api"
+export type ChannelType = "newapi" | "sub2api" | "chatgpt_pool" | "grok_pool"
 
 export type CredentialMode = "password" | "token"
 
@@ -58,6 +58,11 @@ export interface Channel {
   last_error?: string
   created_at: string
   updated_at: string
+	fixed?: boolean
+	pool_type?: "chatgpt" | "grok"
+	total_accounts?: number
+	rate_limited_accounts?: number
+	available_accounts?: number
 }
 
 export interface ChannelPage {
@@ -358,6 +363,7 @@ export interface SystemProxyConfig {
   port: number
   username: string
   password: string
+	selectedTargets: string[]
 }
 
 export interface SystemUpstreamConfig {
@@ -570,6 +576,7 @@ export interface GatewayKey {
   balance_limit: number
   concurrency_limit: number
   max_group_ratio: number
+  route_preference: "ratio_first" | "pool_first" | "upstream_first"
   balance_remaining: number
   today_cost: number
   total_cost: number
@@ -674,11 +681,19 @@ export interface UpstreamGroupKey {
   last_success_at?: string | null
   health_probe_model?: string
   supported_models?: string
+  available_models?: string
+  model_restriction_enabled?: boolean
   last_used_at?: string | null
   disabled_until?: string | null
   last_error?: string
   created_at: string
   updated_at: string
+}
+
+export interface GroupModelPolicy {
+  available_models: string[]
+  supported_models: string[]
+  restriction_enabled: boolean
 }
 
 export interface UpstreamGroupKeyPage {
@@ -712,9 +727,33 @@ export interface UsageLog {
   ratio?: number
   status?: string
   error_message?: string
+  error_code?: string
+  error_status?: number
+  error_detail?: string
+  oauth_pool?: "chatgpt" | "grok" | string
+  oauth_account?: string
+  dispatch_attempt?: number
   first_token_ms?: number
   duration_ms?: number
   created_at: string
+}
+
+export interface DispatchEventDetail {
+  request_time?: string
+  channel?: string
+  pool?: string
+  account?: string
+  model?: string
+  attempt?: number
+  status?: string
+  error_code?: string
+  error_status?: number
+  error?: string
+}
+
+export interface UsageLogDetailResponse {
+  event: UsageLog
+  detail?: DispatchEventDetail | null
 }
 
 export interface IPPolicy {

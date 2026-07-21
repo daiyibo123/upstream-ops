@@ -29,8 +29,11 @@ import (
 	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/bejix/upstream-ops/backend/connector"
 	appcrypto "github.com/bejix/upstream-ops/backend/crypto"
+	"github.com/bejix/upstream-ops/backend/oauthpool"
 	"github.com/bejix/upstream-ops/backend/progress"
+	"github.com/bejix/upstream-ops/backend/sanitize"
 	"github.com/bejix/upstream-ops/backend/storage"
+	"gorm.io/gorm"
 )
 
 const (
@@ -100,26 +103,39 @@ var builtinModelPriceRules = []modelPriceRule{
 	{Prefix: "gpt-5.6", Price: modelPrice{InputPerMillion: 5, CachedInputPerMillion: 0.5, OutputPerMillion: 30}},
 }
 
+var defaultGrokPoolModelCatalog = []string{
+	"grok-4.5",
+	"grok-4.3",
+	"grok-code-fast-1",
+	"grok-chat-fast",
+}
+
 type Service struct {
-	channels         *storage.Channels
-	gateway          *storage.GatewayKeys
-	affinities       *storage.GatewayAffinities
-	groupKeys        *storage.UpstreamGroupKeys
-	usageLogs        *storage.UsageLogs
-	ipPolicies       *storage.IPPolicies
-	cipher           *appcrypto.Cipher
-	channelSvc       *channel.Service
-	log              *slog.Logger
-	clients          sync.Map
-	runtime          sync.Map
-	keyRuntime       sync.Map
-	ipRuntime        sync.Map
-	healthProbeSlots sync.Map
-	healthJobs       sync.Map
-	healthJobMu      sync.Mutex
-	configMu         sync.RWMutex
-	upstream         config.UpstreamConfig
-	app              config.AppConfig
+	channels          *storage.Channels
+	gateway           *storage.GatewayKeys
+	affinities        *storage.GatewayAffinities
+	groupKeys         *storage.UpstreamGroupKeys
+	usageLogs         *storage.UsageLogs
+	ipPolicies        *storage.IPPolicies
+	cipher            *appcrypto.Cipher
+	channelSvc        *channel.Service
+	log               *slog.Logger
+	clients           sync.Map
+	runtime           sync.Map
+	keyRuntime        sync.Map
+	ipRuntime         sync.Map
+	healthProbeSlots  sync.Map
+	healthJobs        sync.Map
+	dispatchCursors   sync.Map
+	healthJobMu       sync.Mutex
+	candidateCache    candidateSnapshotCache
+	configMu          sync.RWMutex
+	upstream          config.UpstreamConfig
+	app               config.AppConfig
+	proxy             config.ProxyConfig
+	oauthPool         *oauthpool.Service
+	oauthAccounts     *storage.OAuthAccounts
+	oauthFailureDirty sync.Map
 }
 
 type CreateGatewayKeyInput struct {
@@ -133,6 +149,7 @@ type CreateGatewayKeyInput struct {
 	BalanceLimit      float64 `json:"balance_limit"`
 	ConcurrencyLimit  int     `json:"concurrency_limit"`
 	MaxGroupRatio     float64 `json:"max_group_ratio"`
+	RoutePreference   string  `json:"route_preference"`
 	ExpiresInDays     int     `json:"expires_in_days"`
 }
 
@@ -148,6 +165,7 @@ type UpdateGatewayKeyInput struct {
 	BalanceLimit      *float64   `json:"balance_limit"`
 	ConcurrencyLimit  *int       `json:"concurrency_limit"`
 	MaxGroupRatio     *float64   `json:"max_group_ratio"`
+	RoutePreference   *string    `json:"route_preference"`
 	ExpiresInDays     *int       `json:"expires_in_days"`
 	ExpiresAt         *time.Time `json:"expires_at"`
 	DisabledMessage   *string    `json:"disabled_message"`
@@ -191,6 +209,7 @@ type GatewayKeyOutput struct {
 	BalanceLimit       float64    `json:"balance_limit"`
 	ConcurrencyLimit   int        `json:"concurrency_limit"`
 	MaxGroupRatio      float64    `json:"max_group_ratio"`
+	RoutePreference    string     `json:"route_preference"`
 	BalanceRemaining   float64    `json:"balance_remaining"`
 	TodayCost          float64    `json:"today_cost"`
 	TotalCost          float64    `json:"total_cost"`
@@ -586,6 +605,8 @@ type modelPriceRule struct {
 type groupRuntimeState struct {
 	mu                sync.Mutex
 	disabledUntil     time.Time
+	needsRecovery     bool
+	recoveryInFlight  bool
 	avgFirstTokenMS   float64
 	avgLatencyMS      float64
 	inFlight          int
@@ -896,6 +917,26 @@ func (s *Service) ListUsageLogs(limit, offset int, views ...string) ([]storage.U
 	return items, total, err
 }
 
+func (s *Service) UsageLogDetail(id uint) (*storage.UsageLog, error) {
+	if s.usageLogs == nil {
+		return nil, gorm.ErrRecordNotFound
+	}
+	entry, err := s.usageLogs.Find(id)
+	if err != nil {
+		return nil, err
+	}
+	entry.ErrorMessage = sanitize.Truncate(sanitize.RedactText(entry.ErrorMessage), 1000)
+	entry.ErrorDetail = sanitize.Truncate(sanitize.RedactText(entry.ErrorDetail), 4096)
+	if entry.ErrorDetail == "" && entry.ErrorMessage != "" {
+		attempt := dispatchLogAttempt{
+			startedAt: entry.CreatedAt, channel: entry.ChannelName, pool: entry.OAuthPool,
+			model: entry.Model, attempt: entry.DispatchAttempt,
+		}
+		entry.ErrorDetail = dispatchErrorDetail(attempt, entry.Status, entry.ErrorCode, entry.ErrorStatus, entry.ErrorMessage)
+	}
+	return entry, nil
+}
+
 // UsageLogStats 返回当前保留使用明细的聚合指标。
 func (s *Service) UsageLogStats(views ...string) (storage.UsageLogStats, error) {
 	if s.usageLogs == nil {
@@ -952,11 +993,21 @@ func (s *Service) recordUsageLog(gatewayKey *storage.GatewayKey, candidate *stor
 type dispatchLogAttempt struct {
 	id        uint
 	startedAt time.Time
+	channel   string
+	pool      string
+	model     string
+	attempt   int
 }
 
-func (s *Service) startDispatchLog(gatewayKey *storage.GatewayKey, candidate *storage.UpstreamGroupKey, model, requestIP string) dispatchLogAttempt {
+type dispatchLogContextKey struct{}
+
+func (s *Service) startDispatchLog(gatewayKey *storage.GatewayKey, candidate *storage.UpstreamGroupKey, model, requestIP string, attemptNumbers ...int) dispatchLogAttempt {
 	startedAt := time.Now()
-	attempt := dispatchLogAttempt{startedAt: startedAt}
+	attemptNumber := 0
+	if len(attemptNumbers) > 0 && attemptNumbers[0] > 0 {
+		attemptNumber = attemptNumbers[0]
+	}
+	attempt := dispatchLogAttempt{startedAt: startedAt, model: strings.TrimSpace(model), attempt: attemptNumber}
 	if s.usageLogs == nil {
 		return attempt
 	}
@@ -974,6 +1025,7 @@ func (s *Service) startDispatchLog(gatewayKey *storage.GatewayKey, candidate *st
 		entry.GatewayKeyIsPublic = gatewayKey.IsPublic
 	}
 	if candidate != nil {
+		attempt.channel = candidate.ChannelName
 		entry.ChannelID = candidate.ChannelID
 		entry.ChannelName = candidate.ChannelName
 		entry.UpstreamGroupKeyID = candidate.ID
@@ -981,7 +1033,12 @@ func (s *Service) startDispatchLog(gatewayKey *storage.GatewayKey, candidate *st
 		entry.GroupName = candidate.GroupName
 		entry.ClientFormat = candidate.ClientFormat
 		entry.Ratio = effectiveGroupRatio(*candidate)
+		if pool, fixed := oauthPoolForCandidate(candidate); fixed {
+			attempt.pool = string(pool)
+			entry.OAuthPool = string(pool)
+		}
 	}
+	entry.DispatchAttempt = attemptNumber
 	if err := s.usageLogs.Add(entry); err != nil {
 		if s.log != nil {
 			s.log.Warn("record dispatch start failed", "err", err)
@@ -1004,6 +1061,9 @@ func (s *Service) finishDispatchLog(attempt dispatchLogAttempt, status, errMsg s
 	if durationMS <= 0 && !attempt.startedAt.IsZero() {
 		durationMS = time.Since(attempt.startedAt).Milliseconds()
 	}
+	safeError := sanitize.Truncate(sanitize.RedactText(errMsg), 2000)
+	errorCode, errorStatus := dispatchErrorClassification(status, safeError)
+	detail := dispatchErrorDetail(attempt, status, errorCode, errorStatus, safeError)
 	updates := map[string]any{
 		"status":            status,
 		"prompt_tokens":     maxInt64(0, usage.Prompt),
@@ -1012,11 +1072,72 @@ func (s *Service) finishDispatchLog(attempt dispatchLogAttempt, status, errMsg s
 		"cached_tokens":     maxInt64(0, usage.Cached),
 		"first_token_ms":    maxInt64(0, usage.FirstTokenMS),
 		"duration_ms":       maxInt64(0, durationMS),
-		"error_message":     truncateLogMessage(errMsg, 1000),
+		"error_message":     sanitize.Truncate(safeError, 1000),
+		"error_code":        errorCode,
+		"error_status":      errorStatus,
+		"error_detail":      detail,
 	}
 	if err := s.usageLogs.Update(attempt.id, updates); err != nil && s.log != nil {
 		s.log.Warn("record dispatch finish failed", "id", attempt.id, "err", err)
 	}
+}
+
+func dispatchErrorClassification(status, message string) (string, int) {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	for _, code := range []int{400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504} {
+		marker := strconv.Itoa(code)
+		if strings.Contains(lower, "http "+marker) || strings.Contains(lower, "status "+marker) {
+			return "upstream_http_error", code
+		}
+	}
+	switch {
+	case strings.Contains(lower, "oauth_pool_unavailable"):
+		return "oauth_pool_unavailable", http.StatusServiceUnavailable
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded"):
+		return "upstream_timeout", http.StatusGatewayTimeout
+	case strings.Contains(lower, "proxy"):
+		return "proxy_error", http.StatusBadGateway
+	case strings.Contains(lower, "auth") || strings.Contains(lower, "unauthorized"):
+		return "upstream_auth_error", http.StatusUnauthorized
+	case status == "saturated":
+		return "concurrency_saturated", http.StatusServiceUnavailable
+	case status == "cooldown_skipped":
+		return "temporary_unschedulable", http.StatusServiceUnavailable
+	case strings.TrimSpace(message) != "":
+		return "upstream_error", http.StatusBadGateway
+	default:
+		return "", 0
+	}
+}
+
+func dispatchErrorDetail(attempt dispatchLogAttempt, status, code string, errorStatus int, message string) string {
+	if message == "" && code == "" {
+		return ""
+	}
+	payload := map[string]any{
+		"request_time": attempt.startedAt.UTC(), "channel": attempt.channel, "pool": attempt.pool,
+		"model": attempt.model, "attempt": attempt.attempt, "status": status,
+		"error_code": code, "error_status": errorStatus, "error": message,
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return sanitize.Truncate(message, 4096)
+	}
+	return sanitize.Truncate(sanitize.RedactText(string(raw)), 4096)
+}
+
+func (s *Service) attachOAuthDispatchAccount(ctx context.Context, lease *oauthpool.DispatchLease, accountAttempt int) {
+	if s.usageLogs == nil || lease == nil {
+		return
+	}
+	id, _ := ctx.Value(dispatchLogContextKey{}).(uint)
+	if id == 0 {
+		return
+	}
+	identifier := firstNonEmpty(lease.Account.Email, lease.Account.ExternalID, strconv.FormatUint(uint64(lease.Account.ID), 10))
+	_ = s.usageLogs.Update(id, map[string]any{
+		"oauth_pool": lease.Pool, "oauth_account": sanitize.MaskIdentifier(identifier), "dispatch_attempt": accountAttempt,
+	})
 }
 
 func (s *Service) recordDispatchSkipLog(gatewayKey *storage.GatewayKey, candidate *storage.UpstreamGroupKey, model, requestIP, status, errMsg string) {
@@ -1134,6 +1255,48 @@ func (s *Service) UpdateAppConfig(cfg config.AppConfig) {
 	s.configMu.Unlock()
 }
 
+func (s *Service) UpdateProxyConfig(cfg config.ProxyConfig) {
+	cfg.SelectedTargets = config.CleanProxyTargets(cfg.SelectedTargets)
+	s.configMu.Lock()
+	s.proxy = cfg
+	s.configMu.Unlock()
+	s.clients.Range(func(key, value any) bool {
+		if client, ok := value.(*http.Client); ok {
+			client.CloseIdleConnections()
+		}
+		s.clients.Delete(key)
+		return true
+	})
+}
+
+// SetOAuthPool attaches the account scheduler used only after the normal
+// ratio/group scheduler has selected one of the fixed pool channels.
+func (s *Service) SetOAuthPool(service *oauthpool.Service) {
+	s.configMu.Lock()
+	s.oauthPool = service
+	s.configMu.Unlock()
+}
+
+func (s *Service) SetOAuthAccounts(repository *storage.OAuthAccounts) {
+	s.configMu.Lock()
+	s.oauthAccounts = repository
+	s.configMu.Unlock()
+}
+
+func (s *Service) oauthPoolService() *oauthpool.Service {
+	s.configMu.RLock()
+	service := s.oauthPool
+	s.configMu.RUnlock()
+	return service
+}
+
+func (s *Service) oauthAccountRepository() *storage.OAuthAccounts {
+	s.configMu.RLock()
+	repository := s.oauthAccounts
+	s.configMu.RUnlock()
+	return repository
+}
+
 func (s *Service) appConfig() config.AppConfig {
 	s.configMu.RLock()
 	cfg := s.app
@@ -1146,6 +1309,13 @@ func (s *Service) upstreamConfig() config.UpstreamConfig {
 	cfg := s.upstream
 	s.configMu.RUnlock()
 	return cfg.WithDefaults()
+}
+
+func (s *Service) proxyConfig() config.ProxyConfig {
+	s.configMu.RLock()
+	cfg := s.proxy
+	s.configMu.RUnlock()
+	return cfg
 }
 
 // streamFirstEventBudget 是"等上游吐出第一个可见生成事件"的窗口，可配置。
@@ -1173,6 +1343,17 @@ func (s *Service) healthProbeBudget() time.Duration {
 func (s *Service) streamInterceptionScanEvents() int {
 	n := s.upstreamConfig().StreamInterceptionScanEvents
 	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// maxDispatchAttempts 是单次请求最多"真正尝试"的候选数上限（冷却/内存禁用被跳过的
+// 候选不计）。<=0 视为不限，行为回退到历史"遍历全部候选"。配合收敛后的首字节窗口，
+// 把最坏单请求等待压到"上限 × 首字节窗口"以内。
+func (s *Service) maxDispatchAttempts() int {
+	n := s.upstreamConfig().MaxDispatchAttemptsPerRequest
+	if n <= 0 {
 		return 0
 	}
 	return n
@@ -1267,6 +1448,23 @@ func normalizeGatewayMaxGroupRatio(value float64) float64 {
 	return 0
 }
 
+const (
+	gatewayRouteRatioFirst    = "ratio_first"
+	gatewayRoutePoolFirst     = "pool_first"
+	gatewayRouteUpstreamFirst = "upstream_first"
+)
+
+func normalizeGatewayRoutePreference(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case gatewayRoutePoolFirst:
+		return gatewayRoutePoolFirst
+	case gatewayRouteUpstreamFirst:
+		return gatewayRouteUpstreamFirst
+	default:
+		return gatewayRouteRatioFirst
+	}
+}
+
 func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutput, error) {
 	name := strings.TrimSpace(input.Name)
 	if name == "" {
@@ -1301,6 +1499,7 @@ func (s *Service) CreateGatewayKey(input CreateGatewayKeyInput) (*GatewayKeyOutp
 		BalanceLimit:      balanceLimit,
 		ConcurrencyLimit:  concurrencyLimit,
 		MaxGroupRatio:     normalizeGatewayMaxGroupRatio(input.MaxGroupRatio),
+		RoutePreference:   normalizeGatewayRoutePreference(input.RoutePreference),
 	}
 	if input.ExpiresInDays > 0 {
 		expiresAt := time.Now().AddDate(0, 0, input.ExpiresInDays)
@@ -1408,6 +1607,9 @@ func (s *Service) UpdateGatewayKey(id uint, input UpdateGatewayKeyInput) (*Gatew
 	}
 	if input.MaxGroupRatio != nil {
 		key.MaxGroupRatio = normalizeGatewayMaxGroupRatio(*input.MaxGroupRatio)
+	}
+	if input.RoutePreference != nil {
+		key.RoutePreference = normalizeGatewayRoutePreference(*input.RoutePreference)
 	}
 	if input.ExpiresInDays != nil {
 		days := *input.ExpiresInDays
@@ -1601,6 +1803,7 @@ func (s *Service) GroupKeyCounts() (storage.UpstreamGroupKeyCounts, error) {
 }
 
 func (s *Service) UpdateGroupKey(id uint, input UpdateGroupKeyInput) (*storage.UpstreamGroupKey, error) {
+	defer s.InvalidateSchedulingCache()
 	key, err := s.groupKeys.FindByID(id)
 	if err != nil {
 		return nil, err
@@ -2051,8 +2254,8 @@ func (s *Service) syncBootstrapGroupModels(ctx context.Context, groups []storage
 			}
 			release := s.acquireHealthProbeUpstreamSlot(candidate)
 			defer release()
-			models, err := s.SyncGroupKeyModels(ctx, candidate.ID)
-			if err != nil || len(models) == 0 {
+			policy, err := s.SyncGroupKeyModels(ctx, candidate.ID)
+			if err != nil || len(policy.AvailableModels) == 0 {
 				failed.Add(1)
 				if err != nil && s.log != nil {
 					s.log.Warn("bootstrap model sync failed", "id", candidate.ID, "channel", candidate.ChannelName, "group", candidate.GroupName, "err", err)
@@ -2085,6 +2288,7 @@ type ManualGroupKeyInput struct {
 
 // CreateManualGroupKey 手动创建一个上游分组密钥，不经过登录/自动同步。
 func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKeyInput) (*storage.UpstreamGroupKey, error) {
+	defer s.InvalidateSchedulingCache()
 	groupName := strings.TrimSpace(input.GroupName)
 	rawKey := normalizeUpstreamAPIKey(input.Key)
 	if groupName == "" {
@@ -2205,6 +2409,7 @@ func (s *Service) CreateManualGroupKey(ctx context.Context, input ManualGroupKey
 // 用于用户手动清理"上游已经删掉、本地却残留并一直显示 dead"的分组。
 // 只删本地记录，不去动上游（上游那边可能已经没了，也可能是用户手动贴的 key）。
 func (s *Service) DeleteGroupKey(id uint) error {
+	defer s.InvalidateSchedulingCache()
 	if id == 0 {
 		return errors.New("invalid group key id")
 	}
@@ -2214,6 +2419,7 @@ func (s *Service) DeleteGroupKey(id uint) error {
 
 // ClearGroupKeyCooldown 手动解除某个上游分组的冷却，立即恢复可调度。
 func (s *Service) ClearGroupKeyCooldown(id uint) (*storage.UpstreamGroupKey, error) {
+	defer s.InvalidateSchedulingCache()
 	if id == 0 {
 		return nil, errors.New("invalid group key id")
 	}
@@ -2225,6 +2431,7 @@ func (s *Service) ClearGroupKeyCooldown(id uint) (*storage.UpstreamGroupKey, err
 }
 
 func (s *Service) BootstrapGroupKeys(ctx context.Context) (*BootstrapResult, error) {
+	defer s.InvalidateSchedulingCache()
 	channels, err := s.channels.List()
 	if err != nil {
 		return nil, err
@@ -2914,6 +3121,9 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		}
 		return failGatewayRequest(http.StatusTooManyRequests, "gateway_quota_exceeded", err.Error())
 	}
+	if isGatewayModelListRequest(r.Method, path) {
+		return s.writeGatewayModelList(r.Context(), w, gatewayKey)
+	}
 	// Codex normally supplies previous_response_id or prompt_cache_key, but
 	// independent requests do not always carry either.  Without a soft affinity
 	// every such request is re-ranked from scratch and can bounce between two
@@ -2926,13 +3136,14 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	}
 
 	now := time.Now()
-	candidates, err := s.groupKeys.ListCandidates(now)
+	requestedModel := routingRequestModel(normalized)
+	candidates, err := s.schedulingCandidates(now, requestedModel)
 	if err != nil {
 		return failGatewayRequest(http.StatusInternalServerError, "gateway_error", err.Error())
 	}
-	requestedModel := routingRequestModel(normalized)
 	candidates = filterCandidatesForGatewayKey(gatewayKey, candidates)
 	candidates = filterCandidatesForClientFormat(gatewayKey.ClientFormat, normalized.ResponseMode, candidates)
+	candidates = filterSchedulableCandidates(candidates)
 	if len(candidates) == 0 {
 		message := gatewayKeyScopeEmptyMessage(gatewayKey)
 		s.recordDispatchSkipLog(gatewayKey, nil, requestedModel, normalized.ClientIP, "failed", message)
@@ -2944,7 +3155,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		s.recordDispatchSkipLog(gatewayKey, nil, requestedModel, normalized.ClientIP, "failed", message)
 		return failGatewayRequest(http.StatusBadRequest, "model_not_supported", message)
 	}
-	candidates = s.orderCandidatesForRequest(candidates, normalized)
+	candidates = s.orderCandidatesForRequest(candidates, normalized, gatewayKey)
 
 	var errorsSeen []string
 	var saturatedSeen []string
@@ -2976,31 +3187,25 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	// finalErr 承载"客户端错、换 key 也没用"路径的返回值。
 	// 在 stream 已写字节 / 明确 client-side 400 等场景下，我们把 err 记进来后不再继续 fail-over。
 	var finalErr error
-	// cooldownSkipped 收集"仅因冷却/内存禁用被跳过"的候选及其最早到期时间，
-	// 供绝境兜底使用：当没有任何候选被真正尝试过（全被冷却跳过）时，挑一个冷却最快
-	// 到期的强行试一次，避免刚恢复的渠道因残留冷却被直接判成"无可用上游"而返回 503。
-	type cooldownSkip struct {
-		candidate storage.UpstreamGroupKey
-		until     time.Time
-	}
-	var cooldownSkipped []cooldownSkip
-	recordCooldownSkip := func(candidate storage.UpstreamGroupKey, until time.Time) {
-		cooldownSkipped = append(cooldownSkipped, cooldownSkip{candidate: candidate, until: until})
-	}
+	// attemptsUsed 统计"真正发起过上游尝试"的候选数（冷却/内存禁用跳过、并发饱和立即
+	// 退回的都不计）。maxAttempts>0 时达到上限即停止继续 fail-over，避免候选池很大时
+	// 逐个候选各等一个首字节窗口叠成分钟级等待。<=0 视为不限（逃生阀）。
+	maxAttempts := s.maxDispatchAttempts()
+	attemptsMade := 0
+	slowFirstOutputAttempts := 0
+	attemptCapReached := false
 	for i := range candidates {
 		candidate := candidates[i]
 		if until, ok := candidateCooldownUntil(candidate, now); ok {
 			message := cooldownMessage(candidate, until)
 			disabledSeen = append(disabledSeen, message)
 			delayDispatchGroup(candidate)
-			recordCooldownSkip(candidate, until)
 			continue
 		}
 		if until, ok := s.runtimeDisabledUntil(candidate.ID); ok {
 			message := cooldownMessage(candidate, until)
 			disabledSeen = append(disabledSeen, message)
 			delayDispatchGroup(candidate)
-			recordCooldownSkip(candidate, until)
 			continue
 		}
 		if group := dispatchGroupIdentity(candidate); group != "" {
@@ -3010,8 +3215,11 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			}
 		}
 		// 把单个候选的尝试封装到闭包里，用 defer release() 保证 panic / 早退时不泄漏并发额度。
-		dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
-		outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
+		dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, attemptsMade+1)
+		attemptCtx := context.WithValue(r.Context(), dispatchLogContextKey{}, dispatchLog.id)
+		outcome := s.attemptCandidate(attemptCtx, gatewayKey, normalized, &candidate, w)
+		// 只统计"真正发起过尝试"的候选（冷却/内存禁用被 continue 跳过的不计）。
+		attemptsMade++
 
 		switch outcome.kind {
 		case candSuccess:
@@ -3021,6 +3229,8 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			s.finishDispatchLog(dispatchLog, "saturated", "candidate is at concurrency limit", usageTokens{})
 			saturatedSeen = append(saturatedSeen, fmt.Sprintf("%s/%s", candidate.ChannelName, candidate.GroupName))
 			delayDispatchGroup(candidate)
+			// 并发饱和不是真正把请求发给了上游、也没等首字节，不占用尝试预算。
+			attemptsMade--
 			continue
 		case candRetryable:
 			s.finishDispatchLog(dispatchLog, "switched", outcome.errMsg, usageTokens{})
@@ -3029,6 +3239,19 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			delaySameDispatchGroup(candidate, outcome.errMsg)
 			if shouldMarkProxyFailure(outcome.errMsg) {
 				s.markProxyFailure(candidate.ID, outcome.errMsg)
+			}
+			if isSlowFirstOutputFailure(outcome.errMsg) {
+				slowFirstOutputAttempts++
+				if slowFirstOutputAttempts >= 3 {
+					attemptCapReached = true
+					break
+				}
+			}
+			// 达到单请求尝试上限即停止继续 fail-over，避免候选池很大时逐个各等一个
+			// 首字节窗口叠成分钟级等待。maxAttempts<=0 表示不限（逃生阀）。
+			if maxAttempts > 0 && attemptsMade >= maxAttempts {
+				attemptCapReached = true
+				break
 			}
 			continue
 		case candFatal:
@@ -3046,8 +3269,12 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 		if finalErr != nil {
 			return finalErr
 		}
+		// switch 里的 break 只跳出 switch，这里把"达到尝试上限"提升为跳出候选主循环。
+		if attemptCapReached {
+			break
+		}
 	}
-	if len(delayedSameGroupFallback) > 0 {
+	if !attemptCapReached && len(delayedSameGroupFallback) > 0 {
 		delayedSameGroupFallback = s.orderCandidatesWithRuntime(delayedSameGroupFallback, requestedModel)
 		for i := range delayedSameGroupFallback {
 			candidate := delayedSameGroupFallback[i]
@@ -3060,17 +3287,18 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			if until, ok := candidateCooldownUntil(candidate, time.Now()); ok {
 				message := cooldownMessage(candidate, until)
 				disabledSeen = append(disabledSeen, message)
-				recordCooldownSkip(candidate, until)
 				continue
 			}
 			if until, ok := s.runtimeDisabledUntil(candidate.ID); ok {
 				message := cooldownMessage(candidate, until)
 				disabledSeen = append(disabledSeen, message)
-				recordCooldownSkip(candidate, until)
 				continue
 			}
-			dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
-			outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
+			dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP, attemptsMade+1)
+			attemptCtx := context.WithValue(r.Context(), dispatchLogContextKey{}, dispatchLog.id)
+			outcome := s.attemptCandidate(attemptCtx, gatewayKey, normalized, &candidate, w)
+			// 同组延迟兜底同样计入单请求尝试预算（并发饱和不计，见 candSaturated）。
+			attemptsMade++
 			switch outcome.kind {
 			case candSuccess:
 				s.finishDispatchLog(dispatchLog, outcome.logStatus, outcome.errMsg, outcome.usage)
@@ -3078,6 +3306,7 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			case candSaturated:
 				s.finishDispatchLog(dispatchLog, "saturated", "candidate is at concurrency limit", usageTokens{})
 				saturatedSeen = append(saturatedSeen, fmt.Sprintf("%s/%s", candidate.ChannelName, candidate.GroupName))
+				attemptsMade--
 				continue
 			case candRetryable:
 				s.finishDispatchLog(dispatchLog, "switched", outcome.errMsg, usageTokens{})
@@ -3085,6 +3314,18 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 				rememberUnsupportedModel(candidate, outcome.errMsg)
 				if shouldMarkProxyFailure(outcome.errMsg) {
 					s.markProxyFailure(candidate.ID, outcome.errMsg)
+				}
+				if isSlowFirstOutputFailure(outcome.errMsg) {
+					slowFirstOutputAttempts++
+					if slowFirstOutputAttempts >= 3 {
+						attemptCapReached = true
+					}
+				}
+				if maxAttempts > 0 && attemptsMade >= maxAttempts {
+					attemptCapReached = true
+				}
+				if attemptCapReached {
+					break
 				}
 				continue
 			case candFatal:
@@ -3099,52 +3340,8 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 			if finalErr != nil {
 				return finalErr
 			}
-		}
-	}
-	// 绝境兜底：本轮没有任何候选被真正尝试过（errorsSeen / saturatedSeen 都为空），
-	// 全部候选都只是因冷却 / 临时禁用被跳过。此时若直接返回 503，客户端就会看到
-	// "明明有渠道却 temporarily unavailable" 并从头重发整个请求。为尽量减少中断，
-	// 挑一个冷却最快到期的候选强行试一次——它可能刚好已经恢复（DB 冷却与内存禁用都是
-	// 保守估计，上游实际早就好了）。这是有界的：最多一次额外尝试，且只在本来就要返回
-	// 503 的绝境里触发，失败最坏也只是回到同样的 503，绝不会让结果更差。
-	// 客户端已断开时不做兜底：继续尝试没有意义，且会被误判成 network_error 冷却候选。
-	if r.Context().Err() == nil && len(errorsSeen) == 0 && len(saturatedSeen) == 0 && len(cooldownSkipped) > 0 {
-		best := cooldownSkipped[0]
-		for _, skip := range cooldownSkipped[1:] {
-			if skip.until.Before(best.until) {
-				best = skip
-			}
-		}
-		candidate := best.candidate
-		dispatchLog := s.startDispatchLog(gatewayKey, &candidate, requestedModel, normalized.ClientIP)
-		outcome := s.attemptCandidate(r.Context(), gatewayKey, normalized, &candidate, w)
-		switch outcome.kind {
-		case candSuccess:
-			// 兜底尝试成功：这个候选其实已经恢复，顺手清掉它的冷却与内存禁用，
-			// 让后续请求可以正常调度到它，不必再走兜底。
-			s.clearRuntimeDisable(candidate.ID)
-			_ = s.groupKeys.ClearCooldown(candidate.ID)
-			s.finishDispatchLog(dispatchLog, outcome.logStatus, outcome.errMsg, outcome.usage)
-			return nil
-		case candSaturated:
-			s.finishDispatchLog(dispatchLog, "saturated", "candidate is at concurrency limit", usageTokens{})
-			saturatedSeen = append(saturatedSeen, fmt.Sprintf("%s/%s", candidate.ChannelName, candidate.GroupName))
-		case candRetryable:
-			s.finishDispatchLog(dispatchLog, "switched", outcome.errMsg, usageTokens{})
-			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
-			rememberUnsupportedModel(candidate, outcome.errMsg)
-			if shouldMarkProxyFailure(outcome.errMsg) {
-				s.markProxyFailure(candidate.ID, outcome.errMsg)
-			}
-		case candFatal:
-			s.finishDispatchLog(dispatchLog, "failed", outcome.errMsg, usageTokens{})
-			errorsSeen = append(errorsSeen, fmt.Sprintf("%s/%s: %s", candidate.ChannelName, candidate.GroupName, outcome.errMsg))
-			rememberUnsupportedModel(candidate, outcome.errMsg)
-			if outcome.markFailure && shouldMarkProxyFailure(outcome.errMsg) {
-				s.markProxyFailure(candidate.ID, outcome.errMsg)
-			}
-			if outcome.err != nil {
-				return outcome.err
+			if attemptCapReached {
+				break
 			}
 		}
 	}
@@ -3163,6 +3360,92 @@ func (s *Service) Proxy(w http.ResponseWriter, r *http.Request, path string) err
 	}
 	s.recordDispatchSkipLog(gatewayKey, nil, requestedModel, normalized.ClientIP, "failed", message)
 	return failGatewayRequest(http.StatusServiceUnavailable, "upstream_unavailable", message)
+}
+
+func isGatewayModelListRequest(method, path string) bool {
+	if method != http.MethodGet {
+		return false
+	}
+	if index := strings.Index(path, "?"); index >= 0 {
+		path = path[:index]
+	}
+	path = "/" + strings.Trim(strings.TrimSpace(path), "/")
+	return path == healthPath
+}
+
+func (s *Service) writeGatewayModelList(ctx context.Context, w http.ResponseWriter, key *storage.GatewayKey) error {
+	candidates, err := s.schedulingCandidates(time.Now(), "")
+	if err != nil {
+		return &GatewayError{Status: http.StatusInternalServerError, Body: jsonError(err.Error())}
+	}
+	candidates = filterCandidatesForGatewayKey(key, candidates)
+	candidates = filterCandidatesForClientFormat(key.ClientFormat, "responses", candidates)
+	models := make(map[string]map[string]any)
+	for index := range candidates {
+		candidate := candidates[index]
+		if !candidateSchedulable(candidate) {
+			continue
+		}
+		if _, cooling := candidateCooldownUntil(candidate, time.Now()); cooling {
+			continue
+		}
+		if _, cooling := s.runtimeDisabledUntil(candidate.ID); cooling {
+			continue
+		}
+		catalog := decodeModelNames(candidate.AvailableModels)
+		if candidate.ModelRestrictionEnabled {
+			catalog = decodeModelNames(candidate.SupportedModels)
+		} else if len(catalog) == 0 {
+			catalog = decodeModelNames(candidate.SupportedModels)
+		}
+		if len(catalog) == 0 && !candidate.ModelRestrictionEnabled {
+			switch candidate.ChannelType {
+			case storage.ChannelTypeGrokPool:
+				catalog = append([]string(nil), defaultGrokPoolModelCatalog...)
+			case storage.ChannelTypeChatGPTPool:
+				catalog = append([]string(nil), config.DefaultOpenAIHealthProbeModels...)
+			default:
+				if candidate.HealthProbeModel != "" {
+					catalog = []string{candidate.HealthProbeModel}
+				}
+			}
+		}
+		for _, model := range catalog {
+			model = strings.TrimSpace(model)
+			if model == "" {
+				continue
+			}
+			if pool, fixed := oauthPoolForCandidate(&candidate); fixed {
+				poolService := s.oauthPoolService()
+				if poolService == nil {
+					continue
+				}
+				available, availabilityErr := poolService.HasAvailable(ctx, pool, model)
+				if availabilityErr != nil || !available {
+					continue
+				}
+			}
+			normalized := normalizeModelCapabilityKey(model)
+			if _, exists := models[normalized]; exists {
+				continue
+			}
+			models[normalized] = map[string]any{
+				"id": model, "object": "model", "created": int64(0), "owned_by": firstNonEmpty(candidate.ChannelName, "gateway"),
+			}
+		}
+	}
+	keys := make([]string, 0, len(models))
+	for model := range models {
+		keys = append(keys, model)
+	}
+	sort.Strings(keys)
+	data := make([]map[string]any, 0, len(keys))
+	for _, model := range keys {
+		data = append(data, models[model])
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	return json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
 }
 
 // candOutcomeKind 描述一次候选尝试的走向：
@@ -3199,7 +3482,7 @@ func (s *Service) attemptCandidate(
 	candidate *storage.UpstreamGroupKey,
 	w http.ResponseWriter,
 ) candOutcome {
-	release, ok := s.tryAcquireCandidate(candidate.ID, candidate.ConcurrencyLimit)
+	release, ok := s.tryAcquireScheduledCandidate(candidate)
 	if !ok {
 		return candOutcome{kind: candSaturated}
 	}
@@ -3210,6 +3493,175 @@ func (s *Service) attemptCandidate(
 		return s.attemptStream(ctx, gatewayKey, normalized, candidate, w)
 	}
 	return s.attemptNonStream(ctx, gatewayKey, normalized, candidate, w)
+}
+
+const oauthPoolAccountAttemptsPerCandidate = 3
+
+type oauthPoolLeaseContextKey struct{}
+
+type oauthPoolAttemptContext struct {
+	service *oauthpool.Service
+	lease   *oauthpool.DispatchLease
+}
+
+func oauthPoolForCandidate(candidate *storage.UpstreamGroupKey) (storage.OAuthPool, bool) {
+	if candidate == nil {
+		return "", false
+	}
+	switch candidate.ChannelType {
+	case storage.ChannelTypeChatGPTPool:
+		return storage.OAuthPoolChatGPT, true
+	case storage.ChannelTypeGrokPool:
+		return storage.OAuthPoolGrok, true
+	default:
+		return "", false
+	}
+}
+
+func oauthPoolLeaseFromContext(ctx context.Context) *oauthPoolAttemptContext {
+	attempt, _ := ctx.Value(oauthPoolLeaseContextKey{}).(*oauthPoolAttemptContext)
+	return attempt
+}
+
+func (s *Service) streamProxyOAuthPoolCandidate(ctx context.Context, request normalizedRequest, key *storage.UpstreamGroupKey, w http.ResponseWriter, pool storage.OAuthPool) (bool, usageTokens, error) {
+	service := s.oauthPoolService()
+	if service == nil {
+		return true, usageTokens{}, errors.New("oauth_pool_unavailable: OAuth pool service is not configured")
+	}
+	poolCtx := ctx
+	cancel := func() {}
+	if budget := s.streamFirstEventBudget(); budget > 0 {
+		poolCtx, cancel = context.WithTimeout(ctx, budget)
+	}
+	defer cancel()
+	excluded := make(map[uint]bool, oauthPoolAccountAttemptsPerCandidate)
+	var lastErr error
+	for attempt := 0; attempt < oauthPoolAccountAttemptsPerCandidate; attempt++ {
+		lease, err := service.AcquireContext(poolCtx, pool, routingRequestModel(request), excluded)
+		if err != nil {
+			if lastErr != nil {
+				return true, usageTokens{}, fmt.Errorf("oauth_pool_unavailable: %s pool exhausted after %d attempts: %w", pool, attempt, lastErr)
+			}
+			return true, usageTokens{}, fmt.Errorf("oauth_pool_unavailable: %s: %w", pool, err)
+		}
+		excluded[lease.Account.ID] = true
+		s.attachOAuthDispatchAccount(poolCtx, lease, attempt+1)
+		attemptCtx := context.WithValue(poolCtx, oauthPoolLeaseContextKey{}, &oauthPoolAttemptContext{service: service, lease: lease})
+		retry, usage, err := s.streamProxyCandidate(attemptCtx, request, key, w)
+		if err == nil {
+			lease.ReportSuccess()
+			s.recordOAuthPoolSuccess(lease)
+			lease.Release()
+			return retry, usage, nil
+		}
+		if !retry && !shouldCountOAuthAccountFailure(err, 0) {
+			lease.Ignore()
+			lease.Release()
+			return retry, usage, err
+		}
+		failure := oauthPoolFailure(err, 0, nil)
+		lease.ReportFailure(failure)
+		s.recordOAuthPoolFailure(lease, failure)
+		lease.Release()
+		lastErr = err
+		if !retry || responseWriterStarted(w) {
+			return retry, usage, err
+		}
+	}
+	return true, usageTokens{}, fmt.Errorf("oauth_pool_unavailable: %s pool account retry limit reached: %w", pool, lastErr)
+}
+
+func oauthPoolFailure(err error, status int, header http.Header) oauthpool.Failure {
+	if gatewayErr := new(GatewayError); errors.As(err, &gatewayErr) {
+		status = gatewayErr.Status
+		header = gatewayErr.Header
+	}
+	retryAfter := time.Duration(0)
+	if header != nil {
+		raw := strings.TrimSpace(header.Get("Retry-After"))
+		if seconds, parseErr := strconv.Atoi(raw); parseErr == nil && seconds > 0 {
+			retryAfter = time.Duration(seconds) * time.Second
+		} else if parsed, parseErr := http.ParseTime(raw); parseErr == nil {
+			retryAfter = time.Until(parsed)
+		}
+	}
+	failure := oauthpool.FailureFromHTTP(status, retryAfter, err)
+	if status == http.StatusForbidden && looksLikeAuthFailure(status, errorText(err)) {
+		failure.Kind = oauthpool.FailureAuth
+	}
+	return failure
+}
+
+func oauthAccountRuntimeKey(pool storage.OAuthPool, id uint) string {
+	return string(pool) + ":" + strconv.FormatUint(uint64(id), 10)
+}
+
+func (s *Service) recordOAuthPoolFailure(lease *oauthpool.DispatchLease, failure oauthpool.Failure) {
+	if lease == nil {
+		return
+	}
+	repository := s.oauthAccountRepository()
+	if repository == nil {
+		return
+	}
+	status := storage.OAuthStatusCooling
+	var disabledUntil *time.Time
+	now := time.Now().UTC()
+	switch failure.Kind {
+	case oauthpool.FailureAuth, oauthpool.FailurePermanent:
+		status = storage.OAuthStatusDead
+	case oauthpool.FailureRateLimit:
+		status = storage.OAuthStatusRateLimited
+		cooldown := failure.RetryAfter
+		if cooldown <= 0 {
+			cooldown = time.Minute
+		}
+		until := now.Add(cooldown)
+		disabledUntil = &until
+	default:
+		until := now.Add(time.Minute)
+		disabledUntil = &until
+	}
+	message := "OAuth upstream request failed"
+	if failure.Err != nil {
+		message = failure.Err.Error()
+	}
+	if err := repository.RecordRuntimeFailure(lease.Pool, lease.Account.ID, status, message, disabledUntil, 3); err != nil {
+		if s.log != nil {
+			s.log.Warn("persist OAuth pool failure", "pool", lease.Pool, "account_id", lease.Account.ID, "err", err)
+		}
+		return
+	}
+	s.oauthFailureDirty.Store(oauthAccountRuntimeKey(lease.Pool, lease.Account.ID), struct{}{})
+}
+
+func (s *Service) recordOAuthPoolSuccess(lease *oauthpool.DispatchLease) {
+	if lease == nil {
+		return
+	}
+	key := oauthAccountRuntimeKey(lease.Pool, lease.Account.ID)
+	_, dirty := s.oauthFailureDirty.LoadAndDelete(key)
+	needsPersistence := dirty || lease.HalfOpen || lease.Account.ConsecutiveFails > 0 || lease.Account.Status != storage.OAuthStatusAlive
+	if !needsPersistence {
+		return
+	}
+	repository := s.oauthAccountRepository()
+	if repository == nil {
+		return
+	}
+	if err := repository.RecordRuntimeSuccess(lease.Pool, lease.Account.ID, time.Now().UTC()); err != nil {
+		s.oauthFailureDirty.Store(key, struct{}{})
+		if s.log != nil {
+			s.log.Warn("persist OAuth pool recovery", "pool", lease.Pool, "account_id", lease.Account.ID, "err", err)
+		}
+	}
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func requestForCandidate(request normalizedRequest, candidate *storage.UpstreamGroupKey) normalizedRequest {
@@ -3573,6 +4025,7 @@ func (s *Service) persistDetectedAuthMode(key *storage.UpstreamGroupKey, mode st
 	if err := s.groupKeys.UpdateAuthMode(key.ID, mode); err != nil && s.log != nil {
 		s.log.Warn("persist detected upstream authentication header", "group_key_id", key.ID, "err", err)
 	}
+	s.InvalidateSchedulingCache()
 }
 
 func (r normalizedRequest) hasAlt() bool {
@@ -3627,7 +4080,8 @@ func (s *Service) attemptStream(
 		return candOutcome{kind: candFatal, err: err, errMsg: errMsg, markFailure: markFailure}
 	}
 	retry, usage, err := s.streamProxyCandidate(ctx, normalized, candidate, timedWriter)
-	if err != nil && !timedWriter.Started() && shouldRetryWithAlternateAuthHeader(err) {
+	_, fixedPoolCandidate := oauthPoolForCandidate(candidate)
+	if err != nil && !fixedPoolCandidate && !timedWriter.Started() && shouldRetryWithAlternateAuthHeader(err) {
 		alternate := *candidate
 		alternate.AuthMode = alternateUpstreamAuthMode(candidate)
 		retry, usage, err = s.streamProxyCandidate(ctx, normalized, &alternate, timedWriter)
@@ -3650,7 +4104,7 @@ func (s *Service) attemptStream(
 		}
 		return candOutcome{kind: candSuccess, usage: usage}
 	}
-	errMsg := err.Error()
+	errMsg := sanitize.Truncate(sanitize.RedactText(err.Error()), 2000)
 	// The downstream client may close a long-running stream at any time.  That
 	// cancels this request context and is not evidence that the upstream is
 	// unhealthy, so it must not trigger the five-minute scheduler cooldown.
@@ -3864,7 +4318,8 @@ func (s *Service) attemptNonStream(
 ) candOutcome {
 	start := time.Now()
 	status, header, respBody, retry, err := s.tryProxyCandidate(ctx, normalized, candidate)
-	if err != nil && shouldRetryWithAlternateAuthHeader(err) {
+	_, fixedPoolCandidate := oauthPoolForCandidate(candidate)
+	if err != nil && !fixedPoolCandidate && shouldRetryWithAlternateAuthHeader(err) {
 		alternate := *candidate
 		alternate.AuthMode = alternateUpstreamAuthMode(candidate)
 		status, header, respBody, retry, err = s.tryProxyCandidate(ctx, normalized, &alternate)
@@ -3896,7 +4351,7 @@ func (s *Service) attemptNonStream(
 	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 		return candOutcome{kind: candFatal, err: err, errMsg: err.Error(), markFailure: false}
 	}
-	errMsg := err.Error()
+	errMsg := sanitize.Truncate(sanitize.RedactText(err.Error()), 2000)
 	if fallback, reason, ok := fallbackRequestAfterCandidateFailure(normalized, candidate, errMsg, false); ok {
 		start = time.Now()
 		status, header, respBody, retry, err = s.tryProxyCandidate(ctx, fallback, candidate)
@@ -3952,38 +4407,55 @@ func (s *Service) attemptNonStream(
 }
 
 func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRequest, key *storage.UpstreamGroupKey, w http.ResponseWriter) (bool, usageTokens, error) {
-	ch, err := s.channels.FindByID(key.ChannelID)
-	if err != nil {
-		return true, usageTokens{}, err
+	if pool, fixed := oauthPoolForCandidate(key); fixed && oauthPoolLeaseFromContext(ctx) == nil {
+		return s.streamProxyOAuthPoolCandidate(ctx, request, key, w, pool)
 	}
-	upstreamKey, err := s.decryptUpstreamAPIKey(key)
-	if err != nil {
-		return true, usageTokens{}, err
-	}
-	upstreamURL, err := joinUpstreamURL(ch.SiteURL, request.Path)
-	if err != nil {
-		return true, usageTokens{}, err
-	}
+	var err error
 	firstEventBudget := s.streamFirstEventBudget()
 	requestCtx, firstOutput := newFirstOutputGuard(ctx, firstEventBudget)
 	defer firstOutput.Close()
 	firstOutputStartedAt := time.Now()
-	req, err := http.NewRequestWithContext(requestCtx, request.Method, upstreamURL, bytes.NewReader(request.Body))
-	if err != nil {
-		return true, usageTokens{}, err
+	var resp *http.Response
+	var resolvedProvider oauthpool.ProviderKind
+	if attempt := oauthPoolLeaseFromContext(ctx); attempt != nil && attempt.lease != nil && attempt.service != nil {
+		resolved, resolveErr := attempt.lease.ResolveRequest(oauthpool.RequestInput{
+			Method: request.Method, Path: request.Path, Header: request.Header, Body: request.Body, Stream: request.Stream,
+		})
+		if resolveErr != nil {
+			return true, usageTokens{}, resolveErr
+		}
+		resolvedProvider = resolved.Provider
+		resp, err = attempt.service.Do(requestCtx, attempt.lease.Pool, resolved)
+	} else {
+		ch, findErr := s.channels.FindByID(key.ChannelID)
+		if findErr != nil {
+			return true, usageTokens{}, findErr
+		}
+		upstreamKey, decryptErr := s.decryptUpstreamAPIKey(key)
+		if decryptErr != nil {
+			return true, usageTokens{}, decryptErr
+		}
+		upstreamURL, joinErr := joinUpstreamURL(ch.SiteURL, request.Path)
+		if joinErr != nil {
+			return true, usageTokens{}, joinErr
+		}
+		req, requestErr := http.NewRequestWithContext(requestCtx, request.Method, upstreamURL, bytes.NewReader(request.Body))
+		if requestErr != nil {
+			return true, usageTokens{}, requestErr
+		}
+		copyRequestHeaders(req.Header, request.Header)
+		s.applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
+		if request.Stream {
+			req.Header.Set("Accept", "text/event-stream")
+			req.Header.Set("Cache-Control", "no-cache")
+			req.Header.Set("Accept-Encoding", "identity")
+		}
+		client, clientErr := s.httpClientFor(ctx, ch)
+		if clientErr != nil {
+			return true, usageTokens{}, clientErr
+		}
+		resp, err = client.Do(req)
 	}
-	copyRequestHeaders(req.Header, request.Header)
-	s.applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
-	if request.Stream {
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("Cache-Control", "no-cache")
-		// Compression may buffer otherwise valid SSE chunks. Identity encoding
-		// lets the first token pass through as soon as the upstream writes it.
-		req.Header.Set("Accept-Encoding", "identity")
-	}
-
-	client := s.httpClientFor(ctx, ch)
-	resp, err := client.Do(req)
 	if err != nil {
 		if firstOutput.TimedOut() {
 			return true, usageTokens{}, firstOutput.timeoutError()
@@ -3994,6 +4466,9 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 
 	header := cloneHeader(resp.Header)
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if resolvedProvider == oauthpool.ProviderGrokWeb {
+			return s.streamGrokWebOAuthResponse(resp.Body, request, key, w, firstOutput)
+		}
 		if !isEventStream(header) {
 			respBody, readErr := readLimitedBody(resp.Body, 64<<20)
 			if readErr != nil {
@@ -4013,6 +4488,10 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			}
 			if request.Stream && (request.ResponseMode == "responses" || request.ResponseMode == "responses_from_chat") {
 				usage, err := streamNonSSEAsResponsesEvents(w, resp.StatusCode, header, respBody, key, request.ResponseMode, request.ToolKinds)
+				return false, usage, err
+			}
+			if request.Stream && (request.ResponseMode == "chat" || request.ResponseMode == "raw" && isChatCompletionPath(request.Path)) {
+				usage, err := streamNonSSEAsChatEvents(w, resp.StatusCode, header, respBody, key)
 				return false, usage, err
 			}
 			writeProxyResponse(w, resp.StatusCode, header, respBody, key, request.ResponseMode)
@@ -4866,71 +5345,172 @@ func (s *Service) rememberDiscoveredModelCapabilities(key *storage.UpstreamGroup
 	}
 }
 
-// SyncGroupKeyModels 拉取该渠道上游 /v1/models 的模型清单并写入 SupportedModels。
-// 只对 openai 系渠道有意义（claude/grok 不暴露 OpenAI 风格的 /v1/models）。
-// 同步是"覆盖式"：用上游返回的清单整体替换本地，若上游返回空则不动本地已有清单，
-// 避免一次抖动把手工维护的清单清空。返回写入后的模型清单。
-func (s *Service) SyncGroupKeyModels(ctx context.Context, id uint) ([]string, error) {
+type GroupModelPolicy struct {
+	AvailableModels    []string `json:"available_models"`
+	SupportedModels    []string `json:"supported_models"`
+	RestrictionEnabled bool     `json:"restriction_enabled"`
+}
+
+// GroupKeyModels returns the discovered catalog and the explicit allowlist.
+// Legacy rows stay unrestricted until an operator synchronizes or saves them.
+func (s *Service) GroupKeyModels(id uint) (GroupModelPolicy, error) {
 	if s == nil || s.groupKeys == nil {
-		return nil, errors.New("gateway group key store is unavailable")
+		return GroupModelPolicy{}, errors.New("gateway group key store is unavailable")
 	}
 	key, err := s.groupKeys.FindByID(id)
 	if err != nil {
-		return nil, err
+		return GroupModelPolicy{}, err
 	}
 	if key == nil {
-		return nil, errors.New("upstream group key not found")
+		return GroupModelPolicy{}, errors.New("upstream group key not found")
 	}
-	req := normalizedRequest{
-		Method: http.MethodGet,
-		Path:   healthPath,
-		Header: http.Header{},
-	}
-	status, _, body, err := s.requestCandidate(ctx, req, key, s.healthProbeBudget())
-	if err != nil {
-		return nil, fmt.Errorf("fetch upstream models failed: %w", err)
-	}
-	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("fetch upstream models failed: %w", healthProbeError(status, body, nil))
-	}
-	if isUpstreamErrorBody(body) {
-		return nil, fmt.Errorf("fetch upstream models returned error payload: %s", truncateBody(body, 240))
-	}
-	models := uniqueStrings(extractHealthProbeModels(body))
-	if len(models) == 0 {
-		return nil, errors.New("upstream returned no models")
-	}
-	if err := s.persistGroupKeyModels(id, models); err != nil {
-		return nil, err
-	}
-	return models, nil
+	return groupModelPolicyFromKey(key), nil
 }
 
-// SetGroupKeyModels 用管理员手动编辑的清单覆盖渠道的支持模型（增删后保存）。
-// 传空清单表示"清空并回到未同步状态"（视为未知，正常参与调度，不再享受清单加分）。
-func (s *Service) SetGroupKeyModels(id uint, models []string) ([]string, error) {
+// SyncGroupKeyModels discovers the upstream catalog without silently enabling
+// newly advertised models. The first sync starts with all discovered models
+// selected; later syncs preserve only selections that still exist.
+func (s *Service) SyncGroupKeyModels(ctx context.Context, id uint) (GroupModelPolicy, error) {
 	if s == nil || s.groupKeys == nil {
-		return nil, errors.New("gateway group key store is unavailable")
+		return GroupModelPolicy{}, errors.New("gateway group key store is unavailable")
 	}
-	cleaned := uniqueStrings(models)
-	if err := s.persistGroupKeyModels(id, cleaned); err != nil {
-		return nil, err
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return GroupModelPolicy{}, err
 	}
-	return cleaned, nil
+	if key == nil {
+		return GroupModelPolicy{}, errors.New("upstream group key not found")
+	}
+	models := append([]string(nil), defaultGrokPoolModelCatalog...)
+	if key.ChannelType != storage.ChannelTypeGrokPool {
+		modelPath := healthPath
+		if key.ChannelType == storage.ChannelTypeChatGPTPool {
+			modelPath += "?client_version=" + url.QueryEscape(config.DefaultCodexVersion)
+		}
+		req := normalizedRequest{Method: http.MethodGet, Path: modelPath, Header: http.Header{}}
+		status, _, body, requestErr := s.requestCandidate(ctx, req, key, s.healthProbeBudget())
+		if requestErr != nil {
+			return GroupModelPolicy{}, fmt.Errorf("fetch upstream models failed: %w", requestErr)
+		}
+		if status < 200 || status >= 300 {
+			return GroupModelPolicy{}, fmt.Errorf("fetch upstream models failed: %w", healthProbeError(status, body, nil))
+		}
+		if isUpstreamErrorBody(body) {
+			return GroupModelPolicy{}, fmt.Errorf("fetch upstream models returned error payload: %s", truncateBody(body, 240))
+		}
+		models = uniqueStrings(extractHealthProbeModels(body))
+	}
+	if len(models) == 0 {
+		return GroupModelPolicy{}, errors.New("upstream returned no models")
+	}
+	sort.Strings(models)
+	previous := groupModelPolicyFromKey(key)
+	selected := append([]string(nil), models...)
+	if previous.RestrictionEnabled {
+		selected = intersectModelNames(previous.SupportedModels, models)
+	}
+	policy := GroupModelPolicy{AvailableModels: models, SupportedModels: selected, RestrictionEnabled: true}
+	if err := s.persistGroupKeyModelPolicy(id, policy); err != nil {
+		return GroupModelPolicy{}, err
+	}
+	return policy, nil
 }
 
-// persistGroupKeyModels 把模型清单序列化成 JSON 数组文本写入 SupportedModels。
-// 空清单写入空字符串（而非 "[]"），与 supportedModelsContain 的"空即未同步"语义一致。
-func (s *Service) persistGroupKeyModels(id uint, models []string) error {
-	payload := ""
-	if len(models) > 0 {
-		encoded, err := json.Marshal(models)
-		if err != nil {
-			return fmt.Errorf("encode supported models: %w", err)
-		}
-		payload = string(encoded)
+// SetGroupKeyModels saves a strict allowlist. An empty selection intentionally
+// denies every model for this route; it no longer means "unrestricted".
+func (s *Service) SetGroupKeyModels(id uint, models []string) (GroupModelPolicy, error) {
+	if s == nil || s.groupKeys == nil {
+		return GroupModelPolicy{}, errors.New("gateway group key store is unavailable")
 	}
-	return s.groupKeys.UpdateSupportedModels(id, payload)
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil {
+		return GroupModelPolicy{}, err
+	}
+	if key == nil {
+		return GroupModelPolicy{}, errors.New("upstream group key not found")
+	}
+	current := groupModelPolicyFromKey(key)
+	cleaned := uniqueStrings(models)
+	available := current.AvailableModels
+	if len(available) == 0 && len(cleaned) > 0 {
+		// Backward compatible manual bootstrap for deployments that cannot expose a
+		// model endpoint. Subsequent syncs still use the discovered catalog.
+		available = append([]string(nil), cleaned...)
+	}
+	if unknown := modelNamesOutsideCatalog(cleaned, available); len(unknown) > 0 {
+		return GroupModelPolicy{}, fmt.Errorf("models are not present in the discovered catalog: %s", strings.Join(unknown, ", "))
+	}
+	policy := GroupModelPolicy{AvailableModels: available, SupportedModels: cleaned, RestrictionEnabled: true}
+	if err := s.persistGroupKeyModelPolicy(id, policy); err != nil {
+		return GroupModelPolicy{}, err
+	}
+	return policy, nil
+}
+
+func (s *Service) persistGroupKeyModelPolicy(id uint, policy GroupModelPolicy) error {
+	availableJSON, err := json.Marshal(policy.AvailableModels)
+	if err != nil {
+		return fmt.Errorf("encode available models: %w", err)
+	}
+	supportedJSON, err := json.Marshal(policy.SupportedModels)
+	if err != nil {
+		return fmt.Errorf("encode supported models: %w", err)
+	}
+	if err := s.groupKeys.UpdateModelPolicy(id, string(availableJSON), string(supportedJSON), policy.RestrictionEnabled); err != nil {
+		return err
+	}
+	s.InvalidateSchedulingCache()
+	return nil
+}
+
+func groupModelPolicyFromKey(key *storage.UpstreamGroupKey) GroupModelPolicy {
+	if key == nil {
+		return GroupModelPolicy{}
+	}
+	return GroupModelPolicy{
+		AvailableModels:    decodeModelNames(key.AvailableModels),
+		SupportedModels:    decodeModelNames(key.SupportedModels),
+		RestrictionEnabled: key.ModelRestrictionEnabled,
+	}
+}
+
+func decodeModelNames(raw string) []string {
+	var models []string
+	if strings.TrimSpace(raw) == "" || json.Unmarshal([]byte(raw), &models) != nil {
+		return nil
+	}
+	return uniqueStrings(models)
+}
+
+func intersectModelNames(selected, available []string) []string {
+	allowed := make(map[string]struct{}, len(available))
+	for _, model := range available {
+		allowed[normalizeModelCapabilityKey(model)] = struct{}{}
+	}
+	out := make([]string, 0, len(selected))
+	for _, model := range selected {
+		if _, ok := allowed[normalizeModelCapabilityKey(model)]; ok {
+			out = append(out, model)
+		}
+	}
+	return uniqueStrings(out)
+}
+
+func modelNamesOutsideCatalog(selected, available []string) []string {
+	if len(selected) == 0 {
+		return nil
+	}
+	allowed := make(map[string]struct{}, len(available))
+	for _, model := range available {
+		allowed[normalizeModelCapabilityKey(model)] = struct{}{}
+	}
+	var out []string
+	for _, model := range selected {
+		if _, ok := allowed[normalizeModelCapabilityKey(model)]; !ok {
+			out = append(out, model)
+		}
+	}
+	return out
 }
 
 func shouldFallbackHealthModelDiscovery(status int, body []byte, err error) bool {
@@ -5030,11 +5610,20 @@ func appendHealthModelValues(out *[]string, value any) {
 			}
 		}
 	case map[string]any:
-		for _, key := range []string{"id", "model", "name"} {
+		for _, key := range []string{"id", "model", "name", "slug", "public_id", "model_name"} {
 			if item := stringValue(v[key]); item != "" {
 				*out = append(*out, item)
 				return
 			}
+		}
+		// Some providers expose models as an object keyed by model ID rather than
+		// an array. Keep the key and still recurse into values for richer objects.
+		for key, item := range v {
+			key = strings.TrimSpace(key)
+			if key != "" {
+				*out = append(*out, key)
+			}
+			appendHealthModelValues(out, item)
 		}
 	case string:
 		if v = strings.TrimSpace(v); v != "" {
@@ -5568,44 +6157,134 @@ func upstreamHTTPErrorMessage(status int, header http.Header, body []byte) strin
 }
 
 func (s *Service) requestCandidate(ctx context.Context, request normalizedRequest, key *storage.UpstreamGroupKey, timeout time.Duration) (int, http.Header, []byte, error) {
-	ch, err := s.channels.FindByID(key.ChannelID)
-	if err != nil {
-		return 0, nil, nil, err
+	if pool, fixed := oauthPoolForCandidate(key); fixed && oauthPoolLeaseFromContext(ctx) == nil {
+		return s.requestOAuthPoolCandidate(ctx, request, key, timeout, pool)
 	}
-	upstreamKey, err := s.decryptUpstreamAPIKey(key)
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	upstreamURL, err := joinUpstreamURL(ch.SiteURL, request.Path)
-	if err != nil {
-		return 0, nil, nil, err
-	}
+	var err error
 	reqCtx := ctx
 	cancel := func() {}
 	if timeout > 0 {
 		reqCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, request.Method, upstreamURL, bytes.NewReader(request.Body))
-	if err != nil {
-		return 0, nil, nil, err
+	var resp *http.Response
+	var resolvedProvider oauthpool.ProviderKind
+	if attempt := oauthPoolLeaseFromContext(ctx); attempt != nil && attempt.lease != nil && attempt.service != nil {
+		resolved, resolveErr := attempt.lease.ResolveRequest(oauthpool.RequestInput{
+			Method: request.Method, Path: request.Path, Header: request.Header, Body: request.Body, Stream: request.Stream,
+		})
+		if resolveErr != nil {
+			return 0, nil, nil, resolveErr
+		}
+		resolvedProvider = resolved.Provider
+		resp, err = attempt.service.Do(reqCtx, attempt.lease.Pool, resolved)
+	} else {
+		ch, findErr := s.channels.FindByID(key.ChannelID)
+		if findErr != nil {
+			return 0, nil, nil, findErr
+		}
+		upstreamKey, decryptErr := s.decryptUpstreamAPIKey(key)
+		if decryptErr != nil {
+			return 0, nil, nil, decryptErr
+		}
+		upstreamURL, joinErr := joinUpstreamURL(ch.SiteURL, request.Path)
+		if joinErr != nil {
+			return 0, nil, nil, joinErr
+		}
+		req, requestErr := http.NewRequestWithContext(reqCtx, request.Method, upstreamURL, bytes.NewReader(request.Body))
+		if requestErr != nil {
+			return 0, nil, nil, requestErr
+		}
+		copyRequestHeaders(req.Header, request.Header)
+		s.applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
+		client, clientErr := s.httpClientFor(ctx, ch)
+		if clientErr != nil {
+			return 0, nil, nil, clientErr
+		}
+		resp, err = client.Do(req)
 	}
-	copyRequestHeaders(req.Header, request.Header)
-	s.applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
-
-	client := s.httpClientFor(ctx, ch)
-	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 
 	header := cloneHeader(resp.Header)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && resolvedProvider == oauthpool.ProviderGrokWeb {
+		respBody, parseErr := normalizeGrokWebOAuthResponse(resp.Body, request)
+		if parseErr != nil {
+			return resp.StatusCode, header, nil, parseErr
+		}
+		header.Set("Content-Type", "application/json; charset=utf-8")
+		return resp.StatusCode, header, respBody, nil
+	}
 	respBody, readErr := readLimitedBody(resp.Body, 64<<20)
 	if readErr != nil {
 		return resp.StatusCode, header, nil, readErr
 	}
 	return resp.StatusCode, header, respBody, nil
+}
+
+func (s *Service) requestOAuthPoolCandidate(ctx context.Context, request normalizedRequest, key *storage.UpstreamGroupKey, timeout time.Duration, pool storage.OAuthPool) (int, http.Header, []byte, error) {
+	service := s.oauthPoolService()
+	if service == nil {
+		return 0, nil, nil, errors.New("oauth_pool_unavailable: OAuth pool service is not configured")
+	}
+	poolCtx := ctx
+	cancel := func() {}
+	if timeout > 0 {
+		poolCtx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	defer cancel()
+	excluded := make(map[uint]bool, oauthPoolAccountAttemptsPerCandidate)
+	var lastErr error
+	for attemptNumber := 0; attemptNumber < oauthPoolAccountAttemptsPerCandidate; attemptNumber++ {
+		lease, err := service.AcquireContext(poolCtx, pool, routingRequestModel(request), excluded)
+		if err != nil {
+			if lastErr != nil {
+				return 0, nil, nil, fmt.Errorf("oauth_pool_unavailable: %s pool exhausted after %d attempts: %w", pool, attemptNumber, lastErr)
+			}
+			return 0, nil, nil, fmt.Errorf("oauth_pool_unavailable: %s: %w", pool, err)
+		}
+		excluded[lease.Account.ID] = true
+		s.attachOAuthDispatchAccount(poolCtx, lease, attemptNumber+1)
+		attemptCtx := context.WithValue(poolCtx, oauthPoolLeaseContextKey{}, &oauthPoolAttemptContext{service: service, lease: lease})
+		status, header, body, requestErr := s.requestCandidate(attemptCtx, request, key, 0)
+		if requestErr == nil && status >= 200 && status < 300 {
+			lease.ReportSuccess()
+			s.recordOAuthPoolSuccess(lease)
+			lease.Release()
+			return status, header, body, nil
+		}
+		if requestErr != nil {
+			lastErr = requestErr
+		} else {
+			lastErr = &GatewayError{Status: status, Header: header, Body: body}
+		}
+		retryAccount := requestErr != nil || status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusTooManyRequests || status >= 500
+		if !retryAccount {
+			lease.Ignore()
+			lease.Release()
+			return status, header, body, requestErr
+		}
+		failure := oauthPoolFailure(lastErr, status, header)
+		lease.ReportFailure(failure)
+		s.recordOAuthPoolFailure(lease, failure)
+		lease.Release()
+	}
+	return 0, nil, nil, fmt.Errorf("oauth_pool_unavailable: %s pool account retry limit reached: %w", pool, lastErr)
+}
+
+func shouldCountOAuthAccountFailure(err error, status int) bool {
+	var gatewayErr *GatewayError
+	if errors.As(err, &gatewayErr) {
+		status = gatewayErr.Status
+	}
+	switch status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *Service) requestHealthProbeCandidate(ctx context.Context, request normalizedRequest, key *storage.UpstreamGroupKey, timeout time.Duration) (int, http.Header, []byte, error) {
@@ -5643,7 +6322,10 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Accept-Encoding", "identity")
 
-	client := s.httpClientFor(ctx, ch)
+	client, err := s.httpClientFor(ctx, ch)
+	if err != nil {
+		return 0, nil, nil, err
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
@@ -5662,9 +6344,58 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 	buffered, err := preflightHealthSSEStream(reader, resp.Body, timeout)
 	body := healthProbeSSEBody(buffered)
 	if err != nil {
+		// 对齐调度：preflight 返回的错误文本也可能是软失败话术（"当前没有可用上游"
+		// 之类被上游当正文返回），命中拦截词就归到上游错误而不是网络/超时错误。
+		if s.interceptedResponseContent(key, err.Error()) != "" {
+			return resp.StatusCode, header, body, errInterceptedHealthProbe
+		}
 		return resp.StatusCode, header, body, err
 	}
+	// 关键对齐点：测活曾只要 preflightHealthSSEStream 判到"有可见文本"就算活，
+	// 完全不跑调度那套拦截词 / 终态失败检查，于是上游把"stream disconnected before
+	// completion / 公益token休息了 / 当前没有可用上游"当正文吐回来时，调度命中拦截词
+	// 切候选、测活却判活 → "测活活、调度死"。这里让测活复用调度的判定：
+	//   1. 把 buffered 所有可见文本拼起来跑一遍拦截词；
+	//   2. 对每个事件跑 preflight/终态失败检查（response.cancelled/incomplete、[DONE] 无输出等）。
+	// 任一命中就把这次测活判成上游错误（非存活）。
+	if failed, msg := healthBufferedDispatchFailure(buffered); failed {
+		return resp.StatusCode, header, body, errors.New(msg)
+	}
+	var interceptText strings.Builder
+	for _, ev := range buffered {
+		interceptText.WriteString(streamEventInterceptableText(ev))
+	}
+	if s.interceptedResponseContent(key, interceptText.String()) != "" {
+		return resp.StatusCode, header, body, errInterceptedHealthProbe
+	}
 	return resp.StatusCode, header, body, nil
+}
+
+// errInterceptedHealthProbe 是测活命中拦截词/软失败话术时的固定错误。文本包含
+// "no available upstream" 特征串，使 looksLikeUpstreamRoutingUnavailable →
+// healthFailureStatus 归到 upstream_error（前端显示"上游错误"），与调度对齐。
+var errInterceptedHealthProbe = errors.New("health probe response content intercepted: no available upstream")
+
+// healthBufferedDispatchFailure 复用调度 preflight 的终态失败判定：对测活缓冲到的
+// 事件逐个检查 streamEventPreflightFailure / streamEventTerminalWithoutOutput，
+// 命中即返回失败信息。让测活对"终态但无可见输出"的流与调度一致地判死。
+func healthBufferedDispatchFailure(events []sseEvent) (bool, string) {
+	sawGeneration := false
+	for _, ev := range events {
+		if failed, msg := streamEventFailure(ev); failed {
+			return true, msg
+		}
+		if failed, msg := streamEventPreflightFailure(ev); failed {
+			if sawGeneration {
+				continue
+			}
+			return true, msg
+		}
+		if streamEventHasVisibleText(ev) {
+			sawGeneration = true
+		}
+	}
+	return false, ""
 }
 
 func healthProbeSSEBody(events []sseEvent) []byte {
@@ -5690,27 +6421,39 @@ func healthProbeSSEBody(events []sseEvent) []byte {
 	return []byte(strings.TrimSpace(events[0].Data))
 }
 
-func (s *Service) httpClientFor(ctx context.Context, ch *storage.Channel) *http.Client {
+func (s *Service) httpClientFor(_ context.Context, ch *storage.Channel) (*http.Client, error) {
 	proxyURL := ""
-	if ch != nil && ch.ProxyEnabled && s.channelSvc != nil {
-		if resolved, err := s.channelSvc.Resolve(ctx, ch); err == nil && strings.TrimSpace(resolved.ProxyURL) != "" {
-			proxyURL = strings.TrimSpace(resolved.ProxyURL)
+	if ch != nil {
+		cfg := s.proxyConfig()
+		targets := []string{config.ProxyChannelTarget(ch.ID)}
+		switch strings.ToLower(strings.TrimSpace(string(ch.Type))) {
+		case "chatgpt_pool":
+			targets = append(targets, config.ProxyTargetChatGPTPool, config.ProxyTargetGPTPoolChannel)
+		case "grok_pool":
+			targets = append(targets, config.ProxyTargetGrokPool, config.ProxyTargetGrokPoolChannel)
+		}
+		if cfg.AppliesTo(targets...) {
+			resolved, err := cfg.URL()
+			if err != nil {
+				return nil, fmt.Errorf("proxy configuration error: %w", err)
+			}
+			proxyURL = strings.TrimSpace(resolved)
 		}
 	}
 	cacheKey := httpClientCacheKey(ch, proxyURL)
 	if cached, ok := s.clients.Load(cacheKey); ok {
-		return cached.(*http.Client)
+		return cached.(*http.Client), nil
 	}
 	client := &http.Client{Transport: buildProxyTransport(proxyURL)}
 	actual, _ := s.clients.LoadOrStore(cacheKey, client)
-	return actual.(*http.Client)
+	return actual.(*http.Client), nil
 }
 
 func httpClientCacheKey(ch *storage.Channel, proxyURL string) string {
 	if ch == nil {
-		return "default|" + strings.TrimSpace(proxyURL)
+		return "default|" + HashKey(strings.TrimSpace(proxyURL))
 	}
-	return fmt.Sprintf("%d|%t|%s", ch.ID, ch.ProxyEnabled, strings.TrimSpace(proxyURL))
+	return fmt.Sprintf("%d|%s", ch.ID, HashKey(strings.TrimSpace(proxyURL)))
 }
 
 func buildProxyTransport(proxyURL string) *http.Transport {
@@ -5738,30 +6481,32 @@ func (s *Service) markProxyFailure(id uint, msg string) {
 	}
 	status := proxyFailureStatus(msg)
 	policy := s.proxyFailurePolicy(status, msg)
-	persistedStatus := status
-	// A one-off connect reset, timeout, 5xx, or 429 says little about a route's
-	// permanent health. Preserve per-key diagnostics and any short cooldown, but
-	// keep the displayed state alive so one noisy request does not paint a whole
-	// page of channels as dead while a manual re-test succeeds.
-	if isTemporaryProxyFailureStatus(status) {
-		persistedStatus = "alive"
+	immediate := status == "rate_limited" || status == "zero_balance" || status == "auth_failed" || status == "forbidden"
+	persistedStatus := "alive"
+	if immediate {
+		persistedStatus = status
 	}
-	var disabledUntil *time.Time
-	if policy.cooldown > 0 {
-		until := time.Now().Add(policy.cooldown)
-		disabledUntil = &until
-		s.recordRuntimeFailure(id, until)
-	} else {
-		s.clearRuntimeDisable(id)
-	}
-	if err := s.groupKeys.MarkProxyFailureStatus(id, persistedStatus, msg, disabledUntil); err != nil && s.log != nil {
+	result, err := s.groupKeys.RecordDispatchFailure(
+		id,
+		persistedStatus,
+		truncateLogMessage(msg, 1000),
+		healthTransientFailureThreshold,
+		5*time.Minute,
+		policy.cooldown,
+		immediate,
+	)
+	if err != nil && s.log != nil {
 		s.log.Warn("mark upstream group failed", "id", id, "err", err)
+	}
+	if result.DisabledUntil != nil {
+		s.recordRuntimeFailure(id, *result.DisabledUntil)
 	}
 	if policy.disableKey {
 		if err := s.groupKeys.UpdateEnabled(id, false); err != nil && s.log != nil {
 			s.log.Warn("disable upstream group key failed", "id", id, "err", err)
 		}
 	}
+	s.InvalidateSchedulingCache()
 }
 
 func isTemporaryProxyFailureStatus(status string) bool {
@@ -5782,8 +6527,7 @@ func isTemporaryProxyFailureStatus(status string) bool {
 // 失败计数、状态保持 alive，避免可用渠道被逐个打进冷却导致候选池枯竭。
 func shouldMarkProxyFailure(msg string) bool {
 	return !looksLikeUnsupportedModelError(msg) &&
-		!looksLikeClientRequestError(msg) &&
-		!isSlowFirstOutputFailure(msg)
+		!looksLikeClientRequestError(msg)
 }
 
 func shouldDelaySameDispatchGroupAfterFailure(msg string) bool {
@@ -6114,12 +6858,23 @@ func chatToResponsesBody(body []byte) ([]byte, bool, error) {
 		raw["input"] = normalizeChatMessages(messages)
 		delete(raw, "messages")
 	}
+	if tools := chatToolsToResponsesTools(raw["tools"]); len(tools) > 0 {
+		raw["tools"] = tools
+	} else {
+		delete(raw, "tools")
+	}
+	if choice := chatToolChoiceToResponses(raw["tool_choice"]); choice != nil {
+		raw["tool_choice"] = choice
+	} else {
+		delete(raw, "tool_choice")
+	}
 	normalizeChatReasoningForResponses(raw)
 	moveField(raw, "max_tokens", "max_output_tokens")
 	moveField(raw, "max_completion_tokens", "max_output_tokens")
 	delete(raw, "n")
 	delete(raw, "logprobs")
 	delete(raw, "top_logprobs")
+	delete(raw, "stream_options")
 	out, err := json.Marshal(raw)
 	return out, stream, err
 }
@@ -6563,20 +7318,141 @@ func normalizeChatMessages(messages any) any {
 	out := make([]map[string]any, 0, len(items))
 	for _, item := range items {
 		msg, _ := item.(map[string]any)
+		if msg == nil {
+			continue
+		}
 		role, _ := msg["role"].(string)
 		if role == "" {
 			role = "user"
 		}
-		out = append(out, map[string]any{
-			"role":    role,
-			"content": normalizeChatContent(msg["content"], role),
-		})
+		if role == "tool" {
+			callID := strings.TrimSpace(stringValue(msg["tool_call_id"]))
+			if callID != "" {
+				out = append(out, map[string]any{
+					"type": "function_call_output", "call_id": callID,
+					"output": responsesToolOutputToChatContent(msg["content"]),
+				})
+				continue
+			}
+		}
+		content := normalizeChatContent(msg["content"], role)
+		calls, _ := msg["tool_calls"].([]any)
+		legacy, _ := msg["function_call"].(map[string]any)
+		if meaningfulJSONValue(content) || len(calls) == 0 && legacy == nil {
+			out = append(out, map[string]any{"role": role, "content": content})
+		}
+		for index, value := range calls {
+			call, _ := value.(map[string]any)
+			fn, _ := call["function"].(map[string]any)
+			name := strings.TrimSpace(stringValue(fn["name"]))
+			if name == "" {
+				continue
+			}
+			callID := strings.TrimSpace(stringValue(call["id"]))
+			if callID == "" {
+				callID = fmt.Sprintf("call_%d", index)
+			}
+			out = append(out, map[string]any{
+				"type": "function_call", "call_id": callID, "name": name,
+				"arguments": normalizeDoubleEncodedToolArguments(stringValue(fn["arguments"])),
+			})
+		}
+		if legacy != nil && strings.TrimSpace(stringValue(legacy["name"])) != "" {
+			out = append(out, map[string]any{
+				"type": "function_call", "call_id": "call_legacy", "name": stringValue(legacy["name"]),
+				"arguments": normalizeDoubleEncodedToolArguments(stringValue(legacy["arguments"])),
+			})
+		}
 	}
 	return out
 }
 
+func normalizeDoubleEncodedToolArguments(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return value
+	}
+	var decoded any
+	if json.Unmarshal([]byte(trimmed), &decoded) != nil {
+		return value
+	}
+	nested, ok := decoded.(string)
+	if !ok {
+		return value
+	}
+	var structured any
+	if json.Unmarshal([]byte(strings.TrimSpace(nested)), &structured) != nil {
+		return value
+	}
+	switch structured.(type) {
+	case map[string]any, []any:
+		encoded, err := json.Marshal(structured)
+		if err == nil {
+			return string(encoded)
+		}
+	}
+	return value
+}
+
+func chatToolsToResponsesTools(value any) []map[string]any {
+	items, _ := value.([]any)
+	out := make([]map[string]any, 0, len(items))
+	for _, value := range items {
+		tool, _ := value.(map[string]any)
+		if tool == nil {
+			continue
+		}
+		typ := strings.ToLower(strings.TrimSpace(stringValue(tool["type"])))
+		if typ != "" && typ != "function" {
+			continue
+		}
+		fn, _ := tool["function"].(map[string]any)
+		if fn == nil {
+			fn = tool
+		}
+		name := strings.TrimSpace(stringValue(fn["name"]))
+		if name == "" {
+			continue
+		}
+		converted := map[string]any{
+			"type": "function", "name": name,
+			"parameters": firstNonNil(fn["parameters"], fn["input_schema"], map[string]any{"type": "object", "properties": map[string]any{}}),
+		}
+		if description := stringValue(fn["description"]); description != "" {
+			converted["description"] = description
+		}
+		if strict, ok := fn["strict"]; ok {
+			converted["strict"] = strict
+		}
+		out = append(out, converted)
+	}
+	return out
+}
+
+func chatToolChoiceToResponses(value any) any {
+	switch typed := value.(type) {
+	case nil:
+		return nil
+	case string:
+		choice := strings.TrimSpace(typed)
+		if choice == "" {
+			return nil
+		}
+		return choice
+	case map[string]any:
+		fn, _ := typed["function"].(map[string]any)
+		name := strings.TrimSpace(stringValue(firstNonNil(fn["name"], typed["name"])))
+		if name != "" {
+			return map[string]any{"type": "function", "name": name}
+		}
+	}
+	return nil
+}
+
 func normalizeChatContent(content any, role string) any {
 	switch v := content.(type) {
+	case nil:
+		return ""
 	case string:
 		return v
 	case []any:
@@ -6812,9 +7688,14 @@ func (s *Service) rememberSuccessfulProtocolFallback(
 	if mode == "" || normalizeUpstreamRequestMode(candidate.RequestMode) == mode {
 		return
 	}
-	if err := s.groupKeys.UpdateRequestMode(candidate.ID, mode); err != nil && s.log != nil {
-		s.log.Warn("persist recovered upstream request protocol", "id", candidate.ID, "mode", mode, "err", err)
+	if err := s.groupKeys.UpdateRequestMode(candidate.ID, mode); err != nil {
+		if s.log != nil {
+			s.log.Warn("persist recovered upstream request protocol", "id", candidate.ID, "mode", mode, "err", err)
+		}
+		return
 	}
+	candidate.RequestMode = mode
+	s.InvalidateSchedulingCache()
 }
 
 func looksLikeResponsesToolCallStateError(msg string) bool {
@@ -6928,10 +7809,14 @@ func looksLikeResponsesEndpointError(msg string) bool {
 	return false
 }
 
-func (s *Service) orderCandidatesForRequest(candidates []storage.UpstreamGroupKey, request normalizedRequest) []storage.UpstreamGroupKey {
+func (s *Service) orderCandidatesForRequest(candidates []storage.UpstreamGroupKey, request normalizedRequest, gatewayKeys ...*storage.GatewayKey) []storage.UpstreamGroupKey {
 	requestModel := routingRequestModel(request)
 	ordered := s.orderCandidatesWithRuntime(candidates, requestModel)
 	ordered = s.preferSameGroupSchedulableCandidates(ordered, requestModel)
+	if len(gatewayKeys) > 0 {
+		ordered = s.applyGatewayRoutePreference(ordered, gatewayKeys[0], requestModel)
+	}
+	ordered = s.rotateEquivalentCandidates(ordered, requestModel, gatewayKeys...)
 	if s.affinities == nil || request.AffinityKey == "" {
 		return ordered
 	}
@@ -6962,9 +7847,95 @@ func (s *Service) orderCandidatesForRequest(candidates []storage.UpstreamGroupKe
 		out := append([]storage.UpstreamGroupKey{item}, ordered[:i]...)
 		out = append(out, ordered[i+1:]...)
 		out = s.preferSameGroupSchedulableCandidates(out, requestModel)
+		if !hard && len(gatewayKeys) > 0 {
+			out = s.applyGatewayRoutePreference(out, gatewayKeys[0], requestModel)
+		}
 		return out
 	}
 	return ordered
+}
+
+func (s *Service) rotateEquivalentCandidates(candidates []storage.UpstreamGroupKey, model string, gatewayKeys ...*storage.GatewayKey) []storage.UpstreamGroupKey {
+	if len(candidates) < 2 {
+		return candidates
+	}
+	preference := gatewayRouteRatioFirst
+	if len(gatewayKeys) > 0 && gatewayKeys[0] != nil {
+		preference = normalizeGatewayRoutePreference(gatewayKeys[0].RoutePreference)
+	}
+	out := append([]storage.UpstreamGroupKey(nil), candidates...)
+	for start := 0; start < len(out); {
+		end := start + 1
+		for end < len(out) && s.sameRoundRobinTier(out[start], out[end], model, preference) {
+			end++
+		}
+		if size := end - start; size > 1 {
+			key := roundRobinTierKey(out[start], model, preference)
+			actual, _ := s.dispatchCursors.LoadOrStore(key, &atomic.Uint64{})
+			offset := int((actual.(*atomic.Uint64).Add(1) - 1) % uint64(size))
+			if offset > 0 {
+				block := append([]storage.UpstreamGroupKey(nil), out[start:end]...)
+				copy(out[start:end], append(block[offset:], block[:offset]...))
+			}
+		}
+		start = end
+	}
+	return out
+}
+
+func (s *Service) sameRoundRobinTier(a, b storage.UpstreamGroupKey, model, preference string) bool {
+	if !sameDispatchOrderTier(a, b) || a.Priority != b.Priority || a.FailureCount != b.FailureCount ||
+		s.candidateEffectiveModelCapabilityRank(a, model) != s.candidateEffectiveModelCapabilityRank(b, model) {
+		return false
+	}
+	if preference != gatewayRouteRatioFirst {
+		_, poolA := oauthPoolForCandidate(&a)
+		_, poolB := oauthPoolForCandidate(&b)
+		return poolA == poolB
+	}
+	return true
+}
+
+func roundRobinTierKey(item storage.UpstreamGroupKey, model, preference string) string {
+	_, pool := oauthPoolForCandidate(&item)
+	return fmt.Sprintf("%d|%t|%d|%.9f|%.9f|%d|%d|%s|%s|%t",
+		candidateDispatchLayer(item), item.Charity, statusRank(item.Status), effectiveGroupRatio(item),
+		candidateDispatchCostScore(item, model), item.Priority, item.FailureCount,
+		normalizeModelCapabilityKey(model), preference, pool,
+	)
+}
+
+func (s *Service) applyGatewayRoutePreference(candidates []storage.UpstreamGroupKey, key *storage.GatewayKey, model string) []storage.UpstreamGroupKey {
+	preference := gatewayRouteRatioFirst
+	if key != nil {
+		preference = normalizeGatewayRoutePreference(key.RoutePreference)
+	}
+	if preference == gatewayRouteRatioFirst || len(candidates) < 2 {
+		return candidates
+	}
+	out := append([]storage.UpstreamGroupKey(nil), candidates...)
+	for start := 0; start < len(out); {
+		end := start + 1
+		for end < len(out) && sameDispatchOrderTier(out[start], out[end]) &&
+			s.candidateEffectiveModelCapabilityRank(out[start], model) == s.candidateEffectiveModelCapabilityRank(out[end], model) {
+			end++
+		}
+		block := out[start:end]
+		preferred := make([]storage.UpstreamGroupKey, 0, len(block))
+		other := make([]storage.UpstreamGroupKey, 0, len(block))
+		wantPool := preference == gatewayRoutePoolFirst
+		for i := range block {
+			_, fixed := oauthPoolForCandidate(&block[i])
+			if fixed == wantPool {
+				preferred = append(preferred, block[i])
+			} else {
+				other = append(other, block[i])
+			}
+		}
+		copy(out[start:end], append(preferred, other...))
+		start = end
+	}
+	return out
 }
 
 func (s *Service) softAffinityCanPromote(ordered []storage.UpstreamGroupKey, sticky storage.UpstreamGroupKey, model string) bool {
@@ -7060,9 +8031,9 @@ func nearlyEqualFloat(a, b float64) bool {
 }
 
 func dispatchGroupIdentity(item storage.UpstreamGroupKey) string {
-	name := strings.ToLower(strings.TrimSpace(item.GroupName))
+	name := strings.ToLower(strings.TrimSpace(item.GroupRef))
 	if name == "" {
-		name = strings.ToLower(strings.TrimSpace(item.GroupRef))
+		name = strings.ToLower(strings.TrimSpace(item.GroupName))
 	}
 	if name == "" {
 		return ""
@@ -7166,7 +8137,25 @@ func (s *Service) filterKnownUnsupportedModelCandidates(candidates []storage.Ups
 	return out
 }
 
+func filterSchedulableCandidates(candidates []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
+	out := make([]storage.UpstreamGroupKey, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidateSchedulable(candidate) || candidateRecoverableAfterCooldown(candidate) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
 func (s *Service) candidateEffectiveModelCapabilityRank(candidate storage.UpstreamGroupKey, model string) int {
+	model = normalizeModelCapabilityKey(model)
+	if candidate.ModelRestrictionEnabled {
+		if supportedModelsContain(candidate.SupportedModels, model) {
+			return 0
+		}
+		// A strict empty allowlist intentionally rejects every model.
+		return 2
+	}
 	rank := s.candidateModelCapabilityRank(candidate.ID, model)
 	if rank != 1 {
 		return rank
@@ -7174,9 +8163,8 @@ func (s *Service) candidateEffectiveModelCapabilityRank(candidate storage.Upstre
 	if probeRank := healthProbeModelCapabilityRank(candidate.HealthProbeModel, model); probeRank != 1 {
 		return probeRank
 	}
-	// 软过滤：渠道声明/同步的支持模型清单只提供"正向加分"，命中即视为"支持(0)"。
-	// 不命中绝不降级为"不支持(2)"——清单常不全（上游 /v1/models 会过滤/过时），
-	// 降级会把可用渠道误排除，反而制造"有渠道却不可用"。清单为空则完全不参与。
+	// Legacy unrestricted rows retain the former positive-hint behavior until
+	// an operator explicitly synchronizes or saves a strict policy.
 	if supportedModelsContain(candidate.SupportedModels, model) {
 		return 0
 	}
@@ -7366,30 +8354,65 @@ func (s *Service) runtimeFirstTokenLatency(id uint) (float64, bool) {
 	return current.avgFirstTokenMS, true
 }
 
-func (s *Service) tryAcquireCandidate(id uint, limit int) (func(), bool) {
-	if limit <= 0 {
-		return func() {}, true
+func (s *Service) tryAcquireScheduledCandidate(candidate *storage.UpstreamGroupKey) (func(), bool) {
+	if candidate == nil {
+		return nil, false
 	}
+	id, limit := candidate.ID, candidate.ConcurrencyLimit
 	state := s.runtimeState(id)
 	state.mu.Lock()
+	now := time.Now()
+	if candidateNeedsRecoveryProbe(*candidate, now) {
+		state.needsRecovery = true
+	}
 	if state.inFlight >= limit {
+		if limit <= 0 {
+			// Unlimited candidates do not use the in-flight ceiling.
+		} else {
+			state.mu.Unlock()
+			return nil, false
+		}
+	}
+	recoveryLease := false
+	if state.needsRecovery {
+		if state.recoveryInFlight {
+			state.mu.Unlock()
+			return nil, false
+		}
+		state.recoveryInFlight = true
+		recoveryLease = true
+	}
+	if limit > 0 && state.inFlight >= limit {
 		state.mu.Unlock()
 		return nil, false
 	}
-	state.inFlight++
+	if limit > 0 {
+		state.inFlight++
+	}
 	state.lastObservedAt = time.Now()
 	state.mu.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			state.mu.Lock()
-			if state.inFlight > 0 {
+			if limit > 0 && state.inFlight > 0 {
 				state.inFlight--
+			}
+			if recoveryLease {
+				state.recoveryInFlight = false
 			}
 			state.lastObservedAt = time.Now()
 			state.mu.Unlock()
 		})
 	}, true
+}
+
+// tryAcquireCandidate preserves the small runtime-concurrency primitive used
+// by existing tests and internal callers that do not have a persisted
+// candidate snapshot. Recovery-probe semantics require the full candidate and
+// are implemented by tryAcquireScheduledCandidate above.
+func (s *Service) tryAcquireCandidate(id uint, limit int) (func(), bool) {
+	return s.tryAcquireScheduledCandidate(&storage.UpstreamGroupKey{ID: id, ConcurrencyLimit: limit})
 }
 
 func (s *Service) keyRuntimeState(id uint) *keyRuntimeState {
@@ -7564,15 +8587,23 @@ func (s *Service) recordRuntimeSuccess(id uint, duration time.Duration, firstTok
 		state.avgFirstTokenMS = state.avgFirstTokenMS*0.75 + firstTokenMS*0.25
 	}
 	state.disabledUntil = time.Time{}
+	state.needsRecovery = false
+	state.recoveryInFlight = false
 	state.lastObservedAt = time.Now()
+	s.candidateCache.invalidate()
 }
 
 func (s *Service) recordRuntimeFailure(id uint, disabledUntil time.Time) {
 	state := s.runtimeState(id)
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	state.disabledUntil = disabledUntil
+	if disabledUntil.After(state.disabledUntil) {
+		state.disabledUntil = disabledUntil
+	}
+	state.needsRecovery = !state.disabledUntil.IsZero()
+	state.recoveryInFlight = false
 	state.lastObservedAt = time.Now()
+	s.candidateCache.invalidate()
 }
 
 func (s *Service) clearRuntimeDisable(id uint) {
@@ -7580,7 +8611,10 @@ func (s *Service) clearRuntimeDisable(id uint) {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	state.disabledUntil = time.Time{}
+	state.needsRecovery = false
+	state.recoveryInFlight = false
 	state.lastObservedAt = time.Now()
+	s.candidateCache.invalidate()
 }
 
 func orderCandidates(in []storage.UpstreamGroupKey) []storage.UpstreamGroupKey {
@@ -7626,7 +8660,31 @@ func candidateDispatchLayer(item storage.UpstreamGroupKey) int {
 }
 
 func candidateSchedulable(item storage.UpstreamGroupKey) bool {
-	return statusRank(item.Status) <= statusRank("unknown")
+	switch strings.ToLower(strings.TrimSpace(item.Status)) {
+	case "", "alive", "unknown", "network_error", "timeout", "upstream_error", "server_error":
+		return true
+	default:
+		return false
+	}
+}
+
+func candidateRecoverableAfterCooldown(item storage.UpstreamGroupKey) bool {
+	switch strings.ToLower(strings.TrimSpace(item.Status)) {
+	case "cooling", "rate_limited":
+		return item.DisabledUntil != nil
+	default:
+		return false
+	}
+}
+
+func candidateNeedsRecoveryProbe(item storage.UpstreamGroupKey, now time.Time) bool {
+	if item.DisabledUntil == nil || item.DisabledUntil.After(now) {
+		return false
+	}
+	if candidateRecoverableAfterCooldown(item) {
+		return true
+	}
+	return item.FailureCount >= healthTransientFailureThreshold
 }
 
 func hasSchedulableCharityCandidate(candidates []storage.UpstreamGroupKey) bool {
@@ -7746,6 +8804,21 @@ func responsesToChat(body []byte) ([]byte, error) {
 	id, _ := raw["id"].(string)
 	if id == "" {
 		id = "chatcmpl-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	} else if strings.HasPrefix(id, "resp_") {
+		id = "chatcmpl_" + strings.TrimPrefix(id, "resp_")
+	}
+	message := map[string]any{"role": "assistant", "content": text}
+	if reasoning := responsesReasoningSummaryText(raw); reasoning != "" {
+		message["reasoning_content"] = reasoning
+	}
+	toolCalls := responsesOutputToolCalls(raw)
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+		if text == "" {
+			message["content"] = nil
+		}
+		message["tool_calls"] = toolCalls
 	}
 	resp := map[string]any{
 		"id":      id,
@@ -7753,12 +8826,9 @@ func responsesToChat(body []byte) ([]byte, error) {
 		"created": time.Now().Unix(),
 		"model":   model,
 		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role":    "assistant",
-				"content": text,
-			},
-			"finish_reason": "stop",
+			"index":         0,
+			"message":       message,
+			"finish_reason": finishReason,
 		}},
 	}
 	if usage, ok := raw["usage"]; ok {
@@ -7776,6 +8846,53 @@ func responsesToChat(body []byte) ([]byte, error) {
 	return json.Marshal(resp)
 }
 
+func responsesReasoningSummaryText(raw map[string]any) string {
+	output, _ := raw["output"].([]any)
+	var b strings.Builder
+	for _, value := range output {
+		item, _ := value.(map[string]any)
+		if item == nil || !strings.EqualFold(strings.TrimSpace(stringValue(item["type"])), "reasoning") {
+			continue
+		}
+		summary, _ := item["summary"].([]any)
+		for _, partValue := range summary {
+			part, _ := partValue.(map[string]any)
+			b.WriteString(stringValue(part["text"]))
+		}
+	}
+	return b.String()
+}
+
+func responsesOutputToolCalls(raw map[string]any) []any {
+	output, _ := raw["output"].([]any)
+	toolCalls := make([]any, 0)
+	for index, value := range output {
+		item, _ := value.(map[string]any)
+		if item == nil {
+			continue
+		}
+		typ := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
+		if typ != "function_call" && typ != "custom_tool_call" {
+			continue
+		}
+		name := strings.TrimSpace(stringValue(item["name"]))
+		if name == "" {
+			continue
+		}
+		callID := strings.TrimSpace(stringValue(firstNonNil(item["call_id"], item["id"])))
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d", index)
+		}
+		toolCalls = append(toolCalls, map[string]any{
+			"id": callID, "type": "function",
+			"function": map[string]any{
+				"name": name, "arguments": stringValue(firstNonNil(item["arguments"], item["input"])),
+			},
+		})
+	}
+	return toolCalls
+}
+
 // chatToResponsesResponse 把上游返回的 chat.completion（非流式）转换成 Responses 对象，
 // 用于 responses→chat 降级后，把 chat 回复还原成客户端期待的 responses 格式。
 func chatToResponsesResponse(body []byte, toolKinds ...map[string]string) ([]byte, error) {
@@ -7790,8 +8907,14 @@ func chatToResponsesResponse(body []byte, toolKinds ...map[string]string) ([]byt
 		id = "resp_" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	}
 	output := make([]map[string]any, 0, 2)
+	if reasoning := chatCompletionReasoningText(raw); reasoning != "" {
+		output = append(output, map[string]any{
+			"id": "rs_" + strings.TrimPrefix(id, "resp_"), "type": "reasoning", "status": "completed",
+			"summary": []any{map[string]any{"type": "summary_text", "text": reasoning}},
+		})
+	}
 	if text != "" {
-		output = append(output, responsesMessageOutputItem(id, 0, text))
+		output = append(output, responsesMessageOutputItem(id, len(output), text))
 	}
 	// Chat compatible upstreams put tool calls in message.tool_calls.  Keeping
 	// them only in the transient Chat envelope made Codex treat the converted
@@ -7918,6 +9041,79 @@ func streamNonSSEAsResponsesEvents(w http.ResponseWriter, status int, header htt
 		return usage, err
 	}
 	return usage, nil
+}
+
+func streamNonSSEAsChatEvents(w http.ResponseWriter, status int, header http.Header, body []byte, key *storage.UpstreamGroupKey) (usageTokens, error) {
+	chatBody := body
+	if !looksLikeChatCompletionResponse(chatBody) {
+		converted, err := responsesToChat(chatBody)
+		if err != nil {
+			return usageTokens{}, fmt.Errorf("convert non-stream response for Chat streaming client: %w", err)
+		}
+		chatBody = converted
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(chatBody, &raw); err != nil {
+		return usageTokens{}, fmt.Errorf("decode non-stream Chat response: %w", err)
+	}
+	id := normalizeChatCompletionID(stringValue(raw["id"]))
+	model := stringValue(raw["model"])
+	created := time.Now().Unix()
+	if value, ok := numericValue(raw["created"]); ok && value > 0 {
+		created = value
+	}
+	usage := extractUsage(chatBody)
+	usage.ResponseID = firstNonEmpty(usage.ResponseID, id)
+	usage.Model = firstNonEmpty(usage.Model, model)
+	copyResponseHeaders(w, header, key)
+	setStreamResponseHeaders(w)
+	if !responseWriterStarted(w) {
+		w.WriteHeader(status)
+	}
+	if err := writeChatStreamChunk(w, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
+		return usage, err
+	}
+	finishReason := "stop"
+	choices, _ := raw["choices"].([]any)
+	if len(choices) > 0 {
+		choice, _ := choices[0].(map[string]any)
+		message, _ := choice["message"].(map[string]any)
+		if reasoning := stringValue(firstNonNil(message["reasoning_content"], message["reasoning"])); reasoning != "" {
+			if err := writeChatStreamChunk(w, id, model, created, map[string]any{"reasoning_content": reasoning}, nil); err != nil {
+				return usage, err
+			}
+		}
+		if content := chatCompletionText(raw); content != "" {
+			usage.GeneratedText = content
+			if err := writeChatStreamChunk(w, id, model, created, map[string]any{"content": content}, nil); err != nil {
+				return usage, err
+			}
+		}
+		if calls, _ := message["tool_calls"].([]any); len(calls) > 0 {
+			finishReason = "tool_calls"
+			if err := writeChatStreamChunk(w, id, model, created, map[string]any{"tool_calls": calls}, nil); err != nil {
+				return usage, err
+			}
+		}
+		if finish := strings.TrimSpace(stringValue(choice["finish_reason"])); finish != "" {
+			finishReason = finish
+		}
+	}
+	if err := writeChatStreamFinalChunk(w, id, model, created, finishReason, usage); err != nil {
+		return usage, err
+	}
+	if err := writeSSEData(w, "[DONE]"); err != nil {
+		return usage, err
+	}
+	return usage, nil
+}
+
+func isChatCompletionPath(path string) bool {
+	if index := strings.Index(path, "?"); index >= 0 {
+		path = path[:index]
+	}
+	path = "/" + strings.Trim(strings.TrimSpace(path), "/")
+	return path == "/v1/chat/completions" || path == "/chat/completions"
 }
 
 func responsesOutputItemsFromBody(body []byte) []map[string]any {
@@ -8526,6 +9722,24 @@ func chatCompletionText(raw map[string]any) string {
 	return b.String()
 }
 
+func chatCompletionReasoningText(raw map[string]any) string {
+	choices, _ := raw["choices"].([]any)
+	var b strings.Builder
+	for _, c := range choices {
+		choice, _ := c.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		message, _ := choice["message"].(map[string]any)
+		for _, key := range []string{"reasoning_content", "reasoning"} {
+			if text := stringValue(message[key]); text != "" {
+				b.WriteString(text)
+			}
+		}
+	}
+	return b.String()
+}
+
 func responsesToClaude(body []byte) ([]byte, error) {
 	var raw map[string]any
 	if err := json.Unmarshal(body, &raw); err != nil {
@@ -8993,9 +10207,13 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 	createdSent := false
 	textStarted := false
 	textOutputIndex := -1
+	reasoningStarted := false
+	reasoningOutputIndex := -1
+	reasoningItemID := ""
 	nextOutputIndex := 0
 	var best usageTokens
 	var textBuf strings.Builder
+	var reasoningBuf strings.Builder
 	type chatToolCallState struct {
 		OutputIndex int
 		CallID      string
@@ -9027,6 +10245,41 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		nextOutputIndex++
 		textStarted = true
 		return writeResponsesOutputStartAtIndex(w, id, textOutputIndex)
+	}
+	emitReasoningDelta := func(delta string) error {
+		if delta == "" {
+			return nil
+		}
+		if !reasoningStarted {
+			if err := emitCreated(); err != nil {
+				return err
+			}
+			reasoningStarted = true
+			reasoningOutputIndex = nextOutputIndex
+			nextOutputIndex++
+			reasoningItemID = "rs_" + strings.TrimPrefix(id, "resp_")
+			added := map[string]any{
+				"type": "response.output_item.added", "response_id": id, "output_index": reasoningOutputIndex,
+				"item": map[string]any{"id": reasoningItemID, "type": "reasoning", "status": "in_progress", "summary": []any{}},
+			}
+			if err := writeSSEEvent(w, sseEvent{Event: "response.output_item.added", Data: mustJSON(added)}); err != nil {
+				return err
+			}
+			partAdded := map[string]any{
+				"type": "response.reasoning_summary_part.added", "response_id": id, "item_id": reasoningItemID,
+				"output_index": reasoningOutputIndex, "summary_index": 0,
+				"part": map[string]any{"type": "summary_text", "text": ""},
+			}
+			if err := writeSSEEvent(w, sseEvent{Event: "response.reasoning_summary_part.added", Data: mustJSON(partAdded)}); err != nil {
+				return err
+			}
+		}
+		reasoningBuf.WriteString(delta)
+		payload := map[string]any{
+			"type": "response.reasoning_summary_text.delta", "response_id": id, "item_id": reasoningItemID,
+			"output_index": reasoningOutputIndex, "summary_index": 0, "delta": delta,
+		}
+		return writeSSEEvent(w, sseEvent{Event: "response.reasoning_summary_text.delta", Data: mustJSON(payload)})
 	}
 	emitToolCalls := func(raw map[string]any) error {
 		choices, _ := raw["choices"].([]any)
@@ -9148,6 +10401,11 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 				best = usage
 			}
 		}
+		if reasoningDelta := chatChunkReasoningText(raw); reasoningDelta != "" {
+			if err := emitReasoningDelta(reasoningDelta); err != nil {
+				return err
+			}
+		}
 		// 从 chat chunk 里取出增量文本。
 		delta := chatChunkDeltaText(raw)
 		if delta != "" {
@@ -9184,7 +10442,7 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		// of a final finish_reason or [DONE]. If they have already produced
 		// usable text or tool-call deltas, close the Responses lifecycle cleanly
 		// instead of surfacing a client-visible interrupted stream.
-		if streamErr == nil && (textBuf.Len() > 0 || len(toolOrder) > 0) {
+		if streamErr == nil && (textBuf.Len() > 0 || reasoningBuf.Len() > 0 || len(toolOrder) > 0) {
 			sawDone = true
 		} else {
 			message := "upstream chat stream ended before normal completion"
@@ -9208,7 +10466,41 @@ func streamChatAsResponsesEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			return best, err
 		}
 	}
+	if reasoningStarted {
+		reasoningText := reasoningBuf.String()
+		textDone := map[string]any{
+			"type": "response.reasoning_summary_text.done", "response_id": id, "item_id": reasoningItemID,
+			"output_index": reasoningOutputIndex, "summary_index": 0, "text": reasoningText,
+		}
+		if err := writeSSEEvent(w, sseEvent{Event: "response.reasoning_summary_text.done", Data: mustJSON(textDone)}); err != nil {
+			return best, err
+		}
+		partDone := map[string]any{
+			"type": "response.reasoning_summary_part.done", "response_id": id, "item_id": reasoningItemID,
+			"output_index": reasoningOutputIndex, "summary_index": 0,
+			"part": map[string]any{"type": "summary_text", "text": reasoningText},
+		}
+		if err := writeSSEEvent(w, sseEvent{Event: "response.reasoning_summary_part.done", Data: mustJSON(partDone)}); err != nil {
+			return best, err
+		}
+		itemDone := map[string]any{
+			"type": "response.output_item.done", "response_id": id, "output_index": reasoningOutputIndex,
+			"item": map[string]any{
+				"id": reasoningItemID, "type": "reasoning", "status": "completed",
+				"summary": []any{map[string]any{"type": "summary_text", "text": reasoningText}},
+			},
+		}
+		if err := writeSSEEvent(w, sseEvent{Event: "response.output_item.done", Data: mustJSON(itemDone)}); err != nil {
+			return best, err
+		}
+	}
 	outputByIndex := make(map[int]map[string]any, len(toolOrder)+1)
+	if reasoningStarted {
+		outputByIndex[reasoningOutputIndex] = map[string]any{
+			"id": reasoningItemID, "type": "reasoning", "status": "completed",
+			"summary": []any{map[string]any{"type": "summary_text", "text": reasoningBuf.String()}},
+		}
+	}
 	if textStarted {
 		outputByIndex[textOutputIndex] = responsesMessageOutputItem(id, textOutputIndex, textBuf.String())
 	}
@@ -9291,14 +10583,57 @@ func chatChunkDeltaText(raw map[string]any) string {
 	return b.String()
 }
 
+func chatChunkReasoningText(raw map[string]any) string {
+	choices, _ := raw["choices"].([]any)
+	var b strings.Builder
+	for _, c := range choices {
+		choice, _ := c.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		delta, _ := choice["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+		for _, key := range []string{"reasoning_content", "reasoning"} {
+			if text := stringValue(delta[key]); text != "" {
+				b.WriteString(text)
+			}
+		}
+	}
+	return b.String()
+}
+
 func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, reader *sseStreamReader) (usageTokens, error) {
 	created := time.Now().Unix()
 	id := "chatcmpl-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	model := ""
 	roleSent := false
 	doneSent := false
+	toolCallsSeen := false
+	toolIndexByOutput := map[int]int{}
+	nextToolIndex := 0
 	var best usageTokens
 	var interceptBuf strings.Builder
+	ensureRole := func() error {
+		if roleSent {
+			return nil
+		}
+		if err := writeChatStreamChunk(w, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
+			return err
+		}
+		roleSent = true
+		return nil
+	}
+	chatToolIndex := func(outputIndex int) int {
+		if index, ok := toolIndexByOutput[outputIndex]; ok {
+			return index
+		}
+		index := nextToolIndex
+		nextToolIndex++
+		toolIndexByOutput[outputIndex] = index
+		return index
+	}
 	err := readSSEEvents(buffered, reader, func(event, data string) error {
 		if data == "" {
 			return nil
@@ -9357,7 +10692,7 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		}
 		if response, ok := raw["response"].(map[string]any); ok {
 			if v, ok := response["id"].(string); ok && v != "" {
-				id = v
+				id = normalizeChatCompletionID(v)
 				best.ResponseID = v
 			}
 			if v, ok := response["model"].(string); ok && v != "" {
@@ -9374,7 +10709,7 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			}
 		}
 		if v, ok := raw["response_id"].(string); ok && v != "" {
-			id = v
+			id = normalizeChatCompletionID(v)
 			best.ResponseID = v
 		}
 		if v, ok := raw["model"].(string); ok && v != "" {
@@ -9394,11 +10729,8 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 			typ = event
 		}
 		if typ == "response.output_text.delta" {
-			if !roleSent {
-				if err := writeChatStreamChunk(w, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
-					return err
-				}
-				roleSent = true
+			if err := ensureRole(); err != nil {
+				return err
 			}
 			delta, _ := raw["delta"].(string)
 			if delta != "" {
@@ -9406,14 +10738,52 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 				return writeChatStreamChunk(w, id, model, created, map[string]any{"content": delta}, nil)
 			}
 		}
-		if typ == "response.completed" {
-			if !roleSent {
-				if err := writeChatStreamChunk(w, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
+		if typ == "response.reasoning_summary_text.delta" {
+			if err := ensureRole(); err != nil {
+				return err
+			}
+			if delta := stringValue(raw["delta"]); delta != "" {
+				return writeChatStreamChunk(w, id, model, created, map[string]any{"reasoning_content": delta}, nil)
+			}
+		}
+		if typ == "response.output_item.added" {
+			item, _ := raw["item"].(map[string]any)
+			itemType := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
+			if itemType == "function_call" || itemType == "custom_tool_call" {
+				if err := ensureRole(); err != nil {
 					return err
 				}
-				roleSent = true
+				outputIndex := int(intField(raw, "output_index"))
+				index := chatToolIndex(outputIndex)
+				callID := stringValue(firstNonNil(item["call_id"], item["id"]))
+				name := stringValue(item["name"])
+				toolCallsSeen = true
+				return writeChatStreamChunk(w, id, model, created, map[string]any{"tool_calls": []any{map[string]any{
+					"index": index, "id": callID, "type": "function",
+					"function": map[string]any{"name": name, "arguments": ""},
+				}}}, nil)
 			}
-			if err := writeChatStreamChunk(w, id, model, created, map[string]any{}, "stop"); err != nil {
+		}
+		if typ == "response.function_call_arguments.delta" || typ == "response.custom_tool_call_input.delta" {
+			if err := ensureRole(); err != nil {
+				return err
+			}
+			outputIndex := int(intField(raw, "output_index"))
+			index := chatToolIndex(outputIndex)
+			toolCallsSeen = true
+			return writeChatStreamChunk(w, id, model, created, map[string]any{"tool_calls": []any{map[string]any{
+				"index": index, "function": map[string]any{"arguments": stringValue(raw["delta"])},
+			}}}, nil)
+		}
+		if typ == "response.completed" {
+			if err := ensureRole(); err != nil {
+				return err
+			}
+			finishReason := "stop"
+			if toolCallsSeen {
+				finishReason = "tool_calls"
+			}
+			if err := writeChatStreamFinalChunk(w, id, model, created, finishReason, best); err != nil {
 				return err
 			}
 			doneSent = true
@@ -9431,12 +10801,14 @@ func streamResponsesAsChatEvents(w http.ResponseWriter, buffered []sseEvent, rea
 		return best, err
 	}
 	if !doneSent {
-		if !roleSent {
-			if err := writeChatStreamChunk(w, id, model, created, map[string]any{"role": "assistant"}, nil); err != nil {
-				return best, err
-			}
+		if err := ensureRole(); err != nil {
+			return best, err
 		}
-		if err := writeChatStreamChunk(w, id, model, created, map[string]any{}, "stop"); err != nil {
+		finishReason := "stop"
+		if toolCallsSeen {
+			finishReason = "tool_calls"
+		}
+		if err := writeChatStreamFinalChunk(w, id, model, created, finishReason, best); err != nil {
 			return best, err
 		}
 		if err := writeSSEData(w, "[DONE]"); err != nil {
@@ -10669,6 +12041,34 @@ func writeChatStreamChunk(w http.ResponseWriter, id, model string, created int64
 	return writeSSEData(w, string(data))
 }
 
+func writeChatStreamFinalChunk(w http.ResponseWriter, id, model string, created int64, finish string, usage usageTokens) error {
+	chunk := map[string]any{
+		"id": normalizeChatCompletionID(id), "object": "chat.completion.chunk", "created": created, "model": model,
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finish}},
+	}
+	if usage.Total > 0 || usage.Prompt > 0 || usage.Completion > 0 {
+		chunk["usage"] = map[string]int64{
+			"prompt_tokens": usage.Prompt, "completion_tokens": usage.Completion, "total_tokens": usage.Total,
+		}
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return err
+	}
+	return writeSSEData(w, string(data))
+}
+
+func normalizeChatCompletionID(id string) string {
+	id = strings.TrimSpace(id)
+	if strings.HasPrefix(id, "resp_") {
+		return "chatcmpl_" + strings.TrimPrefix(id, "resp_")
+	}
+	if id == "" {
+		return "chatcmpl-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return id
+}
+
 func writeClaudeStart(w http.ResponseWriter, id, model string) error {
 	if err := writeClaudeEvent(w, "message_start", map[string]any{
 		"type": "message_start",
@@ -10975,6 +12375,7 @@ func gatewayKeyOutput(key storage.GatewayKey) GatewayKeyOutput {
 		BalanceLimit:       key.BalanceLimit,
 		ConcurrencyLimit:   key.ConcurrencyLimit,
 		MaxGroupRatio:      key.MaxGroupRatio,
+		RoutePreference:    normalizeGatewayRoutePreference(key.RoutePreference),
 		BalanceRemaining:   balanceRemaining,
 		TodayCost:          todayCost,
 		TotalCost:          key.TotalCost,
@@ -12121,7 +13522,10 @@ func readLimitedBody(r io.Reader, max int64) ([]byte, error) {
 
 func skipRequestHeader(name string) bool {
 	switch strings.ToLower(name) {
-	case "authorization", "x-api-key", "host", "content-length", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+	case "authorization", "x-api-key", "cookie", "set-cookie", "openai-organization", "openai-project",
+		"chatgpt-account-id", "x-account-id", "x-user-id", "x-auth-token",
+		"x-forwarded-for", "x-real-ip", "forwarded", "cf-connecting-ip", "true-client-ip",
+		"host", "content-length", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
 		return true
 	default:
 		return false

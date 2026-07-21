@@ -214,6 +214,11 @@ type UpstreamGroupKeyCounts struct {
 	Enabled int64
 }
 
+type DispatchFailureResult struct {
+	FailureCount  int
+	DisabledUntil *time.Time
+}
+
 func orderUpstreamGroupKeys(q *gorm.DB, table string) *gorm.DB {
 	col := func(name string) string {
 		if table == "" {
@@ -386,10 +391,7 @@ func (r *UpstreamGroupKeys) ListByChannel(channelID uint) ([]UpstreamGroupKey, e
 	return list, nil
 }
 
-func (r *UpstreamGroupKeys) ListCandidates(now time.Time) ([]UpstreamGroupKey, error) {
-	if err := r.reactivateExpiredCooldowns(now); err != nil {
-		return nil, err
-	}
+func (r *UpstreamGroupKeys) ListCandidates(_ time.Time) ([]UpstreamGroupKey, error) {
 	var list []UpstreamGroupKey
 	q := r.db.
 		Joins("JOIN channels ON channels.id = upstream_group_keys.channel_id").
@@ -531,13 +533,12 @@ func (r *UpstreamGroupKeys) UpdateRequestMode(id uint, mode string) error {
 	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("request_mode", mode).Error
 }
 
-// UpdateSupportedModels 写回渠道的支持模型清单（JSON 数组文本）。传入已规整好的
-// JSON 字符串；空清单存 "" 表示"未同步/未知"，调度按软过滤视其正常参与。
-func (r *UpstreamGroupKeys) UpdateSupportedModels(id uint, modelsJSON string) error {
-	if id == 0 {
-		return nil
-	}
-	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Update("supported_models", modelsJSON).Error
+func (r *UpstreamGroupKeys) UpdateModelPolicy(id uint, availableJSON, supportedJSON string, restrictionEnabled bool) error {
+	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+		"available_models":          availableJSON,
+		"supported_models":          supportedJSON,
+		"model_restriction_enabled": restrictionEnabled,
+	}).Error
 }
 
 func (r *UpstreamGroupKeys) UpdateRequestModeConfig(id uint, mode, source string) error {
@@ -647,6 +648,90 @@ func (r *UpstreamGroupKeys) MarkProxyFailureStatus(id uint, status string, errMs
 	}).Error
 }
 
+// RecordDispatchFailure advances the consecutive failure counter in one
+// transaction. Transient failures only get a cooldown after threshold failures
+// inside window; explicit rate-limit/auth failures can request immediate
+// cooldown. MarkSuccess* resets the counter on recovery.
+func (r *UpstreamGroupKeys) RecordDispatchFailure(id uint, status, errMsg string, threshold int, window, cooldown time.Duration, immediate bool) (DispatchFailureResult, error) {
+	var out DispatchFailureResult
+	if threshold <= 0 {
+		threshold = 3
+	}
+	if window <= 0 {
+		window = 5 * time.Minute
+	}
+	now := time.Now()
+	err := r.db.Transaction(func(tx *gorm.DB) error {
+		var current UpstreamGroupKey
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, id).Error; err != nil {
+			return err
+		}
+		failures := current.FailureCount
+		if current.LastCheckedAt == nil || now.Sub(*current.LastCheckedAt) > window {
+			failures = 0
+		}
+		failures++
+		status = strongerDispatchFailureStatus(current.Status, status)
+		updates := map[string]any{
+			"status":          status,
+			"failure_count":   failures,
+			"last_checked_at": &now,
+			"last_error":      errMsg,
+		}
+		disabledUntil := cloneLaterTime(current.DisabledUntil, nil)
+		if (immediate || failures >= threshold) && cooldown > 0 {
+			until := now.Add(cooldown)
+			disabledUntil = cloneLaterTime(disabledUntil, &until)
+		}
+		if disabledUntil != nil {
+			updates["disabled_until"] = disabledUntil
+		}
+		out.FailureCount = failures
+		out.DisabledUntil = cloneLaterTime(disabledUntil, nil)
+		return tx.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(updates).Error
+	})
+	return out, err
+}
+
+func strongerDispatchFailureStatus(current, proposed string) string {
+	current = strings.ToLower(strings.TrimSpace(current))
+	proposed = strings.ToLower(strings.TrimSpace(proposed))
+	if proposed == "" {
+		proposed = "alive"
+	}
+	if dispatchFailureStatusSeverity(current) > dispatchFailureStatusSeverity(proposed) {
+		return current
+	}
+	return proposed
+}
+
+func dispatchFailureStatusSeverity(status string) int {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "auth_failed", "forbidden", "zero_balance":
+		return 4
+	case "dead":
+		return 3
+	case "rate_limited":
+		return 2
+	case "network_error", "timeout", "server_error", "upstream_error":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func cloneLaterTime(current, proposed *time.Time) *time.Time {
+	if current == nil && proposed == nil {
+		return nil
+	}
+	selected := current
+	if selected == nil || proposed != nil && proposed.After(*selected) {
+		selected = proposed
+	}
+	value := selected.UTC()
+	return &value
+}
+
 func (r *UpstreamGroupKeys) MarkHealthFailure(id uint, errMsg string, disabledUntil time.Time, latencyMS int64) error {
 	return r.MarkHealthFailureStatus(id, "dead", errMsg, &disabledUntil, latencyMS)
 }
@@ -659,14 +744,22 @@ func (r *UpstreamGroupKeys) MarkHealthFailureStatus(id uint, status string, errM
 	if strings.TrimSpace(status) == "" {
 		status = "dead"
 	}
-	return r.db.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
-		"status":          status,
-		"failure_count":   gorm.Expr("failure_count + ?", 1),
-		"last_checked_at": &now,
-		"last_latency_ms": latencyMS,
-		"disabled_until":  disabledUntil,
-		"last_error":      errMsg,
-	}).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var current UpstreamGroupKey
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&current, id).Error; err != nil {
+			return err
+		}
+		status = strongerDispatchFailureStatus(current.Status, status)
+		later := cloneLaterTime(current.DisabledUntil, disabledUntil)
+		return tx.Model(&UpstreamGroupKey{}).Where("id = ?", id).Updates(map[string]any{
+			"status":          status,
+			"failure_count":   current.FailureCount + 1,
+			"last_checked_at": &now,
+			"last_latency_ms": latencyMS,
+			"disabled_until":  later,
+			"last_error":      errMsg,
+		}).Error
+	})
 }
 
 // MarkHealthInconclusive records a probe result that could not prove an
@@ -742,6 +835,17 @@ func (r *UsageLogs) Update(id uint, updates map[string]any) error {
 		return nil
 	}
 	return r.db.Model(&UsageLog{}).Where("id = ?", id).Updates(updates).Error
+}
+
+func (r *UsageLogs) Find(id uint) (*UsageLog, error) {
+	if r == nil || r.db == nil || id == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
+	var entry UsageLog
+	if err := r.db.First(&entry, id).Error; err != nil {
+		return nil, err
+	}
+	return &entry, nil
 }
 
 // List 分页返回使用记录，按时间倒序。

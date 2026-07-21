@@ -1,6 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useRef, useState } from "react"
+import { useNavigate } from "react-router-dom"
 import { toast } from "sonner"
 import {
   ArrowUpDown,
@@ -18,12 +19,15 @@ import {
   Plus,
   RefreshCw,
   Search,
+  Server,
   Tags,
   Trash2,
-  Gift,
   ChevronsLeft,
   ChevronsRight,
   XCircle,
+  Upload,
+  Users,
+  Activity,
 } from "lucide-react"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -57,18 +61,28 @@ import { useTriggerRefresh } from "@/lib/refresh-context"
 import { channelTypeLabel, decimal, formatRatio, money, relativeTime } from "@/lib/format"
 import { cn } from "@/lib/utils"
 import { syncAllChannelsStream, syncChannelStream, testLoginStream, type ProgressEvent } from "@/lib/sync-stream"
-import type { Channel, ChannelRedeemResult, RateSnapshot } from "@/lib/api-types"
+import type { Channel, RateSnapshot } from "@/lib/api-types"
 import { ChannelFormDialog } from "@/components/monitor/channel-form-dialog"
-import { ChannelRedeemDialog } from "@/components/monitor/channel-redeem-dialog"
 import { ChannelAPIKeysDialog } from "@/components/monitor/channel-api-keys-dialog"
 import { ManualGroupKeyDialog } from "@/components/monitor/manual-group-key-dialog"
-import {
-  ChannelSubscriptionUsageMetricTiles,
-} from "@/components/monitor/channel-subscription-usage-dialog"
 
 type Status = "healthy" | "low" | "failed" | "idle"
 type ChannelPageSize = 9 | 18 | 36 | 72 | 81 | "all"
 type GroupSortMode = "channel-asc" | "channel-desc" | "ratio-asc" | "ratio-desc"
+
+interface OAuthPoolStatsView {
+  total: number
+  rate_limited: number
+  available: number
+}
+
+type OAuthPoolKind = "chatgpt" | "grok"
+type OAuthPoolStatsState = Record<OAuthPoolKind, OAuthPoolStatsView | null>
+
+const FIXED_POOL_CHANNELS: Array<{ pool: OAuthPoolKind; name: string; type: Channel["type"] }> = [
+  { pool: "chatgpt", name: "chatgpt号池", type: "chatgpt_pool" },
+  { pool: "grok", name: "grok号池", type: "grok_pool" },
+]
 
 const channelPageSizeOptions: ChannelPageSize[] = [9, 18, 36, 72, 81, "all"]
 
@@ -89,6 +103,10 @@ function isManualChannel(c?: Channel | null) {
   return !!c?.manual || (c?.credential_mode === "token" && c?.username?.trim().toLowerCase() === "manual")
 }
 
+function isFixedPoolChannel(c?: Channel | null) {
+	return c?.fixed === true || c?.type === "chatgpt_pool" || c?.type === "grok_pool"
+}
+
 const statusMap: Record<Status, { label: string; cls: string }> = {
   healthy: { label: "健康", cls: "text-success bg-success/10" },
   low: { label: "低余额", cls: "text-warning bg-warning/10" },
@@ -96,15 +114,12 @@ const statusMap: Record<Status, { label: string; cls: string }> = {
   idle: { label: "尚未采集", cls: "text-muted-foreground bg-muted/40" },
 }
 
-function StatTile({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="flex h-16 min-w-0 flex-col justify-between rounded-md border border-border bg-muted/20 px-2.5 py-2">
-      <span className="text-[10px] leading-none text-muted-foreground">{label}</span>
-      <div className="min-w-0 overflow-hidden text-[13px] font-semibold leading-tight text-foreground">
-        {typeof children === "string" ? <span className="block truncate">{children}</span> : children}
-      </div>
-    </div>
-  )
+// statusDotCls 是行式布局里名称前那颗状态点的填充色，与 statusMap 的语义一一对应。
+const statusDotCls: Record<Status, string> = {
+  healthy: "bg-success",
+  low: "bg-warning",
+  failed: "bg-danger",
+  idle: "bg-muted-foreground/40",
 }
 
 function rechargeMultiplierTip(c: Channel) {
@@ -527,7 +542,68 @@ function SyncProgressStrip({ state }: { state: ChannelSyncState }) {
   )
 }
 
+function FixedPoolChannelRow({
+	channel,
+	stats,
+	statsError,
+	busy,
+	onInspect,
+	onOpen,
+}: {
+	channel: Channel
+	stats: OAuthPoolStatsView | null
+	statsError: boolean
+	busy: boolean
+	onInspect: () => void
+	onOpen: (mode: "import" | "manage") => void
+}) {
+	const provider = channel.type === "grok_pool" ? "Grok OAuth" : "ChatGPT OAuth"
+	const usable = (stats?.available ?? 0) > 0
+	const statusLabel = statsError ? "状态未知" : stats == null ? "加载中" : usable ? "可调度" : "无可用账号"
+	return (
+		<Card className="border border-border px-3 py-3 shadow-none">
+			<div className="flex h-full flex-col gap-3">
+				<div className="flex min-w-0 flex-1 items-center gap-3">
+					<div className={cn("flex size-9 shrink-0 items-center justify-center rounded-md", statsError || stats == null ? "bg-muted text-muted-foreground" : usable ? "bg-success/10 text-success" : "bg-danger/10 text-danger")}>
+						<Users className="size-4" />
+					</div>
+					<div className="min-w-0">
+						<div className="flex flex-wrap items-center gap-2">
+							<h3 className="truncate text-sm font-semibold text-foreground">{channel.name}</h3>
+							<span className="rounded bg-brand/10 px-1.5 py-0.5 text-[10px] font-medium text-brand">固定号池</span>
+							<span className={cn("rounded px-1.5 py-0.5 text-[10px] font-medium", statsError || stats == null ? "bg-muted text-muted-foreground" : usable ? "bg-success/10 text-success" : "bg-danger/10 text-danger")}>
+								{statusLabel}
+							</span>
+						</div>
+						<p className="mt-1 text-xs text-muted-foreground">{provider} · 仅存活且当前可调度的账号会参与 API Key 轮询</p>
+					</div>
+				</div>
+				<div className="grid grid-cols-3 gap-2 sm:min-w-90">
+					{[
+						["总账号数", stats?.total, "text-foreground"],
+						["限流账号数", stats?.rate_limited, (stats?.rate_limited ?? 0) > 0 ? "text-warning" : "text-foreground"],
+						["可用账号数", stats?.available, stats == null ? "text-muted-foreground" : usable ? "text-success" : "text-danger"],
+					].map(([label, value, tone]) => (
+						<div key={String(label)} className="rounded-md border border-border bg-muted/20 px-3 py-2 text-center">
+							<p className="text-[10px] text-muted-foreground">{label}</p>
+							<p className={cn("mt-0.5 text-base font-semibold tabular-nums", String(tone))}>{value ?? "-"}</p>
+						</div>
+					))}
+				</div>
+				<div className="mt-auto flex shrink-0 flex-wrap items-center gap-2 border-t border-border pt-3">
+					<Button size="sm" variant="outline" className="gap-1.5 text-xs" onClick={() => onOpen("import")}><Upload className="size-3.5" />导入</Button>
+					<Button size="sm" variant="outline" className="gap-1.5 text-xs" onClick={() => onOpen("manage")}><Users className="size-3.5" />管理</Button>
+					<Button size="sm" className="gap-1.5 text-xs" disabled={busy || stats == null || stats.total === 0} onClick={onInspect}>
+						<Activity className={cn("size-3.5", busy && "animate-pulse")} />{busy ? "巡检中" : "巡检"}
+					</Button>
+				</div>
+			</div>
+		</Card>
+	)
+}
+
 export function ChannelCards() {
+	const navigate = useNavigate()
   const { data: channels, loading: channelsLoading } = useChannels()
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState<ChannelPageSize>(9)
@@ -539,18 +615,66 @@ export function ChannelCards() {
   const [creating, setCreating] = useState(false)
   const [groupsOpen, setGroupsOpen] = useState(false)
   const [manualOpen, setManualOpen] = useState(false)
-  const [redeeming, setRedeeming] = useState<Channel | null>(null)
   const [managingKeys, setManagingKeys] = useState<Channel | null>(null)
   const [busyAction, setBusyAction] = useState<string | null>(null)
+	const [poolStats, setPoolStats] = useState<OAuthPoolStatsState>({ chatgpt: null, grok: null })
+	const [poolStatsErrors, setPoolStatsErrors] = useState<Record<OAuthPoolKind, boolean>>({ chatgpt: false, grok: false })
   // 每个渠道当前 sync 进度（最新一条事件） + 历史事件
   const [syncState, setSyncState] = useState<Record<number, ChannelSyncState>>({})
   const [bulkSync, setBulkSync] = useState<BulkSyncState>({ running: false, completed: 0, total: 0 })
   const anySyncRunning = bulkSync.running || Object.values(syncState).some((s) => s.running)
   const channelPage = pageQuery.data
   const visibleChannels = channelPage?.items ?? []
-  const syncableChannels = (channels ?? []).filter((channel) => !isManualChannel(channel))
+	const fixedPoolChannels = FIXED_POOL_CHANNELS.map((definition, index) => (
+		(channels ?? []).find((channel) => channel.type === definition.type) ?? {
+			id: -(index + 1),
+			name: definition.name,
+			type: definition.type,
+			fixed: true,
+		} as Channel
+	))
+	const orderedVisibleChannels = [
+		...fixedPoolChannels,
+		...visibleChannels.filter((channel) => !isFixedPoolChannel(channel)),
+	]
+	const syncableChannels = (channels ?? []).filter((channel) => !isManualChannel(channel) && !isFixedPoolChannel(channel))
   const totalChannels = channelPage?.total ?? 0
+	const displayedChannelCount = Math.max(totalChannels, FIXED_POOL_CHANNELS.length)
   const pageSizeAll = pageSize === "all"
+
+	async function loadPoolStats() {
+		const pools: OAuthPoolKind[] = ["chatgpt", "grok"]
+		const results = await Promise.allSettled(
+			pools.map((pool) => apiFetch<OAuthPoolStatsView>(`/oauth-accounts/${pool}/stats`)),
+		)
+		setPoolStats((current) => {
+			const next = { ...current }
+			results.forEach((result, index) => {
+				if (result.status === "fulfilled") next[pools[index]] = result.value
+			})
+			return next
+		})
+		setPoolStatsErrors({
+			chatgpt: results[0].status === "rejected",
+			grok: results[1].status === "rejected",
+		})
+	}
+
+	useEffect(() => {
+		void loadPoolStats()
+	}, [])
+
+	async function inspectPool(pool: OAuthPoolKind) {
+		let job = await apiFetch<{ status?: string; total?: number; completed?: number; alive?: number; failed?: number; last_error?: string }>(`/oauth-accounts/${pool}/inspect`, { method: "POST" })
+		for (let attempt = 0; job.status === "running" || job.status === "queued"; attempt += 1) {
+			if (attempt >= 180) throw new Error("巡检仍在后台运行，请稍后到账号管理页查看进度")
+			await new Promise((resolve) => window.setTimeout(resolve, 1000))
+			job = await apiFetch(`/oauth-accounts/${pool}/inspect`)
+		}
+		if (job.status === "failed") throw new Error(job.last_error || "巡检失败")
+		toast.success(`巡检完成：存活 ${job.alive ?? 0}，失败 ${job.failed ?? 0}`)
+		await loadPoolStats()
+	}
   const totalPages = pageSizeAll ? 1 : (channelPage?.pages ?? 1)
   const currentPage = pageSizeAll ? 1 : Math.min(page, totalPages)
   const effectivePageSize = pageSizeAll ? Math.max(totalChannels, 1) : pageSize
@@ -736,30 +860,21 @@ export function ChannelCards() {
     }
   }
 
-  function renderRedeemSummary(result: ChannelRedeemResult) {
-    if (result.type === "subscription") {
-      const group = result.group_name ? ` · ${result.group_name}` : ""
-      const days = result.validity_days ? ` · ${result.validity_days} 天` : ""
-      return `${result.message || "兑换成功"}${group}${days}`
-    }
-    if (result.type === "concurrency") {
-      const extra = result.new_concurrency != null ? ` · 当前并发 ${result.new_concurrency}` : ""
-      return `${result.message || "兑换成功"}${extra}`
-    }
-    const extra = result.new_balance != null ? ` · 当前余额 ${money(result.new_balance)}` : ""
-    return `${result.message || "兑换成功"}${extra}`
-  }
-
   return (
-    <section>
-      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex items-baseline gap-3">
-          <h2 className="text-base font-semibold text-foreground">{"渠道"}</h2>
-          <p className="text-xs text-muted-foreground">{"实时健康、余额与同步状态"}</p>
+    <section className="space-y-4">
+      <div className="flex flex-col gap-4 border-b border-border/70 pb-5 sm:flex-row sm:items-end sm:justify-between">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="mt-0.5 flex size-10 shrink-0 items-center justify-center rounded-lg border border-brand/15 bg-brand/8 text-brand shadow-xs">
+            <Server className="size-[18px]" />
+          </span>
+          <div>
+            <h1 className="text-xl font-semibold text-foreground">上游渠道</h1>
+            <p className="mt-1 text-sm text-muted-foreground">管理普通渠道与固定号池，查看健康、倍率和账号可用性。</p>
+          </div>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
           <span className="text-xs text-muted-foreground">
-            {totalChannels}{" 个渠道"}
+            {displayedChannelCount}{" 个渠道"}
           </span>
           <Button
             variant="outline"
@@ -804,7 +919,7 @@ export function ChannelCards() {
         </div>
       </div>
 
-      <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
         <div className="relative min-w-0 flex-1">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -822,7 +937,7 @@ export function ChannelCards() {
         <p className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-muted-foreground">
           {"加载中…"}
         </p>
-      ) : totalChannels === 0 ? (
+      ) : totalChannels === 0 && orderedVisibleChannels.length === 0 ? (
         <div className="rounded-lg border border-dashed border-border px-4 py-10 text-center">
           <p className="text-sm text-muted-foreground">{"还没有任何渠道。"}</p>
           <Button
@@ -839,284 +954,275 @@ export function ChannelCards() {
         </div>
       ) : (
         <>
-          <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-3">
-            {visibleChannels.map((c) => {
+          <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
+            {orderedVisibleChannels.map((c) => {
+						if (isFixedPoolChannel(c)) {
+							const provider = c.type === "grok_pool" ? "grok" : "chatgpt"
+							return (
+								<FixedPoolChannelRow
+									key={c.id}
+									channel={c}
+									stats={poolStats[provider]}
+									statsError={poolStatsErrors[provider]}
+									busy={busyAction === `inspect-${provider}`}
+									onOpen={(mode) => navigate(`/oauth?pool=${provider}${mode === "import" ? "&import=1" : ""}`)}
+									onInspect={() => void withBusy(`inspect-${provider}`, () => inspectPool(provider))}
+								/>
+							)
+						}
               const status = statusOf(c)
               const meta = statusMap[status]
               const manual = isManualChannel(c)
               return (
-                <Card key={c.id} className="flex flex-col gap-0 border border-border p-3 shadow-none sm:p-4">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="flex min-w-0 flex-wrap items-center gap-2">
+                <Card key={c.id} className="flex flex-col gap-0 border border-border px-3 py-2 shadow-none md:col-span-2">
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                    {/* 左：状态点 + 名称 + 徽章 */}
+                    <div className="flex min-w-0 flex-1 items-center gap-2">
+                      <Tooltip delayDuration={150}>
+                        <TooltipTrigger asChild>
+                          <span className={cn("size-2 shrink-0 rounded-full", statusDotCls[status])} aria-label={meta.label} />
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="text-xs">
+                          {meta.label}
+                        </TooltipContent>
+                      </Tooltip>
                       <span className="truncate text-sm font-semibold text-foreground">{c.name}</span>
                       {c.pinned ? (
-                        <span className="inline-flex items-center gap-1 rounded bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium text-warning ring-1 ring-inset ring-warning/20">
+                        <span className="inline-flex shrink-0 items-center gap-0.5 rounded bg-warning/10 px-1 py-0.5 text-[10px] font-medium text-warning ring-1 ring-inset ring-warning/20">
                           <Pin className="size-2.5 fill-current" />
                           置顶
                         </span>
                       ) : null}
-                      <span
-                        className={cn(
-                          "inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset",
-                          c.type === "newapi"
-                            ? "bg-brand/10 text-brand ring-brand/20"
-                            : "bg-brand/10 text-brand ring-brand/20",
-                        )}
-                      >
+                      <span className="inline-flex shrink-0 items-center rounded bg-brand/10 px-1 py-0.5 text-[10px] font-medium text-brand ring-1 ring-inset ring-brand/20">
                         {channelTypeLabel(c.type)}
                       </span>
                       {manual ? (
-                        <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-border">
+                        <span className="inline-flex shrink-0 items-center rounded bg-muted px-1 py-0.5 text-[10px] font-medium text-muted-foreground ring-1 ring-inset ring-border">
                           手动
                         </span>
                       ) : null}
                       {!c.monitor_enabled ? (
-                        <span className="inline-flex items-center rounded bg-warning/10 px-1.5 py-0.5 text-[10px] font-medium text-warning ring-1 ring-inset ring-warning/20">
+                        <span className="inline-flex shrink-0 items-center rounded bg-warning/10 px-1 py-0.5 text-[10px] font-medium text-warning ring-1 ring-inset ring-warning/20">
                           {"已暂停"}
                         </span>
                       ) : null}
                     </div>
-                    <div className="flex shrink-0 items-center gap-1.5">
-                      <div className="text-right text-[10px] leading-4 text-muted-foreground">
-                        <p>{relativeTime(c.last_balance_at ?? c.updated_at)}</p>
-                      </div>
-                      <Tooltip delayDuration={150}>
-                        <TooltipTrigger asChild>
-                          <Button
-                            asChild
-                            variant="ghost"
-                            size="icon-sm"
-                            className="size-7 text-muted-foreground hover:text-foreground"
-                          >
-                            <a
-                              href={c.site_url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              aria-label={`新窗口打开 ${c.name} 站点地址`}
-                            >
-                              <ExternalLink className="size-3.5" />
-                            </a>
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent side="top" className="text-xs">
-                          {"新窗口打开站点地址"}
-                        </TooltipContent>
-                      </Tooltip>
-                    </div>
-                  </div>
 
-                  <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
-                    <StatTile label="余额">
+                    {/* 中：余额 / 今日 / 累计 紧凑数值 */}
+                    <div className="flex shrink-0 items-center gap-3 text-[11px] tabular-nums">
                       <Tooltip delayDuration={150}>
                         <TooltipTrigger asChild>
-                          <span className="block truncate">{money(c.last_balance)}</span>
+                          <span className="flex items-baseline gap-1">
+                            <span className="text-[10px] text-muted-foreground">余额</span>
+                            <span className="font-semibold text-foreground">{money(c.last_balance)}</span>
+                          </span>
                         </TooltipTrigger>
                         <TooltipContent side="top" className="text-xs">
                           {rechargeMultiplierTip(c)}
                         </TooltipContent>
                       </Tooltip>
-                    </StatTile>
-                    <StatTile label="今日消费">{money(c.today_cost)}</StatTile>
-                    <StatTile label="累计消费">{money(c.total_cost)}</StatTile>
-                    <StatTile label="阈值 / 状态">
-                      <div className="flex min-w-0 items-center gap-1.5">
-                        <Tooltip delayDuration={150}>
-                          <TooltipTrigger asChild>
-                            <span className="truncate text-[11px] font-medium text-foreground">
-                              {c.balance_threshold > 0 ? money(c.balance_threshold) : "未设置"}
-                            </span>
-                          </TooltipTrigger>
-                          <TooltipContent side="top" className="text-xs">
-                            {c.balance_threshold > 0
-                              ? `余额低于 ${money(c.balance_threshold)} 时通知`
-                              : "未开启低余额通知"}
-                          </TooltipContent>
-                        </Tooltip>
-                        <span className="text-[10px] text-muted-foreground">/</span>
-                        <span className={cn("inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium ring-1 ring-inset", meta.cls)}>
-                          {meta.label}
-                        </span>
-                      </div>
-                    </StatTile>
-                    <ChannelSubscriptionUsageMetricTiles channel={c} />
-                    {c.last_error ? (
-                      <div className="col-span-3 rounded-md border border-border bg-muted/20 px-2.5 py-2">
-                        <p className="max-h-16 overflow-y-auto whitespace-pre-wrap break-words pr-1 text-[11px] leading-4 text-danger" title={c.last_error}>
-                          {c.last_error}
-                        </p>
-                      </div>
-                    ) : null}
+                      <span className="flex items-baseline gap-1">
+                        <span className="text-[10px] text-muted-foreground">今日</span>
+                        <span className="font-medium text-foreground">{money(c.today_cost)}</span>
+                      </span>
+                      <span className="hidden items-baseline gap-1 sm:flex">
+                        <span className="text-[10px] text-muted-foreground">累计</span>
+                        <span className="font-medium text-foreground">{money(c.total_cost)}</span>
+                      </span>
+                      <span className="hidden text-[10px] text-muted-foreground lg:inline">
+                        {relativeTime(c.last_balance_at ?? c.updated_at)}
+                      </span>
+                    </div>
+
+                    {/* 右：操作 */}
+                    <div className="flex shrink-0 items-center gap-1">
+                      <Tooltip delayDuration={150}>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            disabled={manual || !!syncState[c.id]?.running || anySyncRunning}
+                            onClick={() => startStream(c, "sync")}
+                            aria-label="同步"
+                          >
+                            <RefreshCw className={cn("size-3.5", syncState[c.id]?.running && "animate-spin")} />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="text-xs">{"同步"}</TooltipContent>
+                      </Tooltip>
+                      <Tooltip delayDuration={150}>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            disabled={manual || !!syncState[c.id]?.running || anySyncRunning}
+                            onClick={() => startStream(c, "test-login")}
+                            aria-label="测试登录"
+                          >
+                            <LogIn className="size-3.5" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="text-xs">{"测试登录"}</TooltipContent>
+                      </Tooltip>
+                      <Tooltip delayDuration={150}>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            onClick={() => setManagingKeys(c)}
+                            aria-label="密钥"
+                          >
+                            <KeyRound className="size-3.5" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="text-xs">{"密钥"}</TooltipContent>
+                      </Tooltip>
+                      <Tooltip delayDuration={150}>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            onClick={() => {
+                              setEditing(c)
+                              setCreating(true)
+                            }}
+                            aria-label="编辑"
+                          >
+                            <Pencil className="size-3.5" />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent side="top" className="text-xs">{"编辑"}</TooltipContent>
+                      </Tooltip>
+                      <Button
+                        asChild
+                        variant="ghost"
+                        size="icon-sm"
+                        className="size-7 text-muted-foreground hover:text-foreground"
+                      >
+                        <a
+                          href={c.site_url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          aria-label={`新窗口打开 ${c.name} 站点地址`}
+                        >
+                          <ExternalLink className="size-3.5" />
+                        </a>
+                      </Button>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-sm"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            disabled={busyAction === `clear-login-${c.id}` || busyAction === `delete-${c.id}`}
+                            aria-label="更多"
+                          >
+                            <MoreHorizontal className="size-3.5" />
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="w-44">
+                          <DropdownMenuItem
+                            disabled={manual || busyAction === `pin-${c.id}`}
+                            onSelect={(e) => {
+                              e.preventDefault()
+                              void withBusy(`pin-${c.id}`, () =>
+                                apiFetch(`/channels/${c.id}`, {
+                                  method: "PUT",
+                                  body: JSON.stringify({ pinned: !c.pinned }),
+                                }),
+                              )
+                            }}
+                          >
+                            <Pin className={cn("size-3.5", c.pinned && "fill-current text-warning")} />
+                            {c.pinned ? "取消置顶" : "置顶"}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={manual || busyAction === `toggle-${c.id}`}
+                            onSelect={(e) => {
+                              e.preventDefault()
+                              void withBusy(`toggle-${c.id}`, () =>
+                                apiFetch(`/channels/${c.id}/${c.monitor_enabled ? "disable" : "enable"}`, {
+                                  method: "POST",
+                                }),
+                              )
+                            }}
+                          >
+                            {c.monitor_enabled ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}
+                            {c.monitor_enabled ? "暂停监控" : "恢复监控"}
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            disabled={manual || busyAction === `rates-${c.id}` || !!syncState[c.id]?.running || anySyncRunning}
+                            onSelect={(e) => {
+                              e.preventDefault()
+                              void withBusy(`rates-${c.id}`, async () => {
+                                await apiFetch(`/channels/${c.id}/refresh-rates`, { method: "POST" })
+                                toast.success("已刷新该渠道倍率")
+                              })
+                            }}
+                          >
+                            <RefreshCw className={cn("size-3.5", busyAction === `rates-${c.id}` && "animate-spin")} />
+                            {"仅刷新倍率"}
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={manual || busyAction === `clear-login-${c.id}`}
+                            onSelect={async (e) => {
+                              e.preventDefault()
+                              const ok = await confirm({
+                                title: `清空 ${c.name} 的登录信息？`,
+                                description: "将清空缓存会话；Token 模式还会清空已保存的 Access Token、Refresh Token 和 NewAPI Cookie。账号密码本身不会删除。",
+                                confirmLabel: "清空",
+                                destructive: true,
+                              })
+                              if (!ok) return
+                              void withBusy(`clear-login-${c.id}`, async () => {
+                                await apiFetch(`/channels/${c.id}/clear-login-info`, { method: "POST" })
+                                toast.success("已清空登录信息")
+                              })
+                            }}
+                          >
+                            <XCircle className="size-3.5" />
+                            {"清空登录信息"}
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            variant="destructive"
+                            disabled={busyAction === `delete-${c.id}`}
+                            onSelect={async (e) => {
+                              e.preventDefault()
+                              const ok = await confirm({
+                                title: `删除渠道 ${c.name}？`,
+                                description: "删除后该渠道的余额历史、倍率快照与登录凭据都将一并清除，且无法恢复。",
+                                confirmLabel: "删除",
+                                destructive: true,
+                              })
+                              if (!ok) return
+                              void withBusy(`delete-${c.id}`, () =>
+                                apiFetch(`/channels/${c.id}`, { method: "DELETE" }),
+                              )
+                            }}
+                          >
+                            <Trash2 className="size-3.5" />
+                            {"删除"}
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
                   </div>
+
+                  {c.last_error ? (
+                    <p className="mt-1.5 max-h-12 overflow-y-auto whitespace-pre-wrap break-words rounded border border-border bg-muted/20 px-2 py-1 text-[11px] leading-4 text-danger" title={c.last_error}>
+                      {c.last_error}
+                    </p>
+                  ) : null}
 
                   <InlineRates channelID={c.id} />
 
-                  <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="gap-1 text-xs"
-                      disabled={manual || !!syncState[c.id]?.running || anySyncRunning}
-                      onClick={() => startStream(c, "sync")}
-                    >
-                      <RefreshCw
-                        className={cn("size-3", syncState[c.id]?.running && "animate-spin")}
-                      />
-                      {"同步"}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="gap-1 text-xs"
-                      disabled={manual || !!syncState[c.id]?.running || anySyncRunning}
-                      onClick={() => startStream(c, "test-login")}
-                      >
-                        <LogIn className="size-3" />
-                        {"测试登录"}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="gap-1 text-xs"
-                      disabled={manual}
-                      onClick={() => setRedeeming(c)}
-                    >
-                      <Gift className="size-3" />
-                      {"兑换"}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="gap-1 text-xs"
-                      onClick={() => setManagingKeys(c)}
-                    >
-                      <KeyRound className="size-3" />
-                      {"密钥"}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="gap-1 text-xs"
-                      onClick={() => {
-                        setEditing(c)
-                        setCreating(true)
-                      }}
-                    >
-                      <Pencil className="size-3" />
-                      {"编辑"}
-                    </Button>
-                  </div>
-
                   <SyncProgressStrip state={syncState[c.id] ?? emptySyncState()} />
-
-                  <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-2.5">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="gap-1 text-xs text-muted-foreground"
-                      disabled={manual || busyAction === `pin-${c.id}`}
-                      onClick={() =>
-                        withBusy(`pin-${c.id}`, () =>
-                          apiFetch(`/channels/${c.id}`, {
-                            method: "PUT",
-                            body: JSON.stringify({ pinned: !c.pinned }),
-                          }),
-                        )
-                      }
-                    >
-                      <Pin className={cn("size-3", c.pinned && "fill-current text-warning")} />
-                      {c.pinned ? "取消置顶" : "置顶"}
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="gap-1 text-xs text-muted-foreground"
-                      disabled={manual || busyAction === `toggle-${c.id}`}
-                      onClick={() =>
-                        withBusy(`toggle-${c.id}`, () =>
-                          apiFetch(`/channels/${c.id}/${c.monitor_enabled ? "disable" : "enable"}`, {
-                            method: "POST",
-                          }),
-                        )
-                      }
-                    >
-                      {c.monitor_enabled ? (
-                        <Pause className="size-3" />
-                      ) : (
-                        <Play className="size-3" />
-                      )}
-                      {c.monitor_enabled ? "暂停监控" : "恢复监控"}
-                    </Button>
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="gap-1 text-xs text-muted-foreground"
-                          disabled={busyAction === `clear-login-${c.id}` || busyAction === `delete-${c.id}`}
-                        >
-                          <MoreHorizontal className="size-3" />
-                          {"更多"}
-                        </Button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="w-44">
-                        <DropdownMenuItem
-                          disabled={manual || busyAction === `rates-${c.id}` || !!syncState[c.id]?.running || anySyncRunning}
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            void withBusy(`rates-${c.id}`, async () => {
-                              await apiFetch(`/channels/${c.id}/refresh-rates`, { method: "POST" })
-                              toast.success("已刷新该渠道倍率")
-                            })
-                          }}
-                        >
-                          <RefreshCw className={cn("size-3.5", busyAction === `rates-${c.id}` && "animate-spin")} />
-                          {"仅刷新倍率"}
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          disabled={manual || busyAction === `clear-login-${c.id}`}
-                          onSelect={async (e) => {
-                            e.preventDefault()
-                            const ok = await confirm({
-                              title: `清空 ${c.name} 的登录信息？`,
-                              description: "将清空缓存会话；Token 模式还会清空已保存的 Access Token、Refresh Token 和 NewAPI Cookie。账号密码本身不会删除。",
-                              confirmLabel: "清空",
-                              destructive: true,
-                            })
-                            if (!ok) return
-                            void withBusy(`clear-login-${c.id}`, async () => {
-                              await apiFetch(`/channels/${c.id}/clear-login-info`, { method: "POST" })
-                              toast.success("已清空登录信息")
-                            })
-                          }}
-                        >
-                          <XCircle className="size-3.5" />
-                          {"清空登录信息"}
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          variant="destructive"
-                          disabled={busyAction === `delete-${c.id}`}
-                          onSelect={async (e) => {
-                            e.preventDefault()
-                            const ok = await confirm({
-                              title: `删除渠道 ${c.name}？`,
-                              description: "删除后该渠道的余额历史、倍率快照与登录凭据都将一并清除，且无法恢复。",
-                              confirmLabel: "删除",
-                              destructive: true,
-                            })
-                            if (!ok) return
-                            void withBusy(`delete-${c.id}`, () =>
-                              apiFetch(`/channels/${c.id}`, { method: "DELETE" }),
-                            )
-                          }}
-                        >
-                          <Trash2 className="size-3.5" />
-                          {"删除"}
-                        </DropdownMenuItem>
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-                  </div>
                 </Card>
               )
             })}
@@ -1233,17 +1339,6 @@ export function ChannelCards() {
         channels={channels ?? []}
         onCreated={() => {
           refresh()
-        }}
-      />
-
-      <ChannelRedeemDialog
-        open={redeeming != null}
-        onOpenChange={(v) => {
-          if (!v) setRedeeming(null)
-        }}
-        channel={redeeming}
-        onSuccess={(result) => {
-          toast.success(renderRedeemSummary(result))
         }}
       />
 

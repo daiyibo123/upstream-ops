@@ -15,6 +15,7 @@ import (
 	"github.com/bejix/upstream-ops/backend/crypto"
 	"github.com/bejix/upstream-ops/backend/gateway"
 	"github.com/bejix/upstream-ops/backend/notify"
+	"github.com/bejix/upstream-ops/backend/oauthadmin"
 	"github.com/bejix/upstream-ops/backend/runtimeconfig"
 	"github.com/bejix/upstream-ops/backend/storage"
 	"github.com/gin-gonic/gin"
@@ -61,6 +62,7 @@ type Deps struct {
 	Monitor       monitorService
 	Dispatcher    *notify.Dispatcher
 	Gateway       *gateway.Service
+	OAuthAdmin    *oauthadmin.Service
 	Log           *slog.Logger
 
 	// Frontend 可选：传入嵌入的前端 dist 文件系统。nil 表示不挂载（本地开发用 vite dev server）。
@@ -98,6 +100,7 @@ func Register(r *gin.Engine, d *Deps) {
 		registerDashboard(api, d)
 		registerSettings(api, d)
 		registerGatewayAPI(api, d)
+		registerOAuthAccounts(api, d)
 	}
 
 	registerGatewayProxy(r, d)

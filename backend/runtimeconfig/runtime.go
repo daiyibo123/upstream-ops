@@ -11,6 +11,7 @@ import (
 	"github.com/bejix/upstream-ops/backend/config"
 	"github.com/bejix/upstream-ops/backend/gateway"
 	"github.com/bejix/upstream-ops/backend/notify"
+	"github.com/bejix/upstream-ops/backend/oauthpool"
 	"github.com/bejix/upstream-ops/backend/scheduler"
 	"github.com/gin-gonic/gin"
 )
@@ -25,11 +26,20 @@ type Manager struct {
 	dispatcher       *notify.Dispatcher
 	channelSvc       *channel.Service
 	gatewaySvc       *gateway.Service
+	oauthPoolSvc     *oauthpool.Service
 	schedulerFactory SchedulerFactory
 	auth             *auth.Service
 	scheduler        *scheduler.Scheduler
 	proxyConfig      config.ProxyConfig
 	upstreamConfig   config.UpstreamConfig
+}
+
+// SetOAuthPoolService attaches the OAuth upstream transport after the runtime
+// manager is constructed, preserving the existing constructor used by tests.
+func (m *Manager) SetOAuthPoolService(service *oauthpool.Service) {
+	m.mu.Lock()
+	m.oauthPoolSvc = service
+	m.mu.Unlock()
 }
 
 type ApplyResult struct {
@@ -120,6 +130,7 @@ func (m *Manager) ApplyFromFile() (*ApplyResult, error) {
 	dispatcher := m.dispatcher
 	channelSvc := m.channelSvc
 	gatewaySvc := m.gatewaySvc
+	oauthPoolSvc := m.oauthPoolSvc
 	factory := m.schedulerFactory
 	oldScheduler := m.scheduler
 	m.mu.RUnlock()
@@ -157,21 +168,35 @@ func (m *Manager) ApplyFromFile() (*ApplyResult, error) {
 	if gatewaySvc != nil {
 		gatewaySvc.UpdateUpstreamConfig(cfg.Upstream)
 		gatewaySvc.UpdateAppConfig(cfg.App)
+		gatewaySvc.UpdateProxyConfig(cfg.Proxy)
+	}
+	if oauthPoolSvc != nil {
+		if err := oauthPoolSvc.UpdateProxyConfig(cfg.Proxy); err != nil {
+			return nil, err
+		}
 	}
 
-	newScheduler := factory(cfg.Scheduler, cfg.Proxy)
-	if err := newScheduler.Start(); err != nil {
-		return nil, err
+	// schedulerFactory 缺省（例如仅热更配置、无需重建调度器的场景，以及部分单元
+	// 测试只注入配置依赖）时保留原有 scheduler，不重建也不停旧的，避免对 nil factory
+	// 解引用 panic。其余配置（proxy / upstream / auth 等）仍照常热更。
+	var newScheduler *scheduler.Scheduler
+	if factory != nil {
+		newScheduler = factory(cfg.Scheduler, cfg.Proxy)
+		if err := newScheduler.Start(); err != nil {
+			return nil, err
+		}
 	}
 
 	m.mu.Lock()
 	m.auth = authSvc
-	m.scheduler = newScheduler
+	if newScheduler != nil {
+		m.scheduler = newScheduler
+	}
 	m.proxyConfig = cfg.Proxy
 	m.upstreamConfig = cfg.Upstream.WithDefaults()
 	m.mu.Unlock()
 
-	if oldScheduler != nil {
+	if newScheduler != nil && oldScheduler != nil {
 		oldScheduler.Stop()
 	}
 

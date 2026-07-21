@@ -8,6 +8,44 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.30.0 - 2026-07-21
+
+### Added
+
+- Added permanent ChatGPT and Grok OAuth pools with immutable `gpt号池` and `grok号池` gateway channels, idempotent upgrade initialization, and stable pool-scope identifiers.
+- Added OAuth JSON import for Sub2API, CLIProxyAPI/CPA, and Grok SSO structures, including partial-success results, deduplication, encrypted credentials, quota refresh, account health checks, paginated management, filtering, statistics, and batch deletion.
+- Added concurrency-safe OAuth account round-robin, least-inflight balancing, three-failure temporary circuit breaking, cooldown, single half-open recovery, and immediate cache invalidation after account changes.
+- Added per-Key route preference (`ratio_first`, `pool_first`, `upstream_first`). Pool/upstream preference is applied only inside an equal ratio/cost scheduling tier, so the existing ratio-first contract remains intact.
+- Added strict channel model catalogs and allowlists. Operators fetch a catalog, select allowed models, and unselected models are rejected before an upstream request. Fixed ChatGPT and Grok pool channels have the same model controls.
+- Added detailed dispatch-event APIs with retry count, channel, OAuth pool, redacted account, model, status, error code, and bounded sanitized error content.
+- Added global or target-selective proxy routing for ordinary channels, fixed pool channels, OAuth account traffic, streaming, health checks, inspections, and quota requests.
+- Added a local, permission-aware OpenAI `/v1/models` catalog for ZCode and other compatible clients. It returns only locally allowed models and never consumes an OAuth lease or probes an upstream.
+
+### Changed
+
+- Reworked scheduling around a lightweight 30-second channel snapshot and two-second OAuth account snapshot with explicit invalidation, avoiding full-table scans and re-sorting on every request.
+- Gateway candidate selection now hard-skips dead, rate-limited, credential-invalid, forbidden, zero-balance, disabled, cooling, and temporarily unschedulable routes.
+- First-output timeouts now participate in the three-failure circuit breaker. A request can switch only a bounded number of times before first output, and never changes account after client-visible stream data begins.
+- Cooldown recovery no longer probes before expiry; after expiry, only one concurrent half-open request can test recovery.
+- Model discovery accepts OpenAI arrays, Grok-style keyed catalogs, and common `id`, `slug`, `public_id`, and `model_name` fields. ChatGPT pool discovery uses the Codex model endpoint with client version, while the Grok pool uses a versioned provider catalog.
+- Refreshed the dashboard, gateway, Key, OAuth account, usage-event, and settings pages without replacing the project's overall frontend architecture.
+- Equal-cost ordinary upstreams now use a lightweight concurrent-safe round-robin cursor, while route affinity and pool/upstream preference remain bounded to their existing scheduling tier.
+
+### Fixed
+
+- Prevented late short failures from shortening an existing long `Retry-After` cooldown or downgrading a more serious rate-limit/auth/dead state.
+- Prevented unrelated upstreams with the same display group name from being treated as one failure domain; stable group references now drive same-group behavior.
+- Preserved API Key authentication, group permissions, quotas, billing, usage logs, model mapping, and redaction when routing through OAuth pools.
+- Unified frontend/backend contracts for OAuth account state, quota, rotation eligibility, proxy target IDs, route preference, model policy, and dispatch-event details.
+- Fixed Grok Web business requests by converting its continuous JSON object stream into standard Responses or Chat SSE, matching the parser already used by account health checks.
+- Preserved Grok reasoning-only output and OpenAI function-call lifecycles across Chat/Responses streaming and non-streaming conversion, including ZCode tool history, double-encoded arguments, terminal usage, and JSON-to-SSE wrapping.
+
+### Security
+
+- Centralized redaction for Authorization, API keys, OAuth tokens, cookies, proxy credentials, account identifiers, upstream error bodies, and dispatch logs.
+- Stripped caller cookies, tenant/account binding headers, and forwarded client-IP headers before requests reach shared upstream credentials.
+- OAuth credentials remain encrypted at rest and are never returned by account, pool, Key, usage, or dispatch-event APIs.
+
 ## v0.27.3 - 2026-07-20
 
 ### Changed

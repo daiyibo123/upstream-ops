@@ -29,6 +29,9 @@ func TestLoadAppliesUpstreamDefaults(t *testing.T) {
 	if cfg.Upstream.HealthProbeTimeoutSeconds != DefaultHealthProbeTimeoutSeconds {
 		t.Fatalf("health probe timeout = %d", cfg.Upstream.HealthProbeTimeoutSeconds)
 	}
+	if cfg.Upstream.MaxDispatchAttemptsPerRequest != DefaultMaxDispatchAttemptsPerRequest {
+		t.Fatalf("max dispatch attempts = %d, want default %d", cfg.Upstream.MaxDispatchAttemptsPerRequest, DefaultMaxDispatchAttemptsPerRequest)
+	}
 }
 
 func TestUpstreamConfigWithDefaultsKeepsCustomUserAgent(t *testing.T) {

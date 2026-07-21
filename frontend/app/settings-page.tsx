@@ -11,8 +11,10 @@ import {
   Plus,
   Power,
   RefreshCw,
+  Search,
   Send,
   Server,
+  Settings2,
   ShieldCheck,
   Terminal,
   Trash2,
@@ -30,6 +32,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { NotificationFormDialog } from "@/components/monitor/notification-form-dialog";
@@ -41,19 +44,23 @@ import type {
   NotificationChannel,
   NotificationChannelType,
   SystemConfig,
+  SystemConfigResponse,
   SystemRestartResponse,
   SystemUpdateResponse,
   SystemUpdateStatus,
 } from "@/lib/api-types";
 import { relativeTime } from "@/lib/format";
+import { projectReleaseURL } from "@/lib/project-links";
 import {
   useDashboardSummary,
   useNotificationLogs,
   useNotificationChannels,
   useAppVersion,
   useSystemConfig,
+  useChannels,
 } from "@/lib/queries";
 import { cn } from "@/lib/utils";
+import { PageHeader } from "@/components/page-header";
 
 function num(v: string) {
   return Number(v || 0);
@@ -104,6 +111,10 @@ function withConfigDefaults(cfg: SystemConfig): SystemConfig {
       temporaryFailureCooldownSeconds: upstream.temporaryFailureCooldownSeconds ?? 300,
       streamInterceptionScanEvents: upstream.streamInterceptionScanEvents ?? 0,
     },
+		proxy: {
+			...cfg.proxy,
+			selectedTargets: normalizeProxyTargets(cfg.proxy.selectedTargets),
+		},
   };
 }
 
@@ -115,6 +126,51 @@ interface ProxyTestResult {
   error?: string;
 }
 
+interface ProxyTargetResponse {
+  id: string;
+  name: string;
+  kind: string;
+  fixed?: boolean;
+  channel_id?: number;
+}
+
+function normalizeProxyTargets(values: string[] | undefined) {
+  const seen = new Set<string>();
+  return (Array.isArray(values) ? values : [])
+    .map((value) => {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === "available:gpt") return "fixed-channel:gpt";
+      if (normalized === "available:grok") return "fixed-channel:grok";
+      return normalized;
+    })
+    .filter((value) => {
+      if (!value || seen.has(value)) return false;
+      seen.add(value);
+      return true;
+    });
+}
+
+function proxyKindLabel(kind: string) {
+  switch (kind) {
+    case "oauth_pool":
+      return "固定号池";
+    case "fixed_channel":
+      return "固定渠道";
+    default:
+      return "普通渠道";
+  }
+}
+
+function isMaskedProxyCredential(value: string) {
+  return value === "********" || /^.\*{3}.$/u.test(value);
+}
+
+function redactProxyMessage(value: string) {
+  return value
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^@\s/]+)@/gi, "$1***:***@")
+    .replace(/((?:username|password|proxy[_-]?(?:user|password))\s*[:=]\s*)[^\s,;]+/gi, "$1[已隐藏]");
+}
+
 export default function SettingsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const query = useSystemConfig();
@@ -122,12 +178,17 @@ export default function SettingsPage() {
   const summary = useDashboardSummary();
   const notificationLogs = useNotificationLogs(1, 10);
   const appVersion = useAppVersion();
+  const channels = useChannels();
   const refresh = useTriggerRefresh();
   const { confirm, dialog: confirmDialog } = useConfirm();
   const [form, setForm] = useState<SystemConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [healthProbeModelDraft, setHealthProbeModelDraft] = useState("");
   const [testingProxy, setTestingProxy] = useState(false);
+  const [proxySearch, setProxySearch] = useState("");
+  const [proxyTargets, setProxyTargets] = useState<ProxyTargetResponse[]>([]);
+  const [proxyTargetsLoading, setProxyTargetsLoading] = useState(true);
+  const [proxyTargetsError, setProxyTargetsError] = useState<string | null>(null);
   const [checkingVersion, setCheckingVersion] = useState(false);
   const [updatingSystem, setUpdatingSystem] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -142,10 +203,8 @@ export default function SettingsPage() {
   );
   const [versionInfo, setVersionInfo] = useState<AppVersion | null>(null);
 
-  // 只在首次加载（form 尚未初始化）时用服务端配置填充表单。后续的手动刷新 / 保存后
-  // refetch 都不再覆盖 form，避免用户改了代理 IP、冷却时长等字段还没点“保存/应用”时，
-  // 一次后台刷新就把正在编辑的表单冲回配置文件里的旧值（表现为“保存后自动切回原值”）。
-  // 保存成功后 form 已经持有最新值，无需再从服务端回填。
+  // 只在首次加载时自动填充表单，避免后台刷新覆盖尚未保存的编辑内容。
+  // 保存流程会显式 PUT 后再 GET，并直接用服务端确认结果回填。
   const formInitializedRef = useRef(false);
   useEffect(() => {
     if (!formInitializedRef.current && query.data?.config) {
@@ -153,6 +212,25 @@ export default function SettingsPage() {
       setForm(withConfigDefaults(query.data.config));
     }
   }, [query.data]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setProxyTargetsLoading(true);
+    setProxyTargetsError(null);
+    apiFetch<ProxyTargetResponse[]>("/settings/proxy/targets")
+      .then((items) => {
+        if (!cancelled) setProxyTargets(Array.isArray(items) ? items : []);
+      })
+      .catch((error: Error) => {
+        if (!cancelled) setProxyTargetsError(redactProxyMessage(error.message || "加载代理渠道失败"));
+      })
+      .finally(() => {
+        if (!cancelled) setProxyTargetsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (appVersion.data) {
@@ -190,6 +268,31 @@ export default function SettingsPage() {
   const recentLogs = notificationLogs.data?.items ?? [];
   const lastSent = recentLogs[0]?.sent_at ?? null;
   const recentFailed = recentLogs.filter((item) => !item.success).length;
+	const fixedProxyTargets = [
+		{ value: "pool:chatgpt", label: "chatgpt号池", kind: "固定号池" },
+		{ value: "pool:grok", label: "grok号池", kind: "固定号池" },
+		{ value: "fixed-channel:gpt", label: "gpt渠道", kind: "固定渠道" },
+		{ value: "fixed-channel:grok", label: "grok渠道", kind: "固定渠道" },
+	];
+	const discoveredProxyTargets = proxyTargets.length > 0
+		? proxyTargets.map((item) => ({
+			value: normalizeProxyTargets([item.id])[0] ?? item.id,
+			label: item.name,
+			kind: proxyKindLabel(item.kind),
+		}))
+		: (channels.data ?? [])
+			.filter((channel) => channel.type !== "chatgpt_pool" && channel.type !== "grok_pool")
+			.map((channel) => ({
+				value: `channel:${channel.id}`,
+				label: channel.name,
+				kind: "普通渠道",
+			}));
+	const proxyTargetOptions = [...fixedProxyTargets, ...discoveredProxyTargets]
+		.filter((item, index, list) => list.findIndex((candidate) => candidate.value === item.value) === index);
+	const normalizedProxySearch = proxySearch.trim().toLowerCase();
+	const visibleProxyTargets = proxyTargetOptions.filter((item) =>
+		!normalizedProxySearch || `${item.label} ${item.kind}`.toLowerCase().includes(normalizedProxySearch),
+	);
 
   function addHealthProbeModel() {
     if (!form) return;
@@ -277,25 +380,34 @@ export default function SettingsPage() {
 
   async function handleSave() {
     if (!form) return;
+		if (form.proxy.enabled && (!form.proxy.host.trim() || form.proxy.port <= 0)) {
+			toast.error("启用代理后必须填写有效的代理主机和端口");
+			return;
+		}
     setSaving(true);
     try {
-      // 后端 PUT /settings/config 已在写文件后立即 ApplyFromFile()，保存即生效，
-      // 无需再单独点“应用”。保存成功后不回填表单：form 已持有用户刚提交的最新值，
-      // 若再从服务端拉取覆盖会把用户输入冲回旧值（表现为“改了代理 IP 等一会儿又跳回”）。
+      // 后端 PUT /settings/config 保存即生效；随后重新读取一次，以服务端持久化结果为准。
       const result = await apiFetch<{ message?: string }>("/settings/config", {
         method: "PUT",
         body: JSON.stringify(form),
       });
-      toast.success(result?.message || "已保存并生效");
+			const confirmed = await apiFetch<SystemConfigResponse>("/settings/config");
+			setForm(withConfigDefaults(confirmed.config));
+			query.setData(confirmed);
+			toast.success(result?.message || "已保存并确认生效");
       refresh();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "保存失败");
+      toast.error(redactProxyMessage(err instanceof Error ? err.message : "保存失败"));
     } finally {
       setSaving(false);
     }
   }
 
   async function handleTestProxy() {
+    if (form && (isMaskedProxyCredential(form.proxy.username) || isMaskedProxyCredential(form.proxy.password))) {
+      toast.info("代理认证信息已脱敏，请重新输入账号和密码后再测试");
+      return;
+    }
     setTestingProxy(true);
     try {
       const result = await apiFetch<ProxyTestResult>("/settings/proxy/test", {
@@ -307,10 +419,10 @@ export default function SettingsPage() {
           `代理可用，出口 IP ${result.ip}，延迟 ${result.latency_ms}ms`,
         );
       } else {
-        toast.error(result.error ?? "代理测试失败");
+        toast.error(redactProxyMessage(result.error ?? "代理测试失败"));
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "代理测试失败");
+      toast.error(redactProxyMessage(err instanceof Error ? err.message : "代理测试失败"));
     } finally {
       setTestingProxy(false);
     }
@@ -449,27 +561,16 @@ export default function SettingsPage() {
   }
 
   return (
-    <section className="space-y-4">
-      <header className="space-y-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="text-lg font-semibold text-foreground">系统设置</h1>
-          <Badge
-            variant="outline"
-            className="border-border bg-muted/40 text-muted-foreground"
-          >
-            动态配置中心
-          </Badge>
-        </div>
-        <p className="max-w-3xl text-sm leading-6 text-muted-foreground">
-          这里集中管理鉴权、调度、通知策略和通知渠道。保存只写入配置文件，应用会让鉴权、调度和通知策略立即生效；通知渠道本身是实时写库生效。
-        </p>
-        <p className="text-xs text-muted-foreground">
-          配置文件路径：{query.data?.config_path ?? "—"}
-        </p>
-      </header>
+    <section className="space-y-5">
+      <PageHeader
+        icon={<Settings2 className="size-[18px]" />}
+        title="系统设置"
+        description="集中管理鉴权、调度、代理和通知；保存后立即写入配置并应用。"
+        meta={<Badge variant="outline" className="border-border bg-background text-muted-foreground">动态配置</Badge>}
+      />
 
       <Tabs value={activeTab} onValueChange={handleTabChange} className="space-y-4">
-        <TabsList className="h-auto w-full justify-start rounded-2xl border border-border bg-muted/40 p-1">
+        <TabsList className="h-auto w-full justify-start p-1">
           <TabsTrigger value="system" className="px-4 py-2">
             系统设置
           </TabsTrigger>
@@ -490,19 +591,26 @@ export default function SettingsPage() {
                   <Badge variant="outline" className="border-border bg-background">
                     当前版本 {versionInfo?.version || "加载中"}
                   </Badge>
-                  {versionInfo?.latest_version ? (
+                  {versionInfo?.latest_version && versionInfo.update_available ? (
                     <Badge
+                      asChild
                       variant="outline"
                       className={cn(
                         "border-transparent",
-                        versionInfo.update_available
-                          ? "bg-warning/10 text-warning"
-                          : "bg-success/10 text-success",
+                        "bg-warning/10 text-warning",
                       )}
                     >
-                      {versionInfo.update_available
-                        ? `可更新 ${versionInfo.latest_version}`
-                        : "已是最新"}
+                      <a
+                        href={projectReleaseURL(versionInfo.latest_version)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        可更新 {versionInfo.latest_version}
+                      </a>
+                    </Badge>
+                  ) : versionInfo?.latest_version ? (
+                    <Badge variant="outline" className="border-transparent bg-success/10 text-success">
+                      已是最新
                     </Badge>
                   ) : null}
                   <Button
@@ -1518,7 +1626,7 @@ export default function SettingsPage() {
           <SectionCard
             icon={<Network className="size-4 text-brand" />}
             title="代理 IP"
-            description="配置渠道上游请求使用的全局代理。只有渠道里开启代理 IP 的账号会使用这里的配置。"
+            description="配置上游请求代理及其作用范围。未选择渠道代表全局使用代理，不代表关闭代理。"
             action={
               <Button
                 size="sm"
@@ -1537,8 +1645,8 @@ export default function SettingsPage() {
             <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
               <InlineSwitch
                 id="proxy-enabled"
-                label="启用全局代理"
-                description="关闭后所有已勾选代理 IP 的对象也会保持直连。"
+                label="启用代理 IP"
+                description="关闭后所有渠道按原方式直连，已选范围会保留供下次启用。"
                 checked={form.proxy.enabled}
                 onCheckedChange={(checked) =>
                   setForm((prev) =>
@@ -1662,6 +1770,82 @@ export default function SettingsPage() {
                 />
               </Field>
             </div>
+
+			<div className={cn(
+				"mt-4 rounded-lg border px-4 py-3 text-sm",
+				!form.proxy.enabled
+					? "border-border bg-muted/40 text-muted-foreground"
+					: form.proxy.selectedTargets.length === 0
+						? "border-warning/30 bg-warning/10 text-foreground"
+						: "border-success/30 bg-success/10 text-foreground",
+			)}>
+				<p className="font-medium">
+					{!form.proxy.enabled
+						? "代理当前不生效"
+						: form.proxy.selectedTargets.length === 0
+							? "当前代理将全局应用于所有渠道。"
+							: "当前代理仅应用于已选择的渠道。"}
+				</p>
+				<p className="mt-1 text-xs text-muted-foreground">
+					{form.proxy.enabled && form.proxy.selectedTargets.length === 0
+						? "普通渠道、OAuth 号池和固定可用渠道都会使用该代理。"
+						: form.proxy.enabled
+							? `已选择 ${form.proxy.selectedTargets.length} 个渠道目标，其他渠道保持直连。`
+							: "所有渠道按原方式连接。"}
+				</p>
+			</div>
+
+			<div className="mt-4 space-y-3 rounded-lg border border-border bg-background p-4">
+				<div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+					<div>
+						<p className="text-sm font-medium text-foreground">代理范围</p>
+						<p className="mt-1 text-xs text-muted-foreground">不选择时全局使用；选择后仅应用于选中的渠道。</p>
+					</div>
+					<Button
+						type="button"
+						variant="outline"
+						size="sm"
+						disabled={form.proxy.selectedTargets.length === 0}
+						onClick={() => setForm((prev) => prev ? { ...prev, proxy: { ...prev.proxy, selectedTargets: [] } } : prev)}
+					>
+						清空选择
+					</Button>
+				</div>
+				<div className="relative">
+					<Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+					<Input value={proxySearch} onChange={(event) => setProxySearch(event.target.value)} placeholder="搜索渠道或号池" className="pl-9" />
+				</div>
+				{proxyTargetsLoading ? (
+					<p className="text-xs text-muted-foreground">正在读取可选渠道...</p>
+				) : proxyTargetsError ? (
+					<p className="rounded-md bg-warning/8 px-3 py-2 text-xs text-warning">
+						暂时无法读取后端目标，当前已使用本地渠道列表。
+					</p>
+				) : null}
+				<div className="max-h-64 overflow-y-auto rounded-md border border-border">
+					{visibleProxyTargets.length === 0 ? (
+						<p className="px-3 py-6 text-center text-xs text-muted-foreground">没有匹配的渠道</p>
+					) : visibleProxyTargets.map((item) => {
+						const checked = form.proxy.selectedTargets.includes(item.value);
+						return (
+							<label key={item.value} className="flex cursor-pointer items-center gap-3 border-b border-border px-3 py-2.5 last:border-b-0 hover:bg-muted/40">
+								<Checkbox
+									checked={checked}
+									onCheckedChange={(next) => setForm((prev) => {
+										if (!prev) return prev;
+										const selected = next === true
+											? [...prev.proxy.selectedTargets, item.value]
+											: prev.proxy.selectedTargets.filter((value) => value !== item.value);
+										return { ...prev, proxy: { ...prev.proxy, selectedTargets: selected } };
+									})}
+								/>
+								<span className="min-w-0 flex-1 truncate text-sm text-foreground">{item.label}</span>
+								<span className="shrink-0 text-xs text-muted-foreground">{item.kind}</span>
+							</label>
+						);
+					})}
+				</div>
+			</div>
           </SectionCard>
 
           <div className="flex flex-wrap items-center gap-3 border-t border-border pt-5">
@@ -1870,16 +2054,18 @@ function SectionCard({
   children: React.ReactNode;
 }) {
   return (
-    <section className="rounded-3xl border border-border/80 bg-muted/20 p-5">
+    <section className="border-b border-border/70 pb-7 last:border-b-0 last:pb-0">
       <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div className="space-y-1.5">
-          <div className="flex items-center gap-2 text-sm font-semibold text-foreground">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="flex size-8 shrink-0 items-center justify-center rounded-md border border-border bg-muted/45">
             {icon}
-            {title}
+          </span>
+          <div className="space-y-1">
+            <h2 className="text-sm font-semibold text-foreground">{title}</h2>
+            <p className="max-w-2xl text-xs leading-5 text-muted-foreground">
+              {description}
+            </p>
           </div>
-          <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
-            {description}
-          </p>
         </div>
         {action}
       </div>
