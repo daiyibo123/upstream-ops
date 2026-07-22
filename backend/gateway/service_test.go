@@ -170,6 +170,30 @@ func TestDispatchEventDetailIsSanitizedAndBounded(t *testing.T) {
 	}
 }
 
+func TestDispatchEventsDoNotStoreUsageTimings(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("t", 32))
+	candidate := &storage.UpstreamGroupKey{ID: 78, ChannelID: 9, ChannelName: "relay", GroupName: "group", Ratio: 1}
+	event := env.svc.startDispatchLog(nil, candidate, "gpt-test", "192.0.2.1", 1)
+	env.svc.finishDispatchLog(event, "switched", "upstream timeout", usageTokens{FirstTokenMS: 12, DurationMS: 34})
+	stored, err := env.usageLogs.Find(event.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.FirstTokenMS != 0 || stored.DurationMS != 0 {
+		t.Fatalf("dispatch event retained usage timings: %#v", stored)
+	}
+
+	usage := env.svc.startDispatchLog(nil, candidate, "gpt-test", "192.0.2.1", 1)
+	env.svc.finishDispatchLog(usage, "success", "", usageTokens{FirstTokenMS: 12, DurationMS: 34})
+	stored, err = env.usageLogs.Find(usage.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.FirstTokenMS != 12 || stored.DurationMS != 34 {
+		t.Fatalf("usage detail lost timings: %#v", stored)
+	}
+}
+
 func TestProxyBlockedIPWritesRecognizableResponsesText(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("b", 32))
 	if err := env.ipPolicies.Upsert(&storage.IPPolicy{IP: "203.0.113.9", Blocked: true}); err != nil {
@@ -2021,7 +2045,7 @@ func TestProxyFailurePolicyImmediatelyUsesConfiguredCooldown(t *testing.T) {
 	}
 }
 
-func TestProxyFailureDoesNotCoolDownSlowFirstOutput(t *testing.T) {
+func TestProxyFailureCoolsDownAfterThreeFirstOutputTimeouts(t *testing.T) {
 	env := newGatewayProxyTestEnv(t, strings.Repeat("bb", 16))
 	channel := &storage.Channel{Name: "slow-first-output", Type: storage.ChannelTypeSub2API, SiteURL: "https://example.invalid", MonitorEnabled: true}
 	if err := env.channels.Create(channel); err != nil {
@@ -2042,8 +2066,12 @@ func TestProxyFailureDoesNotCoolDownSlowFirstOutput(t *testing.T) {
 		t.Fatalf("load group key: %v", err)
 	}
 
+	// Semantic reasoning/tool events disarm the first-output guard. Reaching
+	// this deadline therefore means the route produced no usable output and
+	// must participate in the same three-strike circuit breaker as other
+	// transient upstream failures.
 	if !shouldMarkProxyFailure("upstream did not produce first output within 60s") {
-		t.Fatal("slow first output must contribute to the temporary circuit breaker")
+		t.Fatal("first-output timeout must be marked as a proxy failure")
 	}
 	for i := 0; i < 3; i++ {
 		env.svc.markProxyFailure(group.ID, "upstream did not produce first output within 60s")
@@ -2052,8 +2080,51 @@ func TestProxyFailureDoesNotCoolDownSlowFirstOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load group after slow first output: %v", err)
 	}
-	if stored.DisabledUntil == nil || stored.FailureCount < 3 || !stored.Enabled {
-		t.Fatalf("three slow first outputs must temporarily cool down the candidate: %#v", stored)
+	if stored.DisabledUntil == nil || stored.FailureCount != 3 || !stored.Enabled || stored.Status != "alive" {
+		t.Fatalf("third first-output timeout must temporarily cool the route: %#v", stored)
+	}
+}
+
+// 固定号池渠道（chatgpt号池 / grok号池）的健康由每账号 oauthpool 熔断治理，渠道层
+// 绝不能因为号池派发的聚合失败被上冷却或禁用——否则会把大量健康账号一起挡在候选外，
+// 且渠道级冷却没有成功路径来解除。这里覆盖 F1（限时/临时故障冷却）与 F2（auth 禁用）。
+func TestMarkProxyFailureNeverCoolsOrDisablesFixedPoolChannel(t *testing.T) {
+	env := newGatewayProxyTestEnv(t, strings.Repeat("fp", 16))
+	if err := storage.EnsureFixedOAuthPoolScopes(env.channels, env.groupKeys, env.cipher); err != nil {
+		t.Fatalf("ensure fixed pools: %v", err)
+	}
+	allGroups, err := env.groupKeys.List()
+	if err != nil {
+		t.Fatalf("list group keys: %v", err)
+	}
+	poolByRef := make(map[string]storage.UpstreamGroupKey)
+	for _, g := range allGroups {
+		poolByRef[g.GroupRef] = g
+	}
+	for _, ref := range []string{storage.GPTPoolScopeRef, storage.GrokPoolScopeRef} {
+		pool, ok := poolByRef[ref]
+		if !ok {
+			t.Fatalf("fixed pool group %q not found", ref)
+		}
+		// F1: 号池的聚合超时/503 类临时失败，反复标记也不应给渠道上冷却或累加失败计数。
+		for i := 0; i < 5; i++ {
+			env.svc.markProxyFailure(pool.ID, "oauth_pool_unavailable: retry limit reached: upstream returned HTTP 503")
+		}
+		// F2: 号池里个别账号 401/鉴权失败，绝不能把整个号池渠道 UpdateEnabled(false)。
+		env.svc.markProxyFailure(pool.ID, "oauth_pool_unavailable: retry limit reached: HTTP 401 invalid token")
+		stored, err := env.groupKeys.FindByID(pool.ID)
+		if err != nil {
+			t.Fatalf("load fixed pool after failures %q: %v", ref, err)
+		}
+		if stored.DisabledUntil != nil {
+			t.Fatalf("fixed pool channel %q must never be cooled down: %#v", ref, stored)
+		}
+		if !stored.Enabled {
+			t.Fatalf("fixed pool channel %q must never be disabled: %#v", ref, stored)
+		}
+		if stored.FailureCount != 0 {
+			t.Fatalf("fixed pool channel %q must not accumulate channel-level failures: %#v", ref, stored)
+		}
 	}
 }
 
@@ -2634,6 +2705,19 @@ func TestGroupModelPolicySyncPreservesSelectionAndStrictlyRejectsUnselectedModel
 	}
 	if generationHits != 0 {
 		t.Fatalf("unselected model reached upstream %d times", generationHits)
+	}
+}
+
+func TestGroupModelPolicyAlwaysSerializesModelListsAsArrays(t *testing.T) {
+	policy := groupModelPolicyFromKey(&storage.UpstreamGroupKey{})
+	body, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	if strings.Contains(text, `"available_models":null`) || strings.Contains(text, `"supported_models":null`) ||
+		!strings.Contains(text, `"available_models":[]`) || !strings.Contains(text, `"supported_models":[]`) {
+		t.Fatalf("model policy must use arrays: %s", body)
 	}
 }
 
@@ -7318,6 +7402,24 @@ func TestHealthBufferedDispatchFailureMatchesDispatch(t *testing.T) {
 		{Event: "response.failed", Data: `{"type":"response.failed"}`},
 	}); !failed {
 		t.Fatal("response.failed event must be a health failure")
+	}
+}
+
+func TestPreflightSSEStreamAcceptsResponsesReasoningBeforeText(t *testing.T) {
+	// GPT-5/Codex 类上游常先推一段 reasoning（思考）事件再出正文。preflight 必须把
+	// responses 格式的 reasoning 事件当作可用输出立即放行，否则思考阶段会塞满缓冲，
+	// 在正文出现前就误判 "did not send a usable generation event"，把健康渠道当失败。
+	body := io.NopCloser(strings.NewReader("event: response.created\n" +
+		"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_r\",\"status\":\"in_progress\"}}\n\n" +
+		"event: response.reasoning_summary_text.delta\n" +
+		"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Thinking...\"}\n\n"))
+	defer body.Close()
+	buffered, err := preflightSSEStream(newSSEStreamReader(body), body, time.Second, nil)
+	if err != nil {
+		t.Fatalf("reasoning-first stream must pass preflight, err=%v", err)
+	}
+	if !streamBufferedHasCodexOutput(buffered) {
+		t.Fatalf("buffered reasoning events were not treated as usable output: %#v", buffered)
 	}
 }
 

@@ -1057,9 +1057,14 @@ func (s *Service) finishDispatchLog(attempt dispatchLogAttempt, status, errMsg s
 	if status == "" {
 		status = usageStatus(usage)
 	}
-	durationMS := usage.DurationMS
-	if durationMS <= 0 && !attempt.startedAt.IsZero() {
-		durationMS = time.Since(attempt.startedAt).Milliseconds()
+	firstTokenMS := int64(0)
+	durationMS := int64(0)
+	if status == "success" || status == "estimated" {
+		firstTokenMS = usage.FirstTokenMS
+		durationMS = usage.DurationMS
+		if durationMS <= 0 && !attempt.startedAt.IsZero() {
+			durationMS = time.Since(attempt.startedAt).Milliseconds()
+		}
 	}
 	safeError := sanitize.Truncate(sanitize.RedactText(errMsg), 2000)
 	errorCode, errorStatus := dispatchErrorClassification(status, safeError)
@@ -1070,7 +1075,7 @@ func (s *Service) finishDispatchLog(attempt dispatchLogAttempt, status, errMsg s
 		"completion_tokens": maxInt64(0, usage.Completion),
 		"total_tokens":      maxInt64(0, usage.Total),
 		"cached_tokens":     maxInt64(0, usage.Cached),
-		"first_token_ms":    maxInt64(0, usage.FirstTokenMS),
+		"first_token_ms":    maxInt64(0, firstTokenMS),
 		"duration_ms":       maxInt64(0, durationMS),
 		"error_message":     sanitize.Truncate(safeError, 1000),
 		"error_code":        errorCode,
@@ -4450,7 +4455,7 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			req.Header.Set("Cache-Control", "no-cache")
 			req.Header.Set("Accept-Encoding", "identity")
 		}
-		client, clientErr := s.httpClientFor(ctx, ch)
+		client, clientErr := s.httpClientFor(ctx, ch, key)
 		if clientErr != nil {
 			return true, usageTokens{}, clientErr
 		}
@@ -4470,7 +4475,25 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			return s.streamGrokWebOAuthResponse(resp.Body, request, key, w, firstOutput)
 		}
 		if !isEventStream(header) {
-			respBody, readErr := readLimitedBody(resp.Body, 64<<20)
+			var source io.Reader = resp.Body
+			if request.Stream {
+				// Some Grok relays advertise their continuous native JSON stream as
+				// application/json. Probe one complete frame and replay the bytes so
+				// native output can be converted while the upstream is still open.
+				bufferedBody := bufio.NewReaderSize(resp.Body, 64<<10)
+				prefix, native, probeErr := preflightGrokWebNativeJSON(bufferedBody, grokWebMaxFrameBytes)
+				if probeErr != nil {
+					if firstOutput.TimedOut() {
+						return true, usageTokens{}, firstOutput.timeoutError()
+					}
+					return true, usageTokens{}, probeErr
+				}
+				source = io.MultiReader(bytes.NewReader(prefix), bufferedBody)
+				if native {
+					return s.streamGrokWebOAuthResponse(source, request, key, w, firstOutput)
+				}
+			}
+			respBody, readErr := readLimitedBody(source, 64<<20)
 			if readErr != nil {
 				if firstOutput.TimedOut() {
 					return true, usageTokens{}, firstOutput.timeoutError()
@@ -4482,6 +4505,14 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 			}
 			if isUpstreamErrorBody(respBody) {
 				return true, usageTokens{}, fmt.Errorf("upstream returned error payload: %s", truncateBody(respBody, 240))
+			}
+			// 手动添加的 Grok 中转渠道（非 OAuth 号池）直接把 Grok 原生的连续 JSON 帧
+			// {"result":{"response":{"token":...}}} 以 application/json 返回，resolvedProvider 为空
+			// 不会命中上面的号池分支。这里按 body 特征识别并复用号池的原生解码器转成标准
+			// responses/chat 事件，否则原样透传会让客户端收到无法解析的裸 JSON（表现为"请求
+			// 不返回任何东西"）。streamGrokWebOAuthResponse 内部自行处理 MarkReady 与故障转移。
+			if request.Stream && looksLikeGrokWebNativeStream(respBody) {
+				return s.streamGrokWebOAuthResponse(bytes.NewReader(respBody), request, key, w, firstOutput)
 			}
 			if !firstOutput.MarkReady() {
 				return true, usageTokens{}, firstOutput.timeoutError()
@@ -4530,6 +4561,12 @@ func (s *Service) streamProxyCandidate(ctx context.Context, request normalizedRe
 		}
 		if s.interceptedResponseContent(key, preflightText.String()) != "" {
 			return true, usageTokens{}, errors.New("response content intercepted")
+		}
+		// A number of Grok relays wrap their native continuous JSON frames in
+		// `data:` SSE lines. They are not OpenAI events, so route the already
+		// buffered prefix and the remaining reader through the native converter.
+		if bufferedSSELooksLikeGrokWeb(buffered) {
+			return s.streamGrokWebSSEEvents(buffered, reader, request, key, w, firstOutput)
 		}
 		// 正式转发阶段的 idle 读超时：上游连续 streamIdleTimeout 没有任何新事件就判定卡死，
 		// 主动关连接返回错误，避免 reader.Next() 无限阻塞导致客户端 stream closed。
@@ -5465,11 +5502,22 @@ func (s *Service) persistGroupKeyModelPolicy(id uint, policy GroupModelPolicy) e
 
 func groupModelPolicyFromKey(key *storage.UpstreamGroupKey) GroupModelPolicy {
 	if key == nil {
-		return GroupModelPolicy{}
+		return GroupModelPolicy{AvailableModels: []string{}, SupportedModels: []string{}}
+	}
+	// Always emit JSON arrays (never null) so API clients can safely call
+	// .length/.map on the payload; a nil slice would marshal to null and crash
+	// the model editor UI.
+	available := decodeModelNames(key.AvailableModels)
+	if available == nil {
+		available = []string{}
+	}
+	supported := decodeModelNames(key.SupportedModels)
+	if supported == nil {
+		supported = []string{}
 	}
 	return GroupModelPolicy{
-		AvailableModels:    decodeModelNames(key.AvailableModels),
-		SupportedModels:    decodeModelNames(key.SupportedModels),
+		AvailableModels:    available,
+		SupportedModels:    supported,
 		RestrictionEnabled: key.ModelRestrictionEnabled,
 	}
 }
@@ -6197,7 +6245,7 @@ func (s *Service) requestCandidate(ctx context.Context, request normalizedReques
 		}
 		copyRequestHeaders(req.Header, request.Header)
 		s.applyUpstreamAuthHeaders(req.Header, key, upstreamKey)
-		client, clientErr := s.httpClientFor(ctx, ch)
+		client, clientErr := s.httpClientFor(ctx, ch, key)
 		if clientErr != nil {
 			return 0, nil, nil, clientErr
 		}
@@ -6220,6 +6268,16 @@ func (s *Service) requestCandidate(ctx context.Context, request normalizedReques
 	respBody, readErr := readLimitedBody(resp.Body, 64<<20)
 	if readErr != nil {
 		return resp.StatusCode, header, nil, readErr
+	}
+	// 手动 Grok 中转渠道直接返回 Grok 原生 JSON 帧（{"result":{"response":...}}）而非
+	// OpenAI 结构，此处按 grok_web 同样的解码规整成客户端可解析的 responses/chat JSON，
+	// 否则客户端拿到拼接的原生帧无法解析。仅在字节明确为 Grok 原生流时才转换。
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+		(looksLikeGrokWebNativeStream(respBody) || looksLikeGrokWebNativeSSEBody(respBody)) {
+		if normalized, parseErr := normalizeGrokWebOAuthResponse(bytes.NewReader(respBody), request); parseErr == nil {
+			header.Set("Content-Type", "application/json; charset=utf-8")
+			return resp.StatusCode, header, normalized, nil
+		}
 	}
 	return resp.StatusCode, header, respBody, nil
 }
@@ -6322,7 +6380,7 @@ func (s *Service) requestHealthProbeCandidate(ctx context.Context, request norma
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Accept-Encoding", "identity")
 
-	client, err := s.httpClientFor(ctx, ch)
+	client, err := s.httpClientFor(ctx, ch, key)
 	if err != nil {
 		return 0, nil, nil, err
 	}
@@ -6421,16 +6479,19 @@ func healthProbeSSEBody(events []sseEvent) []byte {
 	return []byte(strings.TrimSpace(events[0].Data))
 }
 
-func (s *Service) httpClientFor(_ context.Context, ch *storage.Channel) (*http.Client, error) {
+func (s *Service) httpClientFor(_ context.Context, ch *storage.Channel, candidates ...*storage.UpstreamGroupKey) (*http.Client, error) {
 	proxyURL := ""
 	if ch != nil {
 		cfg := s.proxyConfig()
 		targets := []string{config.ProxyChannelTarget(ch.ID)}
 		switch strings.ToLower(strings.TrimSpace(string(ch.Type))) {
 		case "chatgpt_pool":
-			targets = append(targets, config.ProxyTargetChatGPTPool, config.ProxyTargetGPTPoolChannel)
+			targets = append(targets, config.ProxyTargetChatGPTPool)
 		case "grok_pool":
-			targets = append(targets, config.ProxyTargetGrokPool, config.ProxyTargetGrokPoolChannel)
+			targets = append(targets, config.ProxyTargetGrokPool)
+		}
+		if len(candidates) > 0 && candidates[0] != nil {
+			targets = append(targets, proxyTargetsForGroup(candidates[0])...)
 		}
 		if cfg.AppliesTo(targets...) {
 			resolved, err := cfg.URL()
@@ -6447,6 +6508,42 @@ func (s *Service) httpClientFor(_ context.Context, ch *storage.Channel) (*http.C
 	client := &http.Client{Transport: buildProxyTransport(proxyURL)}
 	actual, _ := s.clients.LoadOrStore(cacheKey, client)
 	return actual.(*http.Client), nil
+}
+
+// proxyTargetsForGroup maps the persisted upstream protocol to the two family
+// scopes exposed by settings.  The channel ID remains in the target list for
+// backward-compatible per-channel rules, while fixed-channel:gpt/grok now
+// covers every ordinary upstream of that family as well as its pool channel.
+func proxyTargetsForGroup(group *storage.UpstreamGroupKey) []string {
+	if group == nil {
+		return nil
+	}
+	if _, fixed := oauthPoolForCandidate(group); fixed {
+		if group.ChannelType == storage.ChannelTypeGrokPool {
+			return []string{config.ProxyTargetGrokPool}
+		}
+		return []string{config.ProxyTargetChatGPTPool}
+	}
+	format := normalizeClientFormat(group.ClientFormat)
+	if format == "any" {
+		hints := strings.ToLower(strings.Join([]string{group.ChannelName, group.GroupName, group.GroupDesc}, " "))
+		switch {
+		case strings.Contains(hints, "grok") || strings.Contains(hints, "x.ai") || strings.Contains(hints, "xai"):
+			format = "grok"
+		case strings.Contains(hints, "claude") || strings.Contains(hints, "anthropic"):
+			return nil
+		default:
+			format = "openai"
+		}
+	}
+	switch format {
+	case "grok":
+		return []string{config.ProxyTargetGrokPoolChannel}
+	case "openai":
+		return []string{config.ProxyTargetGPTPoolChannel}
+	default:
+		return nil
+	}
 }
 
 func httpClientCacheKey(ch *storage.Channel, proxyURL string) string {
@@ -6479,6 +6576,16 @@ func (s *Service) markProxyFailure(id uint, msg string) {
 	if !shouldMarkProxyFailure(msg) {
 		return
 	}
+	// 固定号池渠道（chatgpt号池 / grok号池）的健康完全由 oauthpool 内存熔断 +
+	// oauth_accounts 每账号状态治理。渠道层只是所有号池账号的聚合入口，绝不能因为
+	// 一次请求里抽样的少数账号临时失败、或个别账号 401，就给整个号池渠道上冷却
+	// （disabled_until）或直接 UpdateEnabled(false)——那会把大量健康、未尝试或已
+	// 恢复的账号一并挡在候选之外，而渠道级冷却又没有任何成功路径来解除（成功时只
+	// 复位账号，不复位号池渠道），导致整池最长暗 5 分钟甚至被永久禁用。每账号失败
+	// 已由 recordOAuthPoolFailure 正确落库，这里的渠道级记账纯属有害的双重记账。
+	if s.isFixedPoolGroupKey(id) {
+		return
+	}
 	status := proxyFailureStatus(msg)
 	policy := s.proxyFailurePolicy(status, msg)
 	immediate := status == "rate_limited" || status == "zero_balance" || status == "auth_failed" || status == "forbidden"
@@ -6509,6 +6616,20 @@ func (s *Service) markProxyFailure(id uint, msg string) {
 	s.InvalidateSchedulingCache()
 }
 
+// isFixedPoolGroupKey 判断某个 group key 是否为固定号池渠道（chatgpt号池 / grok号池）。
+// 这是失败路径上的一次性判定，不在热路径，直接查库即可；查不到时按“非号池”处理，
+// 让调用方走正常的渠道级失败记账（宁可误记普通渠道，也不要漏掉真实故障）。
+func (s *Service) isFixedPoolGroupKey(id uint) bool {
+	if s == nil || s.groupKeys == nil {
+		return false
+	}
+	key, err := s.groupKeys.FindByID(id)
+	if err != nil || key == nil {
+		return false
+	}
+	return storage.IsPoolScopeGroup(*key)
+}
+
 func isTemporaryProxyFailureStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "rate_limited", "network_error", "timeout", "server_error", "upstream_error", "dead":
@@ -6521,10 +6642,9 @@ func isTemporaryProxyFailureStatus(status string) bool {
 // A requested model can be unavailable on one otherwise healthy upstream.
 // It should trigger same-request failover, but must not turn the whole group
 // red or put its key into cooldown: the next request may use a supported model.
-//
-// 慢首字节（reasoning 阶段较长的推理模型）同理：它只是"这一次等太久"，绝不代表
-// 渠道坏了。首字节窗口放宽后仍偶发超时的，只做当次 fail-over，既不冷却也不累加
-// 失败计数、状态保持 alive，避免可用渠道被逐个打进冷却导致候选池枯竭。
+// A genuine first-output timeout is different: semantic reasoning/tool events
+// already disarm the guard, so reaching the deadline means this route produced
+// no usable output. Count it toward the normal three-strike cooldown.
 func shouldMarkProxyFailure(msg string) bool {
 	return !looksLikeUnsupportedModelError(msg) &&
 		!looksLikeClientRequestError(msg)
@@ -11287,9 +11407,47 @@ func streamEventHasVisibleText(ev sseEvent) bool {
 	if json.Unmarshal([]byte(data), &raw) != nil {
 		return false
 	}
+	if grokWebEventVisibleText(raw) != "" {
+		return true
+	}
 	return strings.TrimSpace(chatChunkDeltaText(raw)) != "" ||
+		strings.TrimSpace(chatChunkReasoningText(raw)) != "" ||
 		strings.TrimSpace(responseVisibleText(raw)) != "" ||
+		strings.TrimSpace(responseReasoningText(raw)) != "" ||
 		strings.TrimSpace(anthropicEventText(raw)) != ""
+}
+
+func bufferedSSELooksLikeGrokWeb(events []sseEvent) bool {
+	for _, event := range events {
+		if grokWebNativeSSEData(event.Data) {
+			return true
+		}
+	}
+	return false
+}
+
+// responseReasoningText 提取 Responses API 流里的思考(reasoning)增量文本。
+// GPT-5 / Codex 类中转常常先推一大段 reasoning_summary/reasoning_text 事件再出正文，
+// 这些事件同样代表上游已经开始正常生成。preflight 若不把它们当作可用输出，思考阶段
+// 就会塞满缓冲(streamPreflightMaxEvents / streamPreflightMaxBytes)，在正文出现前耗尽
+// 预算并误报 "did not send a usable generation event"，把健康的渠道判成失败。
+func responseReasoningText(raw map[string]any) string {
+	if raw == nil {
+		return ""
+	}
+	var b strings.Builder
+	typ := strings.ToLower(strings.TrimSpace(stringValue(raw["type"])))
+	switch typ {
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		b.WriteString(stringValue(raw["delta"]))
+	case "response.reasoning_summary_text.done", "response.reasoning_text.done":
+		b.WriteString(stringValue(raw["text"]))
+	case "response.reasoning_summary_part.added", "response.reasoning_summary_part.done":
+		if part, _ := raw["part"].(map[string]any); part != nil {
+			b.WriteString(stringValue(part["text"]))
+		}
+	}
+	return b.String()
 }
 
 func responseVisibleText(raw map[string]any) string {

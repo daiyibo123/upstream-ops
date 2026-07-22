@@ -86,9 +86,9 @@ func (s *Service) proxyURLForChannel(c *storage.Channel) (string, error) {
 	targets := []string{config.ProxyChannelTarget(c.ID)}
 	switch strings.ToLower(strings.TrimSpace(string(c.Type))) {
 	case "chatgpt_pool":
-		targets = append(targets, config.ProxyTargetChatGPTPool, config.ProxyTargetGPTPoolChannel)
+		targets = append(targets, config.ProxyTargetChatGPTPool)
 	case "grok_pool":
-		targets = append(targets, config.ProxyTargetGrokPool, config.ProxyTargetGrokPoolChannel)
+		targets = append(targets, config.ProxyTargetGrokPool)
 	}
 	if !cfg.AppliesTo(targets...) {
 		return "", nil

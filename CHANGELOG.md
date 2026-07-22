@@ -8,6 +8,18 @@ All notable changes are documented here. Releases use semantic versioning: `vMAJ
 
 Every release must update this file, `backend/global/version.go`, the Dockerfile version argument, and the frontend package version before its matching Git tag is pushed. Update any version-pinned README deployment command at the same time. The matching `vMAJOR.MINOR.PATCH` tag triggers the Docker build and GitHub Release workflow.
 
+## v0.30.1 - 2026-07-22
+
+### Fixed
+
+- Normalized empty and legacy model-policy responses in every channel editor path, preventing a white screen when an upstream or fixed OAuth pool returns `null` model arrays.
+- Restored first-token and total-duration fields in usage details while keeping dispatch-event records free of usage timings.
+- Converted Grok native continuous JSON when delivered as raw JSON or SSE `data:` frames for both streaming and non-streaming gateway requests.
+- Converted long-lived `application/json` Grok streams before upstream EOF, so the first visible token is forwarded while the relay connection remains open.
+- Extended OAuth JSON import detection for real Sub2API, CPA/CLIProxyAPI, Grok2API Build/Web/Console, and Grok SSO envelopes, nested credentials, Cloudflare cookies, partial success, deduplication, and unsigned metadata-only JWTs without weakening expiry checks.
+- Applied four strict proxy scopes (`gpt号池`, `grok号池`, `gpt渠道`, `grok渠道`); OAuth pool scopes and ordinary GPT/Grok channel-family scopes no longer overlap, with immediate client-cache refresh after settings changes.
+- Added stable manual/login channel grouping and source filtering in the gateway panel.
+
 ## v0.30.0 - 2026-07-21
 
 ### Added

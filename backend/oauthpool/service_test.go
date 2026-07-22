@@ -431,3 +431,24 @@ func TestProxySelectionAppliesOnlyToSelectedPool(t *testing.T) {
 		t.Fatalf("unselected pool proxy hits=%d destination=%d", proxyHits.Load(), destinationHits.Load())
 	}
 }
+
+func TestOAuthPoolProxyIgnoresOrdinaryChannelFamilyScopes(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pool   storage.OAuthPool
+		target string
+	}{
+		{name: "gpt", pool: storage.OAuthPoolChatGPT, target: config.ProxyTargetGPTPoolChannel},
+		{name: "grok", pool: storage.OAuthPoolGrok, target: config.ProxyTargetGrokPoolChannel},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proxyURL, err := proxyURLForPool(config.ProxyConfig{
+				Enabled: true, Protocol: "http", Host: "127.0.0.1", Port: 18080,
+				SelectedTargets: []string{tc.target},
+			}, tc.pool)
+			if err != nil || proxyURL != "" {
+				t.Fatalf("OAuth pool unexpectedly used channel-family proxy: url=%q err=%v", proxyURL, err)
+			}
+		})
+	}
+}

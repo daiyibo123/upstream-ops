@@ -32,7 +32,7 @@ RUN pnpm build
 # arm64. This also keeps go mod download on the native build platform.
 FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS go-builder
 WORKDIR /src
-ARG VERSION=0.30.0
+ARG VERSION=0.30.1
 ARG TARGETOS
 ARG TARGETARCH
 

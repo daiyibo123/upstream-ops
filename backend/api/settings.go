@@ -42,24 +42,10 @@ func registerSettings(g *gin.RouterGroup, d *Deps) {
 	gs.POST("/proxy/test", func(c *gin.Context) { testProxy(c) })
 	gs.GET("/proxy/targets", func(c *gin.Context) {
 		items := []gin.H{
-			{"id": config.ProxyTargetChatGPTPool, "name": "chatgpt号池", "kind": "oauth_pool", "fixed": true},
+			{"id": config.ProxyTargetChatGPTPool, "name": "gpt号池", "kind": "oauth_pool", "fixed": true},
 			{"id": config.ProxyTargetGrokPool, "name": "grok号池", "kind": "oauth_pool", "fixed": true},
-			{"id": config.ProxyTargetGPTPoolChannel, "name": "gpt号池", "kind": "fixed_channel", "fixed": true},
-			{"id": config.ProxyTargetGrokPoolChannel, "name": "grok号池", "kind": "fixed_channel", "fixed": true},
-		}
-		if d.Channels != nil {
-			channels, err := d.Channels.List()
-			if err != nil {
-				fail(c, http.StatusInternalServerError, err)
-				return
-			}
-			for _, channel := range channels {
-				kind := strings.ToLower(strings.TrimSpace(string(channel.Type)))
-				if kind == "chatgpt_pool" || kind == "grok_pool" {
-					continue
-				}
-				items = append(items, gin.H{"id": config.ProxyChannelTarget(channel.ID), "name": channel.Name, "kind": "channel", "channel_id": channel.ID})
-			}
+			{"id": config.ProxyTargetGPTPoolChannel, "name": "gpt渠道", "kind": "channel_family", "fixed": true},
+			{"id": config.ProxyTargetGrokPoolChannel, "name": "grok渠道", "kind": "channel_family", "fixed": true},
 		}
 		c.JSON(http.StatusOK, gin.H{"data": items})
 	})

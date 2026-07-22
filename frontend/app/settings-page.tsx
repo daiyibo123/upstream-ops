@@ -11,7 +11,6 @@ import {
   Plus,
   Power,
   RefreshCw,
-  Search,
   Send,
   Server,
   Settings2,
@@ -57,7 +56,6 @@ import {
   useNotificationChannels,
   useAppVersion,
   useSystemConfig,
-  useChannels,
 } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/page-header";
@@ -126,14 +124,6 @@ interface ProxyTestResult {
   error?: string;
 }
 
-interface ProxyTargetResponse {
-  id: string;
-  name: string;
-  kind: string;
-  fixed?: boolean;
-  channel_id?: number;
-}
-
 function normalizeProxyTargets(values: string[] | undefined) {
   const seen = new Set<string>();
   return (Array.isArray(values) ? values : [])
@@ -148,17 +138,6 @@ function normalizeProxyTargets(values: string[] | undefined) {
       seen.add(value);
       return true;
     });
-}
-
-function proxyKindLabel(kind: string) {
-  switch (kind) {
-    case "oauth_pool":
-      return "固定号池";
-    case "fixed_channel":
-      return "固定渠道";
-    default:
-      return "普通渠道";
-  }
 }
 
 function isMaskedProxyCredential(value: string) {
@@ -178,17 +157,12 @@ export default function SettingsPage() {
   const summary = useDashboardSummary();
   const notificationLogs = useNotificationLogs(1, 10);
   const appVersion = useAppVersion();
-  const channels = useChannels();
   const refresh = useTriggerRefresh();
   const { confirm, dialog: confirmDialog } = useConfirm();
   const [form, setForm] = useState<SystemConfig | null>(null);
   const [saving, setSaving] = useState(false);
   const [healthProbeModelDraft, setHealthProbeModelDraft] = useState("");
   const [testingProxy, setTestingProxy] = useState(false);
-  const [proxySearch, setProxySearch] = useState("");
-  const [proxyTargets, setProxyTargets] = useState<ProxyTargetResponse[]>([]);
-  const [proxyTargetsLoading, setProxyTargetsLoading] = useState(true);
-  const [proxyTargetsError, setProxyTargetsError] = useState<string | null>(null);
   const [checkingVersion, setCheckingVersion] = useState(false);
   const [updatingSystem, setUpdatingSystem] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -212,25 +186,6 @@ export default function SettingsPage() {
       setForm(withConfigDefaults(query.data.config));
     }
   }, [query.data]);
-
-  useEffect(() => {
-    let cancelled = false;
-    setProxyTargetsLoading(true);
-    setProxyTargetsError(null);
-    apiFetch<ProxyTargetResponse[]>("/settings/proxy/targets")
-      .then((items) => {
-        if (!cancelled) setProxyTargets(Array.isArray(items) ? items : []);
-      })
-      .catch((error: Error) => {
-        if (!cancelled) setProxyTargetsError(redactProxyMessage(error.message || "加载代理渠道失败"));
-      })
-      .finally(() => {
-        if (!cancelled) setProxyTargetsLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   useEffect(() => {
     if (appVersion.data) {
@@ -268,31 +223,14 @@ export default function SettingsPage() {
   const recentLogs = notificationLogs.data?.items ?? [];
   const lastSent = recentLogs[0]?.sent_at ?? null;
   const recentFailed = recentLogs.filter((item) => !item.success).length;
-	const fixedProxyTargets = [
-		{ value: "pool:chatgpt", label: "chatgpt号池", kind: "固定号池" },
+	// 代理范围固定为四个：gpt/grok 号池 + gpt/grok 渠道。
+	// pool:* 命中 OAuth 号池，fixed-channel:gpt 命中全部 gpt 渠道，fixed-channel:grok 命中全部 grok 渠道。
+	const proxyTargetOptions = [
+		{ value: "pool:chatgpt", label: "gpt号池", kind: "固定号池" },
 		{ value: "pool:grok", label: "grok号池", kind: "固定号池" },
 		{ value: "fixed-channel:gpt", label: "gpt渠道", kind: "固定渠道" },
 		{ value: "fixed-channel:grok", label: "grok渠道", kind: "固定渠道" },
 	];
-	const discoveredProxyTargets = proxyTargets.length > 0
-		? proxyTargets.map((item) => ({
-			value: normalizeProxyTargets([item.id])[0] ?? item.id,
-			label: item.name,
-			kind: proxyKindLabel(item.kind),
-		}))
-		: (channels.data ?? [])
-			.filter((channel) => channel.type !== "chatgpt_pool" && channel.type !== "grok_pool")
-			.map((channel) => ({
-				value: `channel:${channel.id}`,
-				label: channel.name,
-				kind: "普通渠道",
-			}));
-	const proxyTargetOptions = [...fixedProxyTargets, ...discoveredProxyTargets]
-		.filter((item, index, list) => list.findIndex((candidate) => candidate.value === item.value) === index);
-	const normalizedProxySearch = proxySearch.trim().toLowerCase();
-	const visibleProxyTargets = proxyTargetOptions.filter((item) =>
-		!normalizedProxySearch || `${item.label} ${item.kind}`.toLowerCase().includes(normalizedProxySearch),
-	);
 
   function addHealthProbeModel() {
     if (!form) return;
@@ -1811,21 +1749,10 @@ export default function SettingsPage() {
 						清空选择
 					</Button>
 				</div>
-				<div className="relative">
-					<Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-					<Input value={proxySearch} onChange={(event) => setProxySearch(event.target.value)} placeholder="搜索渠道或号池" className="pl-9" />
-				</div>
-				{proxyTargetsLoading ? (
-					<p className="text-xs text-muted-foreground">正在读取可选渠道...</p>
-				) : proxyTargetsError ? (
-					<p className="rounded-md bg-warning/8 px-3 py-2 text-xs text-warning">
-						暂时无法读取后端目标，当前已使用本地渠道列表。
-					</p>
-				) : null}
 				<div className="max-h-64 overflow-y-auto rounded-md border border-border">
-					{visibleProxyTargets.length === 0 ? (
-						<p className="px-3 py-6 text-center text-xs text-muted-foreground">没有匹配的渠道</p>
-					) : visibleProxyTargets.map((item) => {
+					{proxyTargetOptions.length === 0 ? (
+						<p className="px-3 py-6 text-center text-xs text-muted-foreground">没有可选范围</p>
+					) : proxyTargetOptions.map((item) => {
 						const checked = form.proxy.selectedTargets.includes(item.value);
 						return (
 							<label key={item.value} className="flex cursor-pointer items-center gap-3 border-b border-border px-3 py-2.5 last:border-b-0 hover:bg-muted/40">

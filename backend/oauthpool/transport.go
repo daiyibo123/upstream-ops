@@ -68,9 +68,9 @@ func (m *transportManager) update(value config.ProxyConfig) error {
 }
 
 func proxyURLForPool(value config.ProxyConfig, pool storage.OAuthPool) (string, error) {
-	targets := []string{config.ProxyTargetGrokPool, config.ProxyTargetGrokPoolChannel}
+	targets := []string{config.ProxyTargetGrokPool}
 	if pool == storage.OAuthPoolChatGPT {
-		targets = []string{config.ProxyTargetChatGPTPool, config.ProxyTargetGPTPoolChannel}
+		targets = []string{config.ProxyTargetChatGPTPool}
 	}
 	if !value.AppliesTo(targets...) {
 		return "", nil

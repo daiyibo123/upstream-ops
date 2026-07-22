@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,6 +12,41 @@ import (
 	"github.com/bejix/upstream-ops/backend/runtimeconfig"
 	"github.com/gin-gonic/gin"
 )
+
+func TestProxyTargetsExposeExactlyFourStableScopes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	registerSettings(router.Group("/api"), &Deps{})
+	request := httptest.NewRequest(http.MethodGet, "/api/settings/proxy/targets", nil)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	want := []struct{ id, name string }{
+		{config.ProxyTargetChatGPTPool, "gpt号池"},
+		{config.ProxyTargetGrokPool, "grok号池"},
+		{config.ProxyTargetGPTPoolChannel, "gpt渠道"},
+		{config.ProxyTargetGrokPoolChannel, "grok渠道"},
+	}
+	if len(body.Data) != len(want) {
+		t.Fatalf("proxy targets=%#v", body.Data)
+	}
+	for index := range want {
+		if body.Data[index].ID != want[index].id || body.Data[index].Name != want[index].name {
+			t.Fatalf("proxy target %d=%#v, want %#v", index, body.Data[index], want[index])
+		}
+	}
+}
 
 func TestSaveSettingsKeepsAppVersion(t *testing.T) {
 	gin.SetMode(gin.TestMode)

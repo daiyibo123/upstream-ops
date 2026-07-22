@@ -65,12 +65,15 @@ type GroupStatusFilter = "all" | "alive" | "dead" | "zero_balance" | "rate_limit
 type MaxGroupRatioLimit = "0" | "0.05" | "0.1"
 type RoutePreference = "ratio_first" | "pool_first" | "upstream_first"
 
+type GroupSourceFilter = "all" | "login" | "manual"
+
 interface GroupFilters {
   search: string
   format: GroupFormatFilter
   rateBand: RateFilter
   charity: CharityFilter
   status: GroupStatusFilter
+  source: GroupSourceFilter
 }
 
 interface OAuthPoolStatsView {
@@ -86,6 +89,25 @@ const FIXED_POOL_GROUPS = [
 
 function isFixedPoolGroup(group: UpstreamGroupKey) {
   return group.group_ref === "pool-scope:gpt" || group.group_ref === "pool-scope:grok"
+}
+
+// 渠道是否为手动/本地添加（与可用渠道页判定一致）：显式 manual 标记，
+// 或 token 凭证且用户名为 "manual"。登录渠道则来自 OAuth/上游同步。
+function isManualChannel(channel?: Channel | null) {
+  return !!channel?.manual || (channel?.credential_mode === "token" && channel?.username?.trim().toLowerCase() === "manual")
+}
+
+// 手动/本地渠道判定：displayGroups 阶段已把所属渠道的 manual 标记合并到 group.manual；
+// 缺失时回退到 upstream_key_id（登录渠道来自上游 Key，手动渠道没有正数 Key id）。
+function isManualGroup(group: UpstreamGroupKey) {
+  if (typeof group.manual === "boolean") return group.manual
+  if (group.group_ref?.toLowerCase().startsWith("manual:")) return true
+  return Number(group.upstream_key_id ?? 0) <= 0
+}
+
+// 登录渠道排前、手动渠道排后；固定号池不走此判定（单独置顶渲染）。
+function groupSourceRank(group: UpstreamGroupKey) {
+  return isManualGroup(group) ? 1 : 0
 }
 
 function fixedPoolGroupPlaceholder(definition: (typeof FIXED_POOL_GROUPS)[number], index: number): UpstreamGroupKey {
@@ -120,6 +142,7 @@ function createDefaultGroupFilters(): GroupFilters {
     rateBand: "all",
     charity: "all",
     status: "all",
+    source: "all",
   }
 }
 
@@ -208,6 +231,19 @@ function uniqueModelNames(models: string[]): string[] {
     result.push(model)
   }
   return result
+}
+
+function normalizeGroupModelPolicy(policy: Partial<GroupModelPolicy> | null | undefined): GroupModelPolicy {
+  const modelList = (value: unknown) => {
+    if (Array.isArray(value)) return uniqueModelNames(value.map((item) => String(item)))
+    if (typeof value === "string") return parseSupportedModels(value)
+    return []
+  }
+  return {
+    available_models: modelList(policy?.available_models),
+    supported_models: modelList(policy?.supported_models),
+    restriction_enabled: policy?.restriction_enabled === true,
+  }
 }
 
 function statusTone(status: string) {
@@ -529,6 +565,11 @@ function groupMatchesStatus(group: UpstreamGroupKey, status: GroupStatusFilter) 
   return status === "all" || effectiveStatus(group) === status
 }
 
+function groupMatchesSource(group: UpstreamGroupKey, source: GroupSourceFilter) {
+  if (source === "all") return true
+  return source === "manual" ? isManualGroup(group) : !isManualGroup(group)
+}
+
 function upstreamKeyLabel(group: UpstreamGroupKey) {
   const id = Number(group.upstream_key_id ?? 0)
   return id > 0 ? `上游 Key #${id}` : "手动/本地 Key"
@@ -590,6 +631,7 @@ function groupMatchesFilters(group: UpstreamGroupKey, filters: GroupFilters) {
   if (filters.rateBand !== "all") checks.push(groupMatchesRateBand(group, filters.rateBand))
   if (filters.charity !== "all") checks.push(groupMatchesCharity(group, filters.charity))
   if (filters.status !== "all") checks.push(groupMatchesStatus(group, filters.status))
+  if (filters.source !== "all") checks.push(groupMatchesSource(group, filters.source))
   // Every selected condition narrows the result. The old OR behavior made a
   // second selector unexpectedly add unrelated channels back into the list.
   return checks.length === 0 || checks.every(Boolean)
@@ -601,7 +643,8 @@ function activeGroupFilterCount(filters: GroupFilters) {
     (filters.format !== "all" ? 1 : 0) +
     (filters.rateBand !== "all" ? 1 : 0) +
     (filters.charity !== "all" ? 1 : 0) +
-    (filters.status !== "all" ? 1 : 0)
+    (filters.status !== "all" ? 1 : 0) +
+    (filters.source !== "all" ? 1 : 0)
   )
 }
 
@@ -647,6 +690,8 @@ function healthResultSummaryText(result: GatewayHealthResult) {
 function sortGroupsForDisplay(groups: UpstreamGroupKey[]) {
   return groups.slice().sort((a, b) => {
     return (
+      // 登录渠道整体排在手动渠道之前，其余排序规则在各自分区内保持不变。
+      groupSourceRank(a) - groupSourceRank(b) ||
       groupDisplayFormatRank(a) - groupDisplayFormatRank(b) ||
       groupStatusRank(effectiveStatus(a)) - groupStatusRank(effectiveStatus(b)) ||
       Number(Boolean(b.charity)) - Number(Boolean(a.charity)) ||
@@ -1255,8 +1300,14 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     const channelByID = new Map(channels.map((channel) => [channel.id, channel]))
 		return groups.filter((group) => !group.group_ref.startsWith("oauth-account:")).map((group) => {
       const channel = channelByID.get(group.channel_id)
-      if (!channel) return group
-      return { ...group, channel_name: channel.name || group.channel_name, channel_url: channel.site_url || group.channel_url }
+      const manual = group.group_ref.toLowerCase().startsWith("manual:") || isManualChannel(channel)
+      if (!channel) return { ...group, manual }
+      return {
+        ...group,
+        channel_name: channel.name || group.channel_name,
+        channel_url: channel.site_url || group.channel_url,
+        manual,
+      }
     })
   }, [groups, channels])
   const filteredKeys = useMemo(() => {
@@ -1889,15 +1940,17 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
     }
   }
 
-  function updateGroupModelPolicy(id: number, policy: GroupModelPolicy) {
+  function updateGroupModelPolicy(id: number, policy: Partial<GroupModelPolicy> | null | undefined) {
+    const normalized = normalizeGroupModelPolicy(policy)
     const patch = {
-      supported_models: JSON.stringify(policy.supported_models),
-      available_models: JSON.stringify(policy.available_models),
-      model_restriction_enabled: policy.restriction_enabled,
+      supported_models: JSON.stringify(normalized.supported_models),
+      available_models: JSON.stringify(normalized.available_models),
+      model_restriction_enabled: normalized.restriction_enabled,
     }
     setGroups((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)))
     setModelEditorGroup((prev) => (prev?.id === id ? { ...prev, ...patch } : prev))
-    setModelEditorPolicy(policy)
+    setModelEditorPolicy(normalized)
+    return normalized
   }
 
   function openGroupModelEditor(group: UpstreamGroupKey) {
@@ -1919,8 +1972,8 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
       const policy = await apiFetch<GroupModelPolicy>(`/gateway/group-keys/${group.id}/models/sync`, {
         method: "POST",
       })
-      updateGroupModelPolicy(group.id, policy)
-      toast.success(`已获取 ${policy.available_models.length} 个模型，当前允许 ${policy.supported_models.length} 个`)
+      const normalized = updateGroupModelPolicy(group.id, policy)
+      toast.success(`已获取 ${normalized.available_models.length} 个模型，当前允许 ${normalized.supported_models.length} 个`)
     } catch (e) {
       const err = e as Error
       toast.error(err.message || "同步上游模型失败")
@@ -1938,9 +1991,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
         method: "PUT",
         body: JSON.stringify({ models }),
       })
-      updateGroupModelPolicy(modelEditorGroup.id, saved)
+      const normalized = updateGroupModelPolicy(modelEditorGroup.id, saved)
       setModelEditorOpen(false)
-      toast.success(saved.supported_models.length > 0 ? `已保存 ${saved.supported_models.length} 个允许模型` : "已保存空白名单：该渠道将拒绝全部模型")
+      toast.success(normalized.supported_models.length > 0 ? `已保存 ${normalized.supported_models.length} 个允许模型` : "已保存空白名单：该渠道将拒绝全部模型")
     } catch (e) {
       const err = e as Error
       toast.error(err.message || "保存模型清单失败")
@@ -2657,7 +2710,7 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                   上游内容拦截
                 </Button>
               </div>
-              <div className="grid gap-2 lg:grid-cols-[minmax(220px,1.4fr)_0.8fr_0.8fr_0.8fr_0.8fr_auto]">
+              <div className="grid gap-2 lg:grid-cols-[minmax(220px,1.4fr)_0.8fr_0.8fr_0.8fr_0.8fr_0.8fr_auto]">
                 <div className="relative">
                   <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                   <Input
@@ -2739,6 +2792,21 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <SelectItem value="forbidden">403</SelectItem>
                   </SelectContent>
                 </Select>
+                <Select
+                  value={groupFilterDraft.source}
+                  onValueChange={(value) =>
+                    setGroupFilterDraft((prev) => ({ ...prev, source: value as GroupSourceFilter }))
+                  }
+                >
+                  <SelectTrigger className="h-9 w-full text-xs">
+                    <SelectValue placeholder="来源筛选" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="all">全部来源</SelectItem>
+                    <SelectItem value="login">登录渠道</SelectItem>
+                    <SelectItem value="manual">手动渠道</SelectItem>
+                  </SelectContent>
+                </Select>
                 <div className="flex gap-2">
                   <Button
                     size="sm"
@@ -2779,6 +2847,9 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                   {groupFilters.status !== "all" ? (
                     <Badge variant="outline" className="bg-background">状态：{statusText(groupFilters.status)}</Badge>
                   ) : null}
+                  {groupFilters.source !== "all" ? (
+                    <Badge variant="outline" className="bg-background">来源：{groupFilters.source === "login" ? "登录渠道" : "手动渠道"}</Badge>
+                  ) : null}
                 </div>
               ) : null}
             </div>
@@ -2804,7 +2875,21 @@ export function GatewayPanel({ section = "all" }: { section?: "all" | "keys" | "
                     <Button size="sm" variant="outline" className="shrink-0 text-xs" onClick={() => setManualGroupDialogOpen(true)}>添加分组 Key</Button>
                   </div>
                 ))}
-                {pagedGroups.map((group) => renderGroupRow(group))}
+                {pagedGroups.map((group, index) => {
+                  const source = isManualGroup(group) ? "manual" : "login"
+                  const previous = index > 0 ? (isManualGroup(pagedGroups[index - 1]) ? "manual" : "login") : ""
+                  return (
+                    <div key={group.id} className="space-y-2">
+                      {source !== previous ? (
+                        <div className="flex items-center gap-2 px-1 pt-1 text-[11px] font-medium text-muted-foreground">
+                          <span>{source === "login" ? "登录渠道" : "手动渠道"}</span>
+                          <span className="h-px flex-1 bg-border" />
+                        </div>
+                      ) : null}
+                      {renderGroupRow(group)}
+                    </div>
+                  )
+                })}
               </div>
             )}
             {regularFilteredGroups.length > 0 ? (

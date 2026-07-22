@@ -132,6 +132,96 @@ func TestOAuthImportCLIAndCPADirectFormats(t *testing.T) {
 	}
 }
 
+func TestOAuthImportRealSub2APIEnvelopeSupportsExtraAndPartialSuccess(t *testing.T) {
+	repository, _ := newOAuthTestRepository(t)
+	unsignedIDToken := testJWTWithHeader(t, map[string]any{"alg": "none", "typ": "JWT"}, map[string]any{
+		"exp": time.Now().Add(time.Hour).Unix(), "sub": "sub2api-subject", "email": "token@example.com",
+		"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "token-account"},
+	}, "")
+	raw := []byte(fmt.Sprintf(`{
+		"type":"sub2api-data",
+		"data":{
+			"exported_at":"2026-07-20T12:00:00Z",
+			"proxies":[],
+			"accounts":[
+				{
+					"name":"Sub2API OpenAI","platform":"openai","type":"oauth",
+					"credentials":{"access_token":"sub2api-access","refresh_token":"sub2api-refresh","id_token":%q},
+					"extra":{"chatgpt_account_id":"extra-account","chatgpt_user_id":"extra-user","plan_type":"plus","email":"extra@example.com"}
+				},
+				{"name":"Unsupported provider","platform":"anthropic","type":"oauth","credentials":{"access_token":"must-not-leak"}}
+			]
+		}
+	}`, unsignedIDToken))
+
+	result, err := repository.ImportJSON(OAuthPoolChatGPT, raw)
+	if err != nil {
+		t.Fatalf("import sub2api envelope: %v", err)
+	}
+	if result.Total != 2 || result.Created != 1 || result.Failed != 1 || result.Items[0].SourceFormat != "sub2api" {
+		t.Fatalf("unexpected sub2api result: %#v", result)
+	}
+	if strings.Contains(strings.Join([]string{result.Items[1].Reason, result.Failures[0].Reason}, " "), "must-not-leak") {
+		t.Fatalf("import error leaked credential: %#v", result)
+	}
+	account, err := repository.Find(OAuthPoolChatGPT, result.Items[0].AccountID)
+	if err != nil {
+		t.Fatalf("find imported sub2api account: %v", err)
+	}
+	if account.ExternalID != "extra-account" || account.Email != "extra@example.com" || account.DisplayName != "Sub2API OpenAI" {
+		t.Fatalf("sub2api metadata was not preserved: %#v", account)
+	}
+	credentials, err := repository.Credentials(OAuthPoolChatGPT, account.ID)
+	if err != nil {
+		t.Fatalf("read imported sub2api credentials: %v", err)
+	}
+	if credentials.Subject != "sub2api-subject" || credentials.UserID != "extra-user" || credentials.PlanType != "plus" || credentials.LastRefresh != "2026-07-20T12:00:00Z" {
+		t.Fatalf("sub2api credentials were not normalized: %#v", credentials)
+	}
+}
+
+func TestOAuthImportCPAAndCLIProxyNestedRealWorldShapes(t *testing.T) {
+	repository, _ := newOAuthTestRepository(t)
+	cpaIDToken := testJWTWithHeader(t, map[string]any{"alg": "none", "typ": "JWT"}, map[string]any{
+		"exp": time.Now().Add(time.Hour).Unix(), "sub": "cpa-subject",
+	}, "")
+	cpaRaw := []byte(fmt.Sprintf(`{"data":{"source":"CPA","type":"codex","session":{"tokens":{"accessToken":"cpa-access","refreshToken":"cpa-refresh","idToken":%q}},"profile":{"user":{"email":"cpa@example.com","id":"cpa-user"},"account":{"id":"cpa-account","planType":"pro"}}}}`, cpaIDToken))
+	cpa, err := repository.ImportJSON(OAuthPoolChatGPT, cpaRaw)
+	if err != nil || cpa.Created != 1 || cpa.Items[0].SourceFormat != "cpa" {
+		t.Fatalf("import CPA nested object: result=%#v err=%v", cpa, err)
+	}
+	cpaAccount, err := repository.Find(OAuthPoolChatGPT, cpa.Items[0].AccountID)
+	if err != nil {
+		t.Fatalf("find CPA account: %v", err)
+	}
+	if cpaAccount.ExternalID != "cpa-account" || cpaAccount.Email != "cpa@example.com" {
+		t.Fatalf("CPA identity was not normalized: %#v", cpaAccount)
+	}
+	cpaCredentials, err := repository.Credentials(OAuthPoolChatGPT, cpaAccount.ID)
+	if err != nil || cpaCredentials.UserID != "cpa-user" || cpaCredentials.PlanType != "pro" || cpaCredentials.Subject != "cpa-subject" {
+		t.Fatalf("CPA credentials were not normalized: %#v err=%v", cpaCredentials, err)
+	}
+
+	grokIDToken := testJWTWithHeader(t, map[string]any{"alg": "none", "typ": "JWT"}, map[string]any{
+		"exp": time.Now().Add(time.Hour).Unix(), "sub": "grok-subject", "email": "grok@example.com", "user_id": "grok-user",
+	}, "")
+	grokRaw := []byte(fmt.Sprintf(`[
+		{"client":"CLIProxyAPI","type":"xai","access_token":"grok-access","refresh_token":"grok-refresh","id_token":%q,"base_url":"https://cli-chat-proxy.grok.com/v1","token_endpoint":"https://auth.x.ai/oauth2/token","auth_kind":"oauth"}
+	]`, grokIDToken))
+	grok, err := repository.ImportJSON(OAuthPoolGrok, grokRaw)
+	if err != nil || grok.Created != 1 || grok.Items[0].SourceFormat != "cliproxyapi" {
+		t.Fatalf("import CLIProxyAPI Grok array: result=%#v err=%v", grok, err)
+	}
+	grokCredentials, err := repository.Credentials(OAuthPoolGrok, grok.Items[0].AccountID)
+	if err != nil || grokCredentials.Subject != "grok-subject" || grokCredentials.UserID != "grok-user" {
+		t.Fatalf("CLIProxyAPI Grok credentials were not normalized: %#v err=%v", grokCredentials, err)
+	}
+	grokAccount, err := repository.Find(OAuthPoolGrok, grok.Items[0].AccountID)
+	if err != nil || grokAccount.Email != "grok@example.com" || grokAccount.ExternalID != "grok-subject" {
+		t.Fatalf("CLIProxyAPI Grok identity was not normalized: %#v err=%v", grokAccount, err)
+	}
+}
+
 func TestOAuthImportGrokSSOCookieNormalization(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -162,6 +252,44 @@ func TestOAuthImportGrokSSOCookieNormalization(t *testing.T) {
 	credentials, err := repository.Credentials(OAuthPoolGrok, result.Items[0].AccountID)
 	if err != nil || credentials.SSOToken != "direct-secret" || credentials.Cookie != "cf_clearance=clearance; sso=direct-secret" {
 		t.Fatalf("direct SSO credentials=%#v err=%v", credentials, err)
+	}
+}
+
+func TestOAuthImportGrok2APICurrentJSONShapes(t *testing.T) {
+	repository, _ := newOAuthTestRepository(t)
+	web, err := repository.ImportJSON(OAuthPoolGrok, []byte(`{
+		"provider":"grok_web",
+		"accounts":[{"name":"primary","sso_token":"web-sso","tier":"super","cloudflare_cookies":"cf_clearance=abc; sso=drop"}]
+	}`))
+	if err != nil || web.Created != 1 || web.Items[0].SourceFormat != "grok2api_sso" {
+		t.Fatalf("import grok2api web: result=%#v err=%v", web, err)
+	}
+	webCredentials, err := repository.Credentials(OAuthPoolGrok, web.Items[0].AccountID)
+	if err != nil || webCredentials.SSOToken != "web-sso" || webCredentials.AccessToken != "" || webCredentials.PlanType != "super" || !strings.Contains(webCredentials.Cookie, "cf_clearance=abc") {
+		t.Fatalf("grok2api web credentials were not normalized: %#v err=%v", webCredentials, err)
+	}
+
+	console, err := repository.ImportJSON(OAuthPoolGrok, []byte(`{
+		"provider":"grok_console",
+		"accounts":[{"name":"console","token":"console-sso","cloudflare_cookies":"cf_clearance=console"}]
+	}`))
+	if err != nil || console.Created != 1 || console.Items[0].SourceFormat != "grok2api_console" {
+		t.Fatalf("import grok2api console: result=%#v err=%v", console, err)
+	}
+	consoleCredentials, err := repository.Credentials(OAuthPoolGrok, console.Items[0].AccountID)
+	if err != nil || consoleCredentials.SSOToken != "console-sso" || consoleCredentials.AccessToken != "" || !strings.Contains(consoleCredentials.Cookie, "cf_clearance=console") {
+		t.Fatalf("grok2api console credentials were not normalized: %#v err=%v", consoleCredentials, err)
+	}
+
+	build, err := repository.ImportJSON(OAuthPoolGrok, []byte(`{
+		"accounts":[{"provider":"grok_build","name":"build","token":"build-access","refresh_token":"build-refresh","user_id":"build-user"}]
+	}`))
+	if err != nil || build.Created != 1 || build.Items[0].SourceFormat != "grok2api_build" {
+		t.Fatalf("import grok2api build: result=%#v err=%v", build, err)
+	}
+	buildCredentials, err := repository.Credentials(OAuthPoolGrok, build.Items[0].AccountID)
+	if err != nil || buildCredentials.AccessToken != "build-access" || buildCredentials.RefreshToken != "build-refresh" || buildCredentials.SSOToken != "" {
+		t.Fatalf("grok2api build credentials were not normalized: %#v err=%v", buildCredentials, err)
 	}
 }
 
@@ -248,8 +376,6 @@ func TestOAuthImportStrongAndWeakIdentityRules(t *testing.T) {
 func TestOAuthImportRejectsUnsafeCredentials(t *testing.T) {
 	repository, _ := newOAuthTestRepository(t)
 	expiredJWT := testJWT(t, map[string]any{"exp": time.Now().Add(-time.Hour).Unix()})
-	algNone := testJWTWithHeader(t, map[string]any{"alg": "none"}, map[string]any{"exp": time.Now().Add(time.Hour).Unix()}, "signature")
-	emptySignature := testJWTWithHeader(t, map[string]any{"alg": "RS256"}, map[string]any{"exp": time.Now().Add(time.Hour).Unix()}, "")
 	tests := []struct {
 		name string
 		pool OAuthPool
@@ -257,8 +383,6 @@ func TestOAuthImportRejectsUnsafeCredentials(t *testing.T) {
 	}{
 		{"expired explicit", OAuthPoolChatGPT, fmt.Sprintf(`{"type":"codex","account_id":"a","access_token":"x","expired":%q}`, time.Now().Add(-time.Hour).UTC().Format(time.RFC3339))},
 		{"expired JWT", OAuthPoolChatGPT, fmt.Sprintf(`{"type":"codex","account_id":"a","access_token":"x","id_token":%q}`, expiredJWT)},
-		{"alg none", OAuthPoolChatGPT, fmt.Sprintf(`{"type":"codex","account_id":"a","access_token":"x","id_token":%q}`, algNone)},
-		{"empty signature", OAuthPoolChatGPT, fmt.Sprintf(`{"type":"codex","account_id":"a","access_token":"x","id_token":%q}`, emptySignature)},
 		{"hostile token endpoint", OAuthPoolGrok, `{"type":"xai","access_token":"x","token_endpoint":"https://evil.example/token"}`},
 		{"cross pool", OAuthPoolChatGPT, `{"type":"xai","access_token":"x"}`},
 	}
@@ -270,6 +394,35 @@ func TestOAuthImportRejectsUnsafeCredentials(t *testing.T) {
 			}
 			if result.Failed != 1 || result.Succeeded != 0 || result.Items[0].Reason == "" {
 				t.Fatalf("unexpected rejection result: %#v", result)
+			}
+		})
+	}
+}
+
+// id_token 只用于提取元数据、从不验签，所以它的 alg=none / 空签名这类"验签相关"问题
+// 绝不能让导入失败——真实世界的 Codex / sub2api 导出经常带 alg=none 的 id_token。
+// 只要 payload 结构正常就仍可用于元数据提取；否则降级为忽略该 token，
+// 但 access_token 仍作为凭据可用。
+func TestOAuthImportIgnoresUnverifiableIDTokenButStillImports(t *testing.T) {
+	repository, _ := newOAuthTestRepository(t)
+	algNone := testJWTWithHeader(t, map[string]any{"alg": "none"}, map[string]any{"exp": time.Now().Add(time.Hour).Unix()}, "signature")
+	emptySignature := testJWTWithHeader(t, map[string]any{"alg": "RS256"}, map[string]any{"exp": time.Now().Add(time.Hour).Unix()}, "")
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{"alg none", fmt.Sprintf(`{"type":"codex","account_id":"a","access_token":"x","id_token":%q}`, algNone)},
+		{"empty signature", fmt.Sprintf(`{"type":"codex","account_id":"b","access_token":"y","id_token":%q}`, emptySignature)},
+		{"garbage id_token", `{"type":"codex","account_id":"c","access_token":"z","id_token":"not-a-jwt"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := repository.ImportJSON(OAuthPoolChatGPT, []byte(test.raw))
+			if err != nil {
+				t.Fatalf("import error: %v", err)
+			}
+			if result.Succeeded != 1 || result.Failed != 0 {
+				t.Fatalf("unverifiable id_token must not block import: %#v", result)
 			}
 		})
 	}

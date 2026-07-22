@@ -31,6 +31,11 @@ const (
 	maxOAuthErrorRunes     = 4096
 )
 
+// errJWTExpired 标记 JWT 已过期。它是唯一"真的说明凭据不可用"的 JWT 问题；
+// 其它 JWT 问题（alg=none、空签名、header/payload 格式）都只影响验签，而我们
+// 从不校验这些 token 的签名，因此绝不能因它们阻断导入（见 validateAndExtractClaims）。
+var errJWTExpired = errors.New("JWT credential is expired")
+
 type OAuthPool string
 
 const (
@@ -632,9 +637,18 @@ func decodeOAuthImport(raw []byte) ([]map[string]any, map[string]any, error) {
 		} else if data, ok := lookupMap(typed, "data"); ok {
 			if accounts, exists := lookupSlice(data, "accounts"); exists {
 				values = accounts
+				envelope = mergeOAuthImportEnvelope(typed, data)
+			} else if oauthImportRecord(data) {
+				values = []any{data}
 			} else {
 				values = []any{typed}
 			}
+		} else if data, ok := lookupSlice(typed, "data"); ok {
+			values = data
+		} else if records, ok := lookupSlice(typed, "auths", "items"); ok {
+			// Some management exports wrap auth files in auths/items rather than
+			// accounts. Treat those as a batch without requiring a UI-side rewrite.
+			values = records
 		} else {
 			values = []any{typed}
 		}
@@ -658,16 +672,34 @@ func decodeOAuthImport(raw []byte) ([]map[string]any, map[string]any, error) {
 	return items, envelope, nil
 }
 
+func mergeOAuthImportEnvelope(outer, inner map[string]any) map[string]any {
+	result := make(map[string]any, len(outer)+len(inner))
+	for key, value := range outer {
+		result[key] = value
+	}
+	for key, value := range inner {
+		result[key] = value
+	}
+	return result
+}
+
+func oauthImportRecord(value map[string]any) bool {
+	if value == nil {
+		return false
+	}
+	for _, source := range oauthImportMaps(value) {
+		if _, ok := lookupAny(source, "access_token", "accessToken", "refresh_token", "refreshToken", "id_token", "idToken", "sso", "sso_token"); ok {
+			return true
+		}
+	}
+	return false
+}
+
 func parseOAuthImportItem(pool OAuthPool, item, envelope map[string]any) (parsedOAuthImport, error) {
 	if _, invalid := item["__invalid_account_value"]; invalid {
 		return parsedOAuthImport{}, errors.New("account entry must be a JSON object")
 	}
-	nested := []map[string]any{item}
-	for _, key := range []string{"credentials", "credential", "auth", "tokens", "session"} {
-		if value, ok := lookupMap(item, key); ok {
-			nested = append(nested, value)
-		}
-	}
+	nested := oauthImportMaps(item)
 	get := func(keys ...string) any {
 		for _, key := range keys {
 			for _, source := range nested {
@@ -678,16 +710,23 @@ func parseOAuthImportItem(pool OAuthPool, item, envelope map[string]any) (parsed
 		}
 		return nil
 	}
-	declared := strings.ToLower(strings.TrimSpace(stringValue(get("type", "provider", "service", "platform"))))
-	if pool == OAuthPoolChatGPT && containsAnyWord(declared, "grok", "xai", "x.ai") {
+	provider := oauthImportProvider(nested)
+	if provider == OAuthPoolGrok && pool == OAuthPoolChatGPT {
 		return parsedOAuthImport{}, errors.New("Grok/xAI credential cannot be imported into the ChatGPT pool")
 	}
-	if pool == OAuthPoolGrok && containsAnyWord(declared, "chatgpt", "openai", "codex") {
+	if provider == OAuthPoolChatGPT && pool == OAuthPoolGrok {
 		return parsedOAuthImport{}, errors.New("ChatGPT/OpenAI credential cannot be imported into the Grok pool")
 	}
+	if provider == "unsupported" {
+		return parsedOAuthImport{}, errors.New("OAuth credential provider is not supported by this account pool")
+	}
+	formatMaps := append([]map[string]any(nil), nested...)
+	formatMaps = append(formatMaps, oauthImportMaps(envelope)...)
+	grok2APIKind := oauthImportGrok2APIKind(formatMaps)
+	genericToken := cleanSecret(stringValue(get("token")))
 
 	credentials := OAuthCredentials{
-		AccessToken:   cleanSecret(stringValue(get("access_token", "accessToken", "token"))),
+		AccessToken:   cleanSecret(stringValue(get("access_token", "accessToken"))),
 		RefreshToken:  cleanSecret(stringValue(get("refresh_token", "refreshToken"))),
 		IDToken:       cleanSecret(stringValue(get("id_token", "idToken"))),
 		SessionToken:  cleanSecret(stringValue(get("session_token", "sessionToken", "session_access_token"))),
@@ -695,23 +734,28 @@ func parseOAuthImportItem(pool OAuthPool, item, envelope map[string]any) (parsed
 		ClientID:      strings.TrimSpace(stringValue(get("client_id", "clientId"))),
 		TokenType:     strings.TrimSpace(stringValue(get("token_type", "tokenType"))),
 		ExpiresIn:     int64Value(get("expires_in", "expiresIn")),
-		ExpiresAt:     strings.TrimSpace(stringValue(get("expires_at", "expiresAt", "expired", "expiration", "expiry"))),
-		LastRefresh:   strings.TrimSpace(firstString(stringValue(get("last_refresh", "lastRefresh", "refreshed_at")), stringValue(envelopeValue(envelope, "exported_at")))),
-		AccountID:     strings.TrimSpace(stringValue(get("chatgpt_account_id", "account_id", "accountId"))),
+		ExpiresAt:     strings.TrimSpace(stringValue(get("expires_at", "expiresAt", "expired", "expires", "expiration", "expiry"))),
+		LastRefresh:   strings.TrimSpace(firstString(stringValue(get("last_refresh", "lastRefresh", "refreshed_at")), stringValue(envelopeValue(envelope, "exported_at", "exportedAt")))),
+		AccountID:     firstString(stringValue(get("chatgpt_account_id", "account_id", "accountId")), oauthImportEntityValue(item, "account", "chatgpt_account_id", "account_id", "accountId", "id")),
 		Subject:       strings.TrimSpace(stringValue(get("subject", "sub"))),
-		UserID:        strings.TrimSpace(stringValue(get("chatgpt_user_id", "user_id", "userId"))),
+		UserID:        firstString(stringValue(get("chatgpt_user_id", "user_id", "userId")), oauthImportEntityValue(item, "user", "chatgpt_user_id", "user_id", "userId", "id")),
 		TeamID:        strings.TrimSpace(stringValue(get("team_id", "teamId"))),
 		Organization:  strings.TrimSpace(stringValue(get("organization", "organization_id", "organizationId", "poid"))),
-		PlanType:      strings.TrimSpace(stringValue(get("plan_type", "planType", "plan"))),
+		PlanType:      strings.TrimSpace(stringValue(get("plan_type", "planType", "plan", "tier"))),
 		BaseURL:       strings.TrimSpace(stringValue(get("base_url", "baseUrl", "api_base"))),
 		TokenEndpoint: strings.TrimSpace(stringValue(get("token_endpoint", "tokenEndpoint"))),
 		AuthKind:      strings.TrimSpace(stringValue(get("auth_kind", "authKind", "auth_type"))),
 	}
+	if pool == OAuthPoolGrok && (grok2APIKind == "web" || grok2APIKind == "console") {
+		credentials.SSOToken = firstString(credentials.SSOToken, genericToken)
+	} else {
+		credentials.AccessToken = firstString(credentials.AccessToken, genericToken)
+	}
 	if usingAPI, ok := boolValue(get("using_api", "usingApi")); ok {
 		credentials.UsingAPI = &usingAPI
 	}
-	cookieInput := get("cookie", "cookies")
-	if extraCookies := oauthTopLevelCookies(item); len(extraCookies) > 0 {
+	cookieInput := get("cookie", "cookies", "cloudflare_cookies", "cloudflareCookies")
+	if extraCookies := oauthImportCookies(nested); len(extraCookies) > 0 {
 		if cookieInput == nil {
 			cookieInput = extraCookies
 		} else {
@@ -766,18 +810,114 @@ func parseOAuthImportItem(pool OAuthPool, item, envelope map[string]any) (parsed
 	}, nil
 }
 
+func oauthImportMaps(item map[string]any) []map[string]any {
+	// CPA session exports commonly split token, profile, account, and user data
+	// across nested objects. sub2api additionally places stable metadata in extra.
+	// Keep a small bounded traversal so a hostile JSON document cannot create an
+	// expensive graph walk while preserving deterministic field precedence.
+	const maxDepth = 4
+	keys := []string{"credentials", "credential", "auth", "tokens", "token", "session", "profile", "account", "user", "extra", "metadata"}
+	result := make([]map[string]any, 0, 12)
+	var walk func(map[string]any, int)
+	walk = func(value map[string]any, depth int) {
+		if value == nil {
+			return
+		}
+		result = append(result, value)
+		if depth >= maxDepth {
+			return
+		}
+		for _, key := range keys {
+			if nested, ok := lookupMap(value, key); ok {
+				walk(nested, depth+1)
+			}
+		}
+	}
+	walk(item, 0)
+	return result
+}
+
+func oauthImportProvider(nested []map[string]any) OAuthPool {
+	values := make([]string, 0, len(nested)*4)
+	for _, source := range nested {
+		for _, key := range []string{"platform", "provider", "service", "type", "auth_kind", "authKind"} {
+			values = append(values, strings.ToLower(strings.TrimSpace(stringValue(firstLookup(source, key)))))
+		}
+	}
+	for _, value := range values {
+		if containsAnyWord(value, "grok", "xai", "x.ai") {
+			return OAuthPoolGrok
+		}
+		if containsAnyWord(value, "chatgpt", "openai", "codex") {
+			return OAuthPoolChatGPT
+		}
+	}
+	for _, value := range values {
+		if containsAnyWord(value, "anthropic", "claude", "gemini", "google", "kimi", "deepseek") {
+			return "unsupported"
+		}
+	}
+	return ""
+}
+
+func oauthImportGrok2APIKind(nested []map[string]any) string {
+	for _, source := range nested {
+		for _, key := range []string{"provider", "platform", "type"} {
+			value := strings.ToLower(strings.TrimSpace(stringValue(firstLookup(source, key))))
+			switch {
+			case strings.Contains(value, "grok_console"):
+				return "console"
+			case strings.Contains(value, "grok_web"):
+				return "web"
+			case strings.Contains(value, "grok_build"):
+				return "build"
+			}
+		}
+	}
+	return ""
+}
+
+func oauthImportEntityValue(item map[string]any, entity string, keys ...string) string {
+	for _, source := range oauthImportMaps(item) {
+		if nested, ok := lookupMap(source, entity); ok {
+			if value := strings.TrimSpace(stringValue(firstLookup(nested, keys...))); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func oauthImportCookies(sources []map[string]any) map[string]any {
+	result := make(map[string]any)
+	for _, source := range sources {
+		for key, value := range oauthTopLevelCookies(source) {
+			if _, exists := result[key]; !exists {
+				result[key] = value
+			}
+		}
+	}
+	return result
+}
+
 func recognizeOAuthSource(pool OAuthPool, item, envelope map[string]any, credentials OAuthCredentials) string {
-	if _, ok := lookupSlice(envelope, "accounts"); ok {
-		if _, exported := lookupAny(envelope, "exported_at"); exported {
-			return "sub2api"
-		}
+	if isSub2APIEnvelope(envelope) {
+		return "sub2api"
 	}
-	if data, ok := lookupMap(envelope, "data"); ok {
-		if _, accounts := lookupSlice(data, "accounts"); accounts {
-			return "sub2api"
-		}
+	formatMaps := append([]map[string]any(nil), oauthImportMaps(item)...)
+	formatMaps = append(formatMaps, oauthImportMaps(envelope)...)
+	switch oauthImportGrok2APIKind(formatMaps) {
+	case "console":
+		return "grok2api_console"
+	case "web":
+		return "grok2api_sso"
+	case "build":
+		return "grok2api_build"
 	}
-	source := strings.ToLower(strings.TrimSpace(stringValue(firstLookup(item, "source", "client", "format"))))
+	source := strings.ToLower(strings.TrimSpace(firstString(
+		stringValue(firstLookup(item, "source", "client", "format")),
+		stringValue(firstLookup(envelope, "source", "client", "format")),
+	)))
 	switch {
 	case strings.Contains(source, "sub2api"):
 		return "sub2api"
@@ -786,7 +926,9 @@ func recognizeOAuthSource(pool OAuthPool, item, envelope map[string]any, credent
 	case strings.Contains(source, "cpa"):
 		return "cpa"
 	}
-	declared := strings.ToLower(strings.TrimSpace(stringValue(firstLookup(item, "type", "provider"))))
+	declared := strings.ToLower(strings.TrimSpace(strings.Join([]string{
+		stringValue(firstLookup(item, "platform")), stringValue(firstLookup(item, "type", "provider")),
+	}, " ")))
 	if pool == OAuthPoolGrok && (credentials.SSOToken != "" || strings.Contains(declared, "sso")) {
 		if strings.Contains(source, "console") || strings.Contains(strings.ToLower(credentials.BaseURL), "console.x.ai") {
 			return "grok_console"
@@ -803,6 +945,24 @@ func recognizeOAuthSource(pool OAuthPool, item, envelope map[string]any, credent
 		return "grok_oauth"
 	}
 	return "chatgpt_oauth"
+}
+
+func isSub2APIEnvelope(envelope map[string]any) bool {
+	if envelope == nil {
+		return false
+	}
+	if kind := strings.ToLower(strings.TrimSpace(stringValue(firstLookup(envelope, "type", "format", "source")))); strings.Contains(kind, "sub2api") {
+		return true
+	}
+	if _, accounts := lookupSlice(envelope, "accounts"); accounts {
+		if _, exported := lookupAny(envelope, "exported_at", "exportedAt"); exported {
+			return true
+		}
+		if _, proxies := lookupAny(envelope, "proxies"); proxies {
+			return true
+		}
+	}
+	return false
 }
 
 func oauthIdentity(pool OAuthPool, email, displayName string, credentials OAuthCredentials) (hash string, weak bool, externalID string) {
@@ -854,31 +1014,42 @@ func credentialFingerprint(credentials OAuthCredentials) string {
 func validateAndExtractClaims(credentials OAuthCredentials) (map[string]any, error) {
 	merged := make(map[string]any)
 	if credentials.IDToken != "" {
-		claims, err := decodeJWTClaims(credentials.IDToken, true)
-		if err != nil {
+		// id_token 仅用于提取元数据（account_id / plan_type / email 等），我们从不校验它的
+		// 签名。因此它的 alg=none / 空签名 / header 非标准这类"验签相关"问题在这里没有任何
+		// 安全意义，绝不能让整条导入失败——真实世界的 Codex / sub2api 导出经常带 alg=none 的
+		// id_token（用户遇到的 "JWT alg none is forbidden" 正是这个）。解析不出就降级为跳过
+		// 元数据提取即可。唯一仍要拦的是"已过期"：过期的凭据意味着账号确实不可用。
+		claims, err := decodeJWTClaims(credentials.IDToken)
+		switch {
+		case err == nil:
+			copyClaims(merged, claims)
+		case errors.Is(err, errJWTExpired):
 			return nil, fmt.Errorf("invalid ID token: %w", err)
+		default:
+			// 无法解析或验签相关问题：忽略这个 id_token，继续用其它凭据导入。
 		}
-		copyClaims(merged, claims)
 	}
 	for _, token := range []string{credentials.AccessToken, credentials.SessionToken} {
 		if strings.Count(token, ".") != 2 {
 			continue
 		}
-		claims, err := decodeJWTClaims(token, false)
+		claims, err := decodeJWTClaims(token)
 		if err != nil {
-			return nil, fmt.Errorf("invalid JWT credential: %w", err)
+			// 真实凭据（access/session token）同理：只有过期才是真问题；其它解析/验签相关
+			// 问题不阻断导入（这些字段是否是合法 JWT 并不影响它作为 bearer 使用）。
+			if errors.Is(err, errJWTExpired) {
+				return nil, fmt.Errorf("invalid JWT credential: %w", err)
+			}
+			continue
 		}
 		copyClaimsMissing(merged, claims)
 	}
 	return merged, nil
 }
 
-func decodeJWTClaims(token string, required bool) (map[string]any, error) {
+func decodeJWTClaims(token string) (map[string]any, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		if required {
-			return nil, errors.New("JWT must contain exactly three segments")
-		}
 		return nil, errors.New("JWT must contain exactly three segments")
 	}
 	for _, part := range parts {
@@ -886,10 +1057,7 @@ func decodeJWTClaims(token string, required bool) (map[string]any, error) {
 			return nil, errors.New("JWT segment is too large")
 		}
 	}
-	if parts[2] == "" {
-		return nil, errors.New("JWT signature is empty")
-	}
-	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	headerBytes, err := decodeJWTBase64URL(parts[0])
 	if err != nil {
 		return nil, errors.New("JWT header is not base64url")
 	}
@@ -897,10 +1065,10 @@ func decodeJWTClaims(token string, required bool) (map[string]any, error) {
 	if json.Unmarshal(headerBytes, &header) != nil {
 		return nil, errors.New("JWT header is not JSON")
 	}
-	if strings.EqualFold(strings.TrimSpace(stringValue(header["alg"])), "none") {
-		return nil, errors.New("JWT alg none is forbidden")
+	if header == nil {
+		return nil, errors.New("JWT header is not an object")
 	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	payload, err := decodeJWTBase64URL(parts[1])
 	if err != nil {
 		return nil, errors.New("JWT payload is not base64url")
 	}
@@ -910,10 +1078,24 @@ func decodeJWTClaims(token string, required bool) (map[string]any, error) {
 	if decoder.Decode(&claims) != nil {
 		return nil, errors.New("JWT payload is not JSON")
 	}
+	if claims == nil {
+		return nil, errors.New("JWT payload is not an object")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return nil, errors.New("JWT payload contains trailing values")
+	}
 	if expiry := numericUnixTime(claims["exp"]); expiry != nil && !expiry.After(time.Now().UTC()) {
-		return nil, errors.New("JWT credential is expired")
+		return nil, errJWTExpired
 	}
 	return claims, nil
+}
+
+func decodeJWTBase64URL(value string) ([]byte, error) {
+	if decoded, err := base64.RawURLEncoding.DecodeString(value); err == nil {
+		return decoded, nil
+	}
+	return base64.URLEncoding.DecodeString(value)
 }
 
 func mergeOAuthClaims(credentials *OAuthCredentials, claims map[string]any) {

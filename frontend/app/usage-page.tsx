@@ -60,6 +60,13 @@ function cacheTokenLabel(cachedTokens: number | null | undefined, promptTokens: 
   return `${formatTokens(cachedTokens)} cached / ${formatTokens(promptTokens)} input`
 }
 
+function requestTimingLabel(value: number | null | undefined) {
+  const ms = Number(value ?? 0)
+  if (!Number.isFinite(ms) || ms <= 0) return "—"
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  return `${(ms / 1000).toFixed(ms >= 10_000 ? 0 : 1)}s`
+}
+
 function redactSensitiveText(value?: string | null) {
   if (!value) return ""
   return value
@@ -491,13 +498,14 @@ export default function UsagePage() {
             </div>
           ) : null}
           <div className="overflow-x-auto rounded-md border border-border">
-            <Table className="min-w-[980px] table-fixed">
+            <Table className="min-w-[1060px] table-fixed">
               <TableHeader>
                 <TableRow>
                   <TableHead className="w-32">时间</TableHead>
                   <TableHead className="w-36">Key</TableHead>
                   <TableHead className="w-44">模型</TableHead>
                   <TableHead className="w-36 text-right">Token</TableHead>
+                  {detailView === "usage" ? <TableHead className="w-28 text-right">首字 / 耗时</TableHead> : null}
                   <TableHead className="w-20 text-center">状态</TableHead>
                   <TableHead className="w-36">上游 / 倍率</TableHead>
                   <TableHead className="w-32">IP</TableHead>
@@ -507,20 +515,20 @@ export default function UsagePage() {
               <TableBody>
                 {loading && !visibleData ? (
                   <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={detailView === "usage" ? 9 : 8} className="h-24 text-center text-xs text-muted-foreground">
                       <Loader2 className="mx-auto mb-2 size-4 animate-spin" />
                       加载中...
                     </TableCell>
                   </TableRow>
                 ) : loadError && !visibleData ? (
                   <TableRow>
-                    <TableCell colSpan={8} className="h-24 text-center text-xs text-danger">
+                    <TableCell colSpan={detailView === "usage" ? 9 : 8} className="h-24 text-center text-xs text-danger">
                       数据加载失败，请重试
                     </TableCell>
                   </TableRow>
                 ) : rows.length === 0 ? (
                   <TableRow>
-                  <TableCell colSpan={8} className="h-24 text-center text-xs text-muted-foreground">
+                  <TableCell colSpan={detailView === "usage" ? 9 : 8} className="h-24 text-center text-xs text-muted-foreground">
                       {detailView === "usage" ? "还没有成功用量记录" : "当前没有调度异常事件"}
                     </TableCell>
                   </TableRow>
@@ -552,6 +560,12 @@ export default function UsagePage() {
                           {log.prompt_tokens > 0 ? ` · ${formatTokens(log.cached_tokens)} hit` : ""}
                         </span>
                       </TableCell>
+                      {detailView === "usage" ? (
+                        <TableCell className="text-right text-xs text-muted-foreground">
+                          <span className="block font-medium text-foreground">{requestTimingLabel(log.first_token_ms)}</span>
+                          <span className="mt-0.5 block text-[10px]">总计 {requestTimingLabel(log.duration_ms)}</span>
+                        </TableCell>
+                      ) : null}
                       <TableCell className="text-center">
                         <Badge variant="outline" className={`h-5 px-1.5 text-[10px] ${usageStatusTone(log.status)}`}>
                           {usageStatusLabel(log.status)}
@@ -685,6 +699,12 @@ export default function UsagePage() {
                   ["模型", selectedDetail?.model || selectedLog.model || "后端未记录"],
                   ["尝试次数", retryCountLabel(selectedLog, selectedDetail?.attempt)],
                   ["错误码", errorCodeLabel(selectedLog, selectedDetail)],
+                  ...(detailView === "usage"
+                    ? [
+                        ["首字时间", requestTimingLabel(selectedLog.first_token_ms)] as [string, string],
+                        ["总耗时", requestTimingLabel(selectedLog.duration_ms)] as [string, string],
+                      ]
+                    : []),
                 ].map(([label, value]) => (
                   <div key={label} className="min-w-0">
                     <p className="text-xs text-muted-foreground">{label}</p>

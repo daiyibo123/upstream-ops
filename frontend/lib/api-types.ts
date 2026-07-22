@@ -688,6 +688,9 @@ export interface UpstreamGroupKey {
   last_error?: string
   created_at: string
   updated_at: string
+  // 前端 displayGroups 阶段根据所属渠道补充的标记：true 表示手动/本地添加的渠道，
+  // false/未定义表示登录（OAuth 同步）渠道。后端不下发此字段。
+  manual?: boolean
 }
 
 export interface GroupModelPolicy {
